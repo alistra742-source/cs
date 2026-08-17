@@ -1158,6 +1158,11 @@ class DiscordAutomation:
         # navigation wait immediately so Stop actually stops (the browser is
         # then PARKED on Discord and reused on the next Start).
         self._stopped = asyncio.Event()
+        # True once the browser's renderer process dies ("Page crashed").
+        # A crashed tab is gone for good — the render-wait loop recovers it
+        # in place once (fresh page, same circuit) then rotates instead of
+        # burning 20 dead polls on a corpse.
+        self._page_crashed = False
         # Engine-owned identity: Camoufox mints a fresh randomized profile
         # per launch — there is no bot-side fingerprint to keep.
         self._fingerprint = {}
@@ -1353,6 +1358,7 @@ class DiscordAutomation:
         )
         self._page = await self._context.new_page()
         self._attach_rqdata_capture()
+        self._attach_crash_listener()
 
         # CDP-level webdriver removal — runs BEFORE init scripts, catches early checks
         await apply_cdp_stealth(self._context, self._page)
@@ -1378,6 +1384,26 @@ class DiscordAutomation:
         except Exception as e:
             self._log(f"[Captcha] Could not attach rqdata request capture: {e}",
                       level="warn")
+
+    def _attach_crash_listener(self) -> None:
+        """Detect tab crashes (renderer died) the moment they happen instead
+        of learning about them through 20 dead polls in the render-wait loop.
+
+        A crashed page is gone for good — it never resurrects on its own. The
+        flag lets _goto_register recover the tab in place (fresh page on the
+        SAME circuit: renderer crashes are usually transient memory spikes,
+        not dead proxies) and rotate only if it crashes again."""
+        self._page_crashed = False
+        if self._page is None:
+            return
+        try:
+            self._page.on("crash", self._on_page_crash)
+        except Exception as e:
+            self._log(f"[Nav] Could not attach crash listener: {e}", level="warn")
+
+    def _on_page_crash(self) -> None:
+        self._page_crashed = True
+        self._log("[Nav] Page crashed (browser tab died)", level="warn")
 
     def _on_page_request(self, request) -> None:
         try:
@@ -1552,6 +1578,7 @@ class DiscordAutomation:
             )
             self._page = await self._context.new_page()
             self._attach_rqdata_capture()
+            self._attach_crash_listener()
             await apply_cdp_stealth(self._context, self._page)
             self._log("[Nav] Rebuilt browser context WITH fresh TOR proxy")
             return True
@@ -1601,6 +1628,9 @@ class DiscordAutomation:
         circuit is pointless — if Discord blocked that exit node, it won't
         unblock on retry."""
         url = "https://discord.com/register"
+        # A fresh navigation must not inherit a stale crash flag from a
+        # previous page (recovery also resets it — belt and suspenders).
+        self._page_crashed = False
         # 30s cap like the original build: the goto is only a warm-up — the
         # form-poll below is the real render gate and returns the INSTANT the
         # form paints (0.15s polling). Dead sessions still bail via the hard
@@ -1643,6 +1673,11 @@ class DiscordAutomation:
             elapsed = time.time() - t0
             if "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower():
                 self._log(f"[Nav] Page.goto timeout ({type(e).__name__}) after {elapsed:.1f}s - continuing to render-wait")
+            elif "crashed" in str(e).lower():
+                # Renderer died mid-commit. Flag it so the render-wait loop
+                # recovers the tab in place instead of polling a corpse 20x.
+                self._page_crashed = True
+                self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering tab on same circuit", level="warn")
             else:
                 self._log(f"[Nav] Page.goto error ({type(e).__name__}: {e}) - continuing to render-wait", level="warn")
         # ── Check what we got ──
@@ -1652,7 +1687,8 @@ class DiscordAutomation:
         except Exception:
             page_title = "(unknown)"
             page_url = "(unknown)"
-        if str(page_title) == "(unknown)" and str(page_url) == "(unknown)":
+        if (str(page_title) == "(unknown)" and str(page_url) == "(unknown)"
+                and not self._page_crashed):
             # The hard cap can cancel goto while a slow-but-alive session is
             # still committing; the tab usually answers within a beat. Grace-
             # poll up to ~5s before declaring the session dead — this is what
@@ -1780,6 +1816,7 @@ class DiscordAutomation:
         blank_nav_since = None   # when the tab first sat at about:blank (nav never committed)
         nav_reissues = 0         # re-issued gotos for a never-committed navigation
         dead_reads = 0           # consecutive unreadable polls -> page died (old-build bail)
+        crash_recovered = False  # already recovered a crashed tab on this circuit this nav
         last_log = -1.0
         while True:
             # User hit Stop — abort the wait immediately (the browser gets
@@ -1807,6 +1844,22 @@ class DiscordAutomation:
                 # white-screen bail. A healthy page can NEVER reach here,
                 # because the CDP fallback keeps reads alive.
                 dead_reads += 1
+                # Confirmed crash: the tab is GONE and will never come back.
+                # Recover in place ONCE (fresh page, same circuit — a
+                # renderer crash is usually a transient memory spike, not a
+                # dead proxy), then rotate immediately instead of polling a
+                # corpse 20x and burning a good circuit on a bad diagnosis.
+                if self._page_crashed:
+                    if not crash_recovered:
+                        crash_recovered = await self._recover_crashed_page(url)
+                        if crash_recovered:
+                            dead_reads = 0
+                            blank_nav_since = None
+                            last_log = -1.0
+                            continue
+                    self._nav_error = "page crashed (browser tab died) - rotating circuit"
+                    self._log("[Nav] Page crashed - tab died, rotating circuit", level="warn")
+                    return False
                 if elapsed >= last_log + 3.0:
                     last_log = elapsed
                     probe = "(no probe)"
@@ -2035,13 +2088,45 @@ class DiscordAutomation:
         self._log(f"[Nav] Form never rendered - rotating to {proxy_label}", level="warn")
         return False
 
+    async def _recover_crashed_page(self, url: str) -> bool:
+        """Resurrect a crashed tab by opening a fresh page in the SAME
+        context (same proxy + fingerprint) and re-issuing the goto.
+
+        A renderer crash is usually a transient memory spike, not a dead
+        circuit — so recover in place once before rotating. If the fresh tab
+        crashes too, _goto_register rotates to a new circuit."""
+        self._log("[Nav] Recovering crashed tab - fresh page on same circuit...", level="warn")
+        try:
+            if self._page is not None:
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+            self._page = await self._context.new_page()
+            self._attach_rqdata_capture()
+            self._attach_crash_listener()
+            await asyncio.wait_for(
+                self._page.goto(url, wait_until="domcontentloaded", timeout=30000),
+                timeout=33.0)
+            # Give the fresh tab a beat to start committing before the
+            # render-wait loop resumes polling it.
+            await asyncio.sleep(0.5)
+            self._log("[Nav] Crash recovery OK - new tab navigating on same circuit")
+            return True
+        except Exception as e:
+            self._log(f"[Nav] Crash recovery failed ({type(e).__name__}: {e}) - rotating circuit", level="error")
+            return False
+
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
-        # Full-page capture can hang on Discord's SPA through slow proxies;
-        # bound it and fall back to a viewport shot instead of stalling.
+        # VIEWPORT-ONLY capture. Full-page screenshots of Discord's tall SPA
+        # force the renderer to paint + encode the entire page — a big memory
+        # spike that repeatedly OOM-killed the content process ("Page
+        # crashed") while the capture loop ran during signup. The LIVE view
+        # shows a viewport frame anyway.
         try:
-            screenshot = await asyncio.wait_for(self._page.screenshot(full_page=True), timeout=20)
+            screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=20)
         except asyncio.TimeoutError:
             try:
                 screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=10)
