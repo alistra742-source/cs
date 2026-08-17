@@ -2603,11 +2603,12 @@ class DiscordAutomation:
             }
             if (tiles >= 4) return true;
 
+            const body = document.body;
             const prompt = document.querySelector(
                 '.prompt-text, .prompt, .header, [class*="prompt"], ' +
                 '[class*="challenge-description"], [class*="instruction"]');
             const promptText = ((prompt && (prompt.innerText || prompt.textContent)) ||
-                (body.innerText || '')).trim();
+                (body && body.innerText || '')).trim();
 
             // hCaptcha's painted challenge header always carries the
             // About/Accessibility menu button; a loader shell never does.
