@@ -24,7 +24,7 @@ import os
 import re
 import time
 from typing import Callable, Dict, Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 import aiohttp
 
@@ -384,11 +384,29 @@ async def extract_hcaptcha_rqdata(page) -> str:
     """Pull the hCaptcha Enterprise rqdata from the live page (best effort)."""
     try:
         val = await page.evaluate("""() => {
-            const el = document.querySelector('[data-sitekey]');
-            if (el) {
-                const v = el.getAttribute('data-rqdata') || el.getAttribute('rqdata');
-                if (v && v.length > 8) return v;
+            // 1) ANY element carrying an rqdata-ish attribute (Discord has
+            //    mounted it on the widget container / config div / form in
+            //    different builds — never just [data-sitekey]).
+            const els = document.querySelectorAll(
+                '[data-sitekey], [rqdata], [data-rqdata], [data-hcaptcha-rqdata], [data-config], [data-hcaptcha-config]');
+            for (const el of els) {
+                for (const a of el.attributes) {
+                    if (/rqdata/i.test(a.name) && a.value && a.value.length > 8) {
+                        return a.value;
+                    }
+                }
             }
+            // 2) JSON-embedded config attribute values (data-config=...{\"rqdata\":...}).
+            for (const el of els) {
+                for (const a of el.attributes) {
+                    const v = (a.value || '');
+                    if (!/rqdata/i.test(a.name) && v.length > 8 && v.indexOf('rqdata') !== -1) {
+                        const m = v.match(/["']?rqdata["']?\s*[:=]\s*["']([^"']{8,})["']/);
+                        if (m) return m[1];
+                    }
+                }
+            }
+            // 3) Inline scripts.
             for (const s of document.querySelectorAll('script')) {
                 const t = s.textContent || '';
                 const m = t.match(/"rqdata"\s*:\s*"([^"]{8,})"/) ||
@@ -417,6 +435,23 @@ async def extract_hcaptcha_rqdata(page) -> str:
         }""")
         if rq and len(str(rq).strip()) > 8:
             return str(rq).strip()
+    except Exception:
+        pass
+    # 4) Playwright frame URLs: the widget's own iframe src carries
+    #    rqdata=... on enterprise builds (cross-origin, but Playwright sees
+    #    every live frame's URL).
+    try:
+        for frame in page.frames:
+            try:
+                u = frame.url or ""
+            except Exception:
+                continue
+            m = re.search(r"[?&#]rqdata=([^&#]+)", u)
+            if m:
+                try:
+                    return unquote(m.group(1))
+                except Exception:
+                    return m.group(1)
     except Exception:
         pass
     return ""

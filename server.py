@@ -1412,19 +1412,34 @@ class DiscordAutomation:
                 return
             if "getcaptcha" not in url and "checkcaptcha" not in url:
                 return
-            body = None
+            rqdata = ""
+            # Some enterprise builds pass rqdata as a getcaptcha QUERY param
+            # instead of (or alongside) the POST body. The blob is
+            # case-sensitive base64, so parse the ORIGINAL (unlowered) URL.
             try:
-                body = getattr(request, "post_data_buffer", None)
+                from urllib.parse import parse_qs, urlsplit
+                _q = parse_qs(urlsplit(request.url).query)
+                for _k, _vv in _q.items():
+                    if "rqdata" in _k.lower() and _vv:
+                        _cand = _vv[0].strip()
+                        if len(_cand) > 8:
+                            rqdata = _cand
+                            break
             except Exception:
+                pass
+            if not rqdata:
                 body = None
-            if body is None:
                 try:
-                    body = getattr(request, "post_data", None)
+                    body = getattr(request, "post_data_buffer", None)
                 except Exception:
                     body = None
-            if body is None:
-                return
-            rqdata = extract_rqdata_from_body(body)
+                if body is None:
+                    try:
+                        body = getattr(request, "post_data", None)
+                    except Exception:
+                        body = None
+                if body is not None:
+                    rqdata = extract_rqdata_from_body(body)
             if rqdata:
                 self._rqdata = rqdata
                 self._log(
@@ -3091,6 +3106,41 @@ class DiscordAutomation:
         self._log("[Captcha] Exact stable sitekey never appeared after retries", level="error")
         return ""
 
+    async def _read_rqdata_stable(self, reads: int = 4,
+                                  interval: float = 3.0) -> str:
+        """Read the enterprise rqdata up to `reads` times, one read every
+        `interval` seconds, logging EVERY read. Stops as soon as a non-empty
+        value matches an earlier read ("one similar to the others") — that is
+        the stable, complete blob the token must be bound to. A single instant
+        read can race the async getcaptcha request capture and come back
+        empty, so we poll until the value stabilizes. Falls back to the last
+        non-empty read."""
+        seen: list = []
+        for i in range(1, reads + 1):
+            if self._stopped.is_set():
+                break
+            val = (getattr(self, "_rqdata", "") or
+                   await extract_hcaptcha_rqdata(self._page) or "").strip()
+            seen.append(val)
+            if val:
+                self._log(f"[Captcha] rqdata read {i}/{reads}: {len(val)} chars "
+                          f"({val[:20]}...{val[-8:]})")
+            else:
+                self._log(f"[Captcha] rqdata read {i}/{reads}: empty "
+                          f"(getcaptcha not captured yet)", level="warn")
+            if val and val in seen[:-1]:
+                self._rqdata = val
+                self._log(f"[Captcha] rqdata stable on read {i} (matches an "
+                          f"earlier read) - using {len(val)}-char blob")
+                return val
+            if i < reads:
+                await asyncio.sleep(interval)
+        for val in reversed(seen):
+            if val:
+                self._rqdata = val
+                return val
+        return ""
+
     async def _click_form_submit(self) -> bool:
         """Click Create Account / Continue after the captcha token is in place."""
         try:
@@ -3474,7 +3524,7 @@ class DiscordAutomation:
                     self._log("[Captcha] No exact sitekey yet — cannot call NoneCap",
                               level="warn")
                     continue
-                rqdata = getattr(self, "_rqdata", "") or await extract_hcaptcha_rqdata(self._page)
+                rqdata = await self._read_rqdata_stable()
                 proxy_url = proxy_url_from_bot_proxy(self.proxy)
                 if not proxy_url:
                     # Discord's enterprise hCaptcha is IP-bound: the solve IP
@@ -3531,7 +3581,7 @@ class DiscordAutomation:
                     self._log("[Captcha] No exact sitekey yet — cannot call Nopecha",
                               level="warn")
                     continue
-                rqdata = getattr(self, "_rqdata", "") or await extract_hcaptcha_rqdata(self._page)
+                rqdata = await self._read_rqdata_stable()
                 proxy_obj = proxy_dict_from_bot_proxy(self.proxy)
                 if not proxy_obj:
                     self._log(
