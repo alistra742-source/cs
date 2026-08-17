@@ -2112,6 +2112,9 @@ class DiscordAutomation:
         crashes too, _goto_register rotates to a new circuit."""
         self._log("[Nav] Recovering crashed tab - fresh page on same circuit...", level="warn")
         try:
+            if self._context is None:
+                self._log("[Nav] Crash recovery impossible - context is gone (browser closed)", level="error")
+                return False
             if self._page is not None:
                 try:
                     await self._page.close()
@@ -2257,6 +2260,10 @@ class DiscordAutomation:
                 await asyncio.sleep(0.5)
 
             # Fill the form
+            if self._page is None:
+                self._nav_error = "page closed mid-run (browser stopped/closed while settling)"
+                self._log("[Nav] Page is gone (browser stopped/closed) - aborting attempt", level="warn")
+                return False
             form_ok = await self._fill_registration_form()
             success = False
             if form_ok:
@@ -4018,6 +4025,8 @@ class DiscordAutomation:
         ToS count) so the filler can confirm a write actually landed — and
         re-check right before Create Account so a Discord re-render that
         wipes a field can never be submitted as if it were still filled."""
+        if self._page is None:
+            return {}
         try:
             v = await self._page.evaluate("""() => {
                 const F = __CRED_FIELDS__;
@@ -4070,6 +4079,8 @@ class DiscordAutomation:
 
     async def _read_field_value(self, sel: str) -> str:
         """Read one field's current value; empty string on any failure."""
+        if self._page is None:
+            return ""
         try:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0:
@@ -4090,6 +4101,8 @@ class DiscordAutomation:
         with backspace. Returns True only when the field holds `val` —
         anything weird falls back to the instant fill()/JS write path.
         """
+        if self._page is None:
+            return False
         try:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0 or not (await loc.first.is_visible()):
@@ -4152,6 +4165,11 @@ class DiscordAutomation:
         ended up concatenated inside the email field.
         """
         if not val:
+            return False
+        # A closed/stopped browser leaves _page None mid-fill — fail cleanly
+        # instead of AttributeError-spamming and spinning on a dead tab.
+        if self._page is None:
+            self._log("[Form] Page is gone (browser closed/stopped) - cannot write fields", level="warn")
             return False
         # Release focus from any field first, so a stale focused element can
         # never intercept a write or receive stray input.
@@ -4223,6 +4241,9 @@ class DiscordAutomation:
              during DOB/ToS can wipe a controlled input even after a clean
              fill).
         """
+        if self._page is None:
+            self._log("[Form] Page is gone (browser closed/stopped) - aborting form fill", level="warn")
+            return
         fields = self._build_cred_fields(display_name)
         for fname, sel, val in fields:
             if not val:
@@ -4273,6 +4294,9 @@ class DiscordAutomation:
         safe."""
         prev_ok = False
         for _pass in range(passes):
+            if self._page is None:
+                self._log("[Form] Page is gone during stabilize - aborting", level="warn")
+                return
             await asyncio.sleep(0.4)
             ok = True
             for fname, sel, val in fields:

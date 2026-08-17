@@ -16,9 +16,8 @@ lxml>=5.0.0
 # without it the engine falls back to plain randomized fingerprints.
 camoufox[geoip]>=0.5.0
 
-# Web app + Postgres (optional account persistence)
+# Web app (dashboard)
 flask>=3.0.0
-asyncpg>=0.29.0
 
 # Email checker (MX record lookups; optional - falls back to plain DNS)
 dnspython>=2.6.0
