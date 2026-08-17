@@ -1,309 +1,30 @@
 #!/usr/bin/env python3
-"""hCaptcha solver clients + DOM helpers.
+"""hCaptcha DOM helpers (no paid solvers).
 
-Primary solver: NoneCap (https://nonecap.com), paid — reads
-``NONECAP_API_KEY`` (falls back to ``API_KEY``), a ``nc_live_…`` bearer token
-minted at https://dashboard.nonecap.com/keys.
+The paid token APIs (NoneCap / Nopecha) are gone — the bot now solves the
+image challenge itself with a local Ollama vision model (see vision_solver.py
+and server.py's ``_solve_hcaptcha_if_present``). This module keeps only the
+pure DOM helpers the flow still needs:
 
-Backup solver: Nopecha (https://nopecha.com) — its free tier needs NO API key
-(the key is optional and tied to the request IP); set ``NOPECHA_API_KEY`` or
-``API_KEY2`` only when a paid key exists.
-
-Both send the EXACT sitekey (read from the live page only after the widget has
-fully rendered) plus the current page URL, and return a real token that we
-inject into the page's ``h-captcha-response`` field. A returned token is NOT
-the same as "solved": downstream acceptance is verified by the caller and is
-the only event logged as [OK].
+  · extract_hcaptcha_sitekey / extract_hcaptcha_rqdata / extract_rqdata_from_body
+    — read the exact sitekey and enterprise rqdata off the live page (still
+    useful for diagnostics and future token-based flows);
+  · read_hcaptcha_token / set_hcaptcha_token_on_page — read/write the
+    ``h-captcha-response`` textarea (read = detecting a solved challenge).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
-import time
-from typing import Callable, Dict, Optional
+from typing import Optional
 from urllib.parse import parse_qs, unquote
-
-import aiohttp
-
-NONECAP_BASE = os.environ.get(
-    "NONECAP_BASE", "https://api.nonecap.com/v1"
-).rstrip("/")
-
-NOPECHA_BASE = os.environ.get(
-    "NOPECHA_BASE", "https://api.nopecha.com"
-).rstrip("/")
 
 _SITEKEY_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
-# Nopecha asks for a modern-browser user-agent on token solves.
-_NOPECHA_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-def _api_key() -> str:
-    return (os.environ.get("NONECAP_API_KEY") or os.environ.get("API_KEY")
-            or "").strip()
-
-
-def _nopecha_key() -> str:
-    return (os.environ.get("NOPECHA_API_KEY") or os.environ.get("API_KEY2")
-            or "").strip()
-
-
-class NoneCapClient:
-    """Async client for the NoneCap hCaptcha solve API."""
-
-    def __init__(self, log: Optional[Callable] = None):
-        self._log = log or (lambda msg, level="info": None)
-        self.stats = {"calls": 0, "ok": 0, "failed": 0}
-
-    @property
-    def configured(self) -> bool:
-        return bool(_api_key())
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {_api_key()}",
-            "Content-Type": "application/json",
-        }
-
-    async def solve(self, sitekey: str, pageurl: str, rqdata: str = "",
-                    proxy: Optional[str] = None,
-                    timeout: float = 120.0) -> Optional[dict]:
-        """Create a solve, poll to terminal, and return token + solve_id.
-
-        Failed solves are never charged by NoneCap.
-        """
-        if not self.configured:
-            self._log("[NoneCap] No API key (set NONECAP_API_KEY)", level="error")
-            return None
-        self.stats["calls"] += 1
-        payload = {
-            "type": "hcaptcha_enterprise" if rqdata else "hcaptcha",
-            "sitekey": sitekey,
-            "url": pageurl,
-        }
-        if rqdata:
-            payload["rqdata"] = rqdata
-        if proxy:
-            payload["proxy"] = proxy
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(
-                    f"{NONECAP_BASE}/solves",
-                    params={"wait": 30},
-                    headers=self._headers(),
-                    json=payload,
-                ) as r:
-                    if r.status not in (200, 202):
-                        body = await r.text()
-                        self._log(
-                            f"[NoneCap] Solve rejected (HTTP {r.status}): {body[:200]}",
-                            level="warn")
-                        self.stats["failed"] += 1
-                        return None
-                    solve = await r.json()
-                solve_id = str(solve.get("id") or "")
-                # wait=30 may leave the solve pending; poll until terminal.
-                if str(solve.get("status")) in ("pending", "solving"):
-                    solve = await self._poll(solve_id, timeout)
-                token = solve.get("token") if isinstance(solve, dict) else None
-                if solve_id and token:
-                    self.stats["ok"] += 1
-                    self._log(
-                        f"[NoneCap] Token received ({len(token)} chars, {solve_id}) — not yet accepted")
-                    return {"token": str(token), "solve_id": solve_id}
-                err = (solve or {}).get("error") or {}
-                self._log(
-                    f"[NoneCap] Solve failed: {err.get('code', 'unknown')} "
-                    f"{str(err.get('message', ''))[:120]}",
-                    level="warn")
-                self.stats["failed"] += 1
-                return None
-        except Exception as e:
-            self._log(f"[NoneCap] Solve error: {e}", level="error")
-            self.stats["failed"] += 1
-            return None
-
-    async def _poll(self, solve_id: str, timeout: float) -> Optional[dict]:
-        deadline = time.time() + max(timeout, 30)
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as s:
-                while time.time() < deadline:
-                    async with s.get(
-                        f"{NONECAP_BASE}/solves/{solve_id}",
-                        params={"wait": 15},
-                        headers=self._headers(),
-                    ) as r:
-                        if r.status != 200:
-                            return None
-                        data = await r.json()
-                    if str(data.get("status")) not in ("pending", "solving"):
-                        return data
-        except Exception:
-            pass
-        return None
-
-    async def report(self, solve_id: str, outcome: str = "accepted",
-                     reason: str = "") -> None:
-        """Tell NoneCap whether the token was accepted downstream."""
-        if not solve_id or not self.configured:
-            return
-        item = {"solve_id": solve_id, "outcome": outcome}
-        if reason:
-            item["reason"] = reason
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as s:
-                async with s.post(
-                    f"{NONECAP_BASE}/feedback",
-                    headers=self._headers(),
-                    json={"feedback": [item]},
-                ) as r:
-                    self._log(
-                        f"[NoneCap] Feedback reported ({outcome}, HTTP {r.status})")
-        except Exception as e:
-            self._log(f"[NoneCap] Feedback error: {e}", level="warn")
-
-
-class NopechaClient:
-    """Async client for the Nopecha hCaptcha token API (free tier = no key).
-
-    Free solves are tied to the request IP when no key is supplied. ``key``
-    is only added to requests when ``NOPECHA_API_KEY`` / ``API_KEY2`` is set.
-    """
-
-    def __init__(self, log: Optional[Callable] = None):
-        self._log = log or (lambda msg, level="info": None)
-        self.stats = {"calls": 0, "ok": 0, "failed": 0}
-
-    @property
-    def configured(self) -> bool:
-        return True  # free tier needs no key
-
-    def _key(self) -> Dict[str, str]:
-        k = _nopecha_key()
-        return {"key": k} if k else {}
-
-    async def solve(self, sitekey: str, pageurl: str, rqdata: str = "",
-                    proxy: Optional[dict] = None, useragent: str = "",
-                    timeout: float = 120.0) -> Optional[dict]:
-        """Submit an hCaptcha token job and poll until a token is produced.
-
-        ``proxy`` is Nopecha's object form (scheme/host/port/username/
-        password), NOT a URL string. Returns ``{token, solve_id}`` — the
-        caller must still verify Discord accepts the token downstream.
-        """
-        self.stats["calls"] += 1
-        payload: Dict = {
-            "type": "hcaptcha",
-            "sitekey": sitekey,
-            "url": pageurl,
-        }
-        payload.update(self._key())
-        if rqdata:
-            payload["data"] = {"rqdata": rqdata}
-        if proxy:
-            payload["proxy"] = proxy
-        if useragent or _NOPECHA_UA:
-            payload["useragent"] = useragent or _NOPECHA_UA
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(
-                    f"{NOPECHA_BASE}/token/", json=payload
-                ) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        self._log(
-                            f"[Nopecha] Submit rejected (HTTP {r.status}): {body[:200]}",
-                            level="warn")
-                        self.stats["failed"] += 1
-                        return None
-                    resp = await r.json()
-                job_id = str((resp or {}).get("data") or "").strip()
-                if not job_id:
-                    err = (resp or {}).get("error")
-                    msg = str((resp or {}).get("message", ""))
-                    self._log(
-                        f"[Nopecha] Submit returned no job id (error={err}) "
-                        f"{msg[:120]}", level="warn")
-                    self.stats["failed"] += 1
-                    return None
-                token = await self._poll(job_id, timeout)
-                if token:
-                    self.stats["ok"] += 1
-                    self._log(
-                        f"[Nopecha] Token received ({len(token)} chars, "
-                        f"job {job_id[:24]}) — not yet accepted")
-                    return {"token": token, "solve_id": job_id}
-                self.stats["failed"] += 1
-                return None
-        except Exception as e:
-            self._log(f"[Nopecha] Solve error: {e}", level="error")
-            self.stats["failed"] += 1
-            return None
-
-    async def _poll(self, job_id: str, timeout: float) -> Optional[str]:
-        deadline = time.time() + max(timeout, 30)
-        params: Dict = {"id": job_id}
-        params.update(self._key())
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as s:
-                while time.time() < deadline:
-                    async with s.get(
-                        f"{NOPECHA_BASE}/token/", params=params
-                    ) as r:
-                        if r.status != 200:
-                            self._log(
-                                f"[Nopecha] Poll HTTP {r.status}", level="warn")
-                            return None
-                        data = await r.json()
-                    if not isinstance(data, dict):
-                        await asyncio.sleep(2.0)
-                        continue
-                    token = str(data.get("data") or "").strip()
-                    if token and token != job_id and len(token) > 20:
-                        return token
-                    err = data.get("error")
-                    if err == 14:  # incomplete job — keep polling
-                        await asyncio.sleep(2.0)
-                        continue
-                    if err:
-                        msg = str(data.get("message", ""))
-                        low = msg.lower()
-                        if "credit" in low or "free tier" in low:
-                            self._log(
-                                f"[Nopecha] Out of credits / daily free limit "
-                                f"reached (error={err}): {msg[:120]}", level="warn")
-                        else:
-                            self._log(
-                                f"[Nopecha] Solve failed (error={err}): "
-                                f"{msg[:120]}", level="warn")
-                        return None
-                    await asyncio.sleep(2.0)
-        except Exception:
-            pass
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════
-# DOM helpers
-# ═══════════════════════════════════════════════════════════════
 
 def _is_valid_sitekey(value: str) -> bool:
     return bool(_SITEKEY_RE.match((value or "").strip()))
@@ -559,7 +280,7 @@ async def read_hcaptcha_token(page) -> Optional[str]:
 
 
 async def set_hcaptcha_token_on_page(page, token: str) -> bool:
-    """Inject a solved NoneCap token into the hCaptcha textarea."""
+    """Inject a solved token into the hCaptcha textarea (manual/legacy use)."""
     try:
         result = await page.evaluate("""(tok) => {
             const ta = document.querySelector('textarea[name="h-captcha-response"]');
@@ -574,51 +295,3 @@ async def set_hcaptcha_token_on_page(page, token: str) -> bool:
         return bool(result)
     except Exception:
         return False
-
-
-def proxy_url_from_bot_proxy(proxy: Optional[dict]) -> str:
-    """Convert the bot's proxy dict into a URL string NoneCap accepts.
-
-    Credentials are included so the solve egresses from the same sticky exit
-    IP the browser will submit the token from (required for IP-bound
-    enterprise sitekeys).
-    """
-    if not isinstance(proxy, dict):
-        return ""
-    host = (proxy.get("host") or "").strip()
-    port = str(proxy.get("port") or "").strip()
-    if not host or not port:
-        return ""
-    scheme = (proxy.get("proto") or "http").strip().lower()
-    if scheme == "socks5h":
-        scheme = "socks5"
-    user = (proxy.get("username") or "").strip()
-    pwd = (proxy.get("password") or "").strip()
-    auth = f"{user}:{pwd}@" if user else ""
-    return f"{scheme}://{auth}{host}:{port}"
-
-
-def proxy_dict_from_bot_proxy(proxy: Optional[dict]) -> Optional[dict]:
-    """Convert the bot's proxy dict into Nopecha's proxy object format.
-
-    Nopecha expects a dict (scheme/host/port/username/password), not a URL
-    string. Credentials are included so the solve egresses from the same
-    sticky exit IP the browser will submit the token from.
-    """
-    if not isinstance(proxy, dict):
-        return None
-    host = (proxy.get("host") or "").strip()
-    port = str(proxy.get("port") or "").strip()
-    if not host or not port:
-        return None
-    scheme = (proxy.get("proto") or "http").strip().lower()
-    if scheme == "socks5h":
-        scheme = "socks5"
-    user = (proxy.get("username") or "").strip()
-    pwd = (proxy.get("password") or "").strip()
-    out = {"scheme": scheme, "host": host, "port": port}
-    if user:
-        out["username"] = user
-    if pwd:
-        out["password"] = pwd
-    return out
