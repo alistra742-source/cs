@@ -19,7 +19,8 @@ ENV PYTHONUNBUFFERED=1 \
     OLLAMA_REQUEST_TIMEOUT=180 \
     MAX_IMAGE_BYTES=10485760
 
-VOLUME ["/data"]
+# Railway manages the persistent /data mount from the service's Volume UI.
+# Do not declare Docker VOLUME here; Railpack/Railway rejects that instruction.
 EXPOSE 8080
 
 CMD ["/service/start.sh"]
