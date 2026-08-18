@@ -34,8 +34,20 @@ until curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; do
     sleep 1
 done
 
-echo "[vision-service] Pulling configured model: $MODEL_NAME"
-ollama pull "$MODEL_NAME"
+if ollama show "$MODEL_NAME" >/dev/null 2>&1; then
+    echo "[vision-service] Configured model is already cached: $MODEL_NAME"
+else
+    echo "[vision-service] Installing configured model: $MODEL_NAME"
+    # Railway currently returns EOF to Ollama's registry client while fetching
+    # some public manifests. Install the same signed OCI blobs through plain
+    # registry HTTP and verify every blob by size and SHA-256.
+    python3 -u /service/pull_model.py "$MODEL_NAME"
+fi
+
+if ! ollama show "$MODEL_NAME" >/dev/null 2>&1; then
+    echo "[vision-service] Model installation could not be verified: $MODEL_NAME" >&2
+    exit 1
+fi
 
 echo "[vision-service] Model ready. Starting gateway on 0.0.0.0:${PORT:-8080}"
 python3 -u /service/server.py

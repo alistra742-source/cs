@@ -7,7 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /service
-COPY server.py start.sh ./
+COPY server.py pull_model.py start.sh ./
 RUN chmod +x /service/start.sh
 
 ENV PYTHONUNBUFFERED=1 \
