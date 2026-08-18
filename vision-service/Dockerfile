@@ -23,4 +23,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Do not declare Docker VOLUME here; Railpack/Railway rejects that instruction.
 EXPOSE 8080
 
-CMD ["/service/start.sh"]
+# ollama/ollama defines its own `ollama` entrypoint. Replace it so Railway
+# executes our startup script instead of passing the script path to Ollama.
+ENTRYPOINT ["/service/start.sh"]
+CMD []
