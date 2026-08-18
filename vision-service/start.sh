@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-DEFAULT_MODEL="${DEFAULT_OLLAMA_MODEL:-hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0}"
+DEFAULT_MODEL="${DEFAULT_OLLAMA_MODEL:-ahmadwaqar/smolvlm2-256m-video:q8_0}"
 # OLLAMA_MODEL is preferred. MODEL is supported as a Railway-friendly alias.
 MODEL_NAME="${OLLAMA_MODEL:-${MODEL:-$DEFAULT_MODEL}}"
 export OLLAMA_MODEL="$MODEL_NAME"

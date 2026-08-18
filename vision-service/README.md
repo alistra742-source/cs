@@ -17,7 +17,7 @@ Railway will discover this directory's `Dockerfile` and `railway.toml`.
 ### Required variables
 
 ```text
-OLLAMA_MODEL=hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0
+OLLAMA_MODEL=ahmadwaqar/smolvlm2-256m-video:q8_0
 VISION_API_KEY=<generate-a-long-random-secret>
 ```
 
@@ -62,7 +62,7 @@ Example response:
 
 ```json
 {
-  "model": "hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0",
+  "model": "ahmadwaqar/smolvlm2-256m-video:q8_0",
   "response": "The image shows ...",
   "done": true
 }
@@ -70,12 +70,12 @@ Example response:
 
 ## Model choice and realistic limits
 
-`SmolVLM-500M-Instruct Q8_0` is the speed/quality choice for this size limit.
-Its Q8 language weights are about 437 MB and its Q8 vision projector is about
-109 MB (roughly 546 MB combined). It is more capable than the 256M variant
-while remaining well below 1.3 GB. It is suitable for captioning, OCR, and
-visual Q&A, but it will not recognize everything and it cannot safely "do
-everything." Smaller models trade accuracy for low size and cost.
+`SmolVLM2-256M-Video-Instruct Q8_0` is selected for Railway Trial limits.
+Its Ollama package is about 279 MB including the vision projector, so it fits a
+0.5 GB Trial volume. It is suitable for lightweight captioning, OCR, and visual
+Q&A, but it is less capable than the 500M variant, will not recognize
+everything, and cannot safely "do everything." Smaller models trade accuracy
+for low size and cost.
 
 Ollama performs inference; it does not train the model. A later lawful training
 workflow would be:

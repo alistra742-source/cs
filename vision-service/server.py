@@ -28,7 +28,7 @@ OLLAMA_MODEL = (
     os.environ.get("OLLAMA_MODEL")
     or os.environ.get("MODEL")
     or os.environ.get("DEFAULT_OLLAMA_MODEL")
-    or "hf.co/ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
+    or "ahmadwaqar/smolvlm2-256m-video:q8_0"
 ).strip()
 API_KEY = os.environ.get("VISION_API_KEY", "")
 REQUEST_TIMEOUT = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "180"))
