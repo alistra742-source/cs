@@ -147,28 +147,6 @@ class VisionHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        if self.path == "/health":
-            try:
-                tags = _ollama("/api/tags", timeout=5)
-                names = [
-                    item.get("name") or item.get("model")
-                    for item in tags.get("models", [])
-                    if isinstance(item, dict)
-                ]
-                self._send(
-                    HTTPStatus.OK,
-                    {
-                        "ok": True,
-                        "model": OLLAMA_MODEL,
-                        "model_available": OLLAMA_MODEL in names,
-                    },
-                )
-            except Exception:
-                self._send(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"ok": False, "error": "Ollama is unavailable."},
-                )
-            return
         if self.path == "/":
             self._send(
                 HTTPStatus.OK,

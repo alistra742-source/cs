@@ -1,7 +1,7 @@
 FROM ollama/ollama:latest
 
 # The official Ollama image contains the runtime. Python and curl power the
-# small authenticated HTTP gateway and startup health checks.
+# small authenticated HTTP gateway and local Ollama startup checks.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 \
     && rm -rf /var/lib/apt/lists/*

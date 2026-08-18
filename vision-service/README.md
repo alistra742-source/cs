@@ -44,12 +44,6 @@ are faster when the `/data` volume is attached.
 
 ## API
 
-### Health
-
-```bash
-curl https://YOUR-SERVICE.up.railway.app/health
-```
-
 ### Analyze an image
 
 ```bash
