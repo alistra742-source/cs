@@ -37,10 +37,22 @@ done
 if ollama show "$MODEL_NAME" >/dev/null 2>&1; then
     echo "[vision-service] Configured model is already cached: $MODEL_NAME"
 else
+    # Failed pulls can leave large orphan/partial blobs that Ollama does not
+    # list or prune. If no model is installed, clear only Ollama's model store
+    # before retrying; the dedicated Railway volume contains no app data.
+    INSTALLED_COUNT="$(ollama list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
+    if [ "$INSTALLED_COUNT" -eq 0 ]; then
+        echo "[vision-service] Removing orphaned data from earlier failed pulls..."
+        rm -rf "$OLLAMA_MODELS/blobs" "$OLLAMA_MODELS/manifests"
+        mkdir -p "$OLLAMA_MODELS/blobs" "$OLLAMA_MODELS/manifests"
+    else
+        find "$OLLAMA_MODELS/blobs" -maxdepth 1 -type f -name '*-partial' -delete 2>/dev/null || true
+    fi
+
     echo "[vision-service] Installing configured model: $MODEL_NAME"
     # Railway currently returns EOF to Ollama's registry client while fetching
-    # some public manifests. Install the same signed OCI blobs through plain
-    # registry HTTP and verify every blob by size and SHA-256.
+    # some public manifests. Install the same content-addressed OCI blobs
+    # through registry HTTP and verify every blob by size and SHA-256.
     python3 -u /service/pull_model.py "$MODEL_NAME"
 fi
 
