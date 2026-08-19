@@ -505,6 +505,7 @@ async () => {
         'select, [role="combobox"], [role="listbox"], [class*="select" i], [class*="dropdown" i], [class*="control" i]'
     )).filter(labelHits);
     if (!candidates.length) {
+        if (!document.body) return 'not_found';
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         const labels = DOB_LABELS[LABEL] || [LABEL.toLowerCase()];
@@ -784,6 +785,7 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
     // Text-walker fallback: controls with none of the role/class markers
     // (their placeholder text still identifies them).
     if (!hits.length) {
+        if (!document.body) return null;
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
