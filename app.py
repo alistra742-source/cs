@@ -13,13 +13,7 @@ import requests as _requests
 
 from flask import Flask, jsonify, request, Response
 
-try:
-    import db
-    _db_available = True
-except ImportError:
-    db = None
-    _db_available = False
-    print("[app] db.py not found - token saving disabled", flush=True)
+# Database removed - no token persistence
 
 try:
     from proxies import (pool as proxy_pool, configured as _proxies_configured,
@@ -77,7 +71,6 @@ DEFAULT_CONFIG = {
     "custom_email": "",
 }
 
-
 def load_config(path: str = _config_path) -> dict:
     config = dict(DEFAULT_CONFIG)
     if os.path.exists(path):
@@ -92,14 +85,12 @@ def load_config(path: str = _config_path) -> dict:
     config["web_port"] = int(os.environ.get("PORT", config.get("web_port", 8080)))
     return config
 
-
 def save_config(config: dict, path: str = _config_path) -> None:
     try:
         with open(path, 'w') as f:
             json.dump(config, f, indent=2)
     except Exception:
         pass
-
 
 # Shared ring buffer so app-level lines (proxy stats, worker outcomes) reach
 # the web terminal, not just stdout.
@@ -113,7 +104,6 @@ _BURNED_DOMAINS: set = {
     "mikerossy.com", "blobers.it.com", "vibify.cc", "vibeify.cc",
 }
 
-
 def _load_burned() -> None:
     global _BURNED_DOMAINS
     _BURNED_DOMAINS = {"mikerossy.com", "blobers.it.com", "vibify.cc", "vibeify.cc"}
@@ -123,7 +113,6 @@ def _load_burned() -> None:
             str(d).strip().lower() for d in (cfg.get("burned_domains") or []))
     except Exception:
         pass
-
 
 def _burn_domain(domain: str) -> None:
     """Permanently remove a domain from the pool after a phone-verification hit."""
@@ -145,7 +134,6 @@ def _burn_domain(domain: str) -> None:
     except Exception:
         pass
 
-
 def _pick_domain(cfg: dict) -> str:
     """Pick a fresh, non-burned inbox domain from the configured list (falls
     back to duckmail's default @glasswhitehub.com)."""
@@ -159,12 +147,10 @@ def _pick_domain(cfg: dict) -> str:
             return random.choice(fresh)
     return DEFAULT_MAIL_DOMAIN
 
-
 # App-level logs: proxy sweeps, AI warm-up, worker chatter etc. only appear
 # in the ALL logs (LOG_LEVEL=all). Warnings / errors always print.
 _APP_LOG_ALL = os.environ.get("LOG_LEVEL", "").strip().lower() \
     in ("all", "debug", "verbose")
-
 
 def _log(msg: str, level: str = "info"):
     # Store EVERYTHING so the dashboard's ALL LOGS toggle can show it; only
@@ -182,7 +168,6 @@ def _log(msg: str, level: str = "info"):
         _APP_LOGS[:] = _APP_LOGS[-400:]
     if _APP_LOG_ALL or essential:
         print(f"[{level.upper()}] {msg}", flush=True)
-
 
 # ── Worker management (runs in the asyncio thread) ──
 
@@ -204,7 +189,6 @@ def _init_worker(wid: str) -> dict:
         "launching": False,
     }
 
-
 async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
     """Capture screenshots for this worker, staggered so browsers don't all
     upload at the same time: B1 immediately, B2 after 2s, B3 after 4s..."""
@@ -224,7 +208,6 @@ async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
             pass
         await asyncio.sleep(interval)
 
-
 async def _next_proxy(force: bool = False):
     """Grab the least-recently-used proxy session, or None (auto mode only —
     the caller may fall back to TOR). In force mode the pool is refreshed on
@@ -239,7 +222,6 @@ async def _next_proxy(force: bool = False):
     if proxy_pool.count > 0:
         return proxy_pool.take()
     return None
-
 
 async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
     """Draw the next session and only accept it if it probes live against
@@ -270,7 +252,6 @@ async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
             pass
     return None
 
-
 def _proxy_stats_line(wid: str) -> None:
     """Log live proxy usage counters (used / working / failed) for the terminal."""
     try:
@@ -281,7 +262,6 @@ def _proxy_stats_line(wid: str) -> None:
         f"[{wid}] [Proxy] Used {s.get('used', 0)} sessions, "
         f"Working {s.get('working', 0)}, Failed {s.get('failed', 0)}"
     )
-
 
 async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
     """Worker loop: one proxy session per signup attempt, rotating on failure.
@@ -386,10 +366,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
         if bot is None:
             bot = DiscordAutomation(
                 headless=cfg.get("headless", True),
-                proxy=proxy,  # dict = sticky session; None = TOR in _build_context
-                worker_id=wid,
                 domain=domain,
-                email=cfg.get("custom_email") or "",
             )
             state["bot"] = bot
             try:
@@ -476,16 +453,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
             state["token"] = acc["token"]
             if ok and acc["token"]:
                 state["status"] = "done"
-                if _db_available and db is not None:
-                    await db.save_account(
-                        email=acc["email"], username=acc["username"],
-                        password=acc["password"], token=acc["token"],
-                        proxy=label, worker_id=wid,
-                        user_id=acc.get("user_id", ""),
-                        avatar=acc.get("avatar", ""),
-                        bio=acc.get("bio", ""),
-                        humanized=bool(acc.get("humanized")),
-                    )
+
                 _log(f"[{wid}] Done - token {len(acc['token'])} chars ({label})")
                 if proxy:
                     proxy_pool.release(proxy, ok=True)
@@ -511,18 +479,6 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 # custom email the user must verify manually). Persist it as
                 # pending so it is never lost — the user clicks the verify
                 # link in their own inbox and the account is theirs.
-                if (_db_available and db is not None
-                        and acc.get("email") and acc.get("username")
-                        and acc.get("password")):
-                    await db.save_account(
-                        email=acc["email"], username=acc["username"],
-                        password=acc["password"], token=acc.get("token", ""),
-                        proxy=label, worker_id=wid,
-                        user_id=acc.get("user_id", ""),
-                        avatar=acc.get("avatar", ""), bio=acc.get("bio", ""),
-                        humanized=bool(acc.get("humanized")),
-                    )
-                    _log(f"[{wid}] Pending account saved (email verification required to unlock token)")
                 # Park the browser on Discord for reuse on the next Start.
                 return
 
@@ -605,7 +561,6 @@ async def _proxy_validate_loop() -> None:
             _log(f"[Proxy] validation error: {e}", level="warn")
         await asyncio.sleep(180)
 
-
 async def _proxy_file_watcher(interval: float = 15.0) -> None:
     """Reload the proxy pool the moment proxies.txt / vaultproxies.txt changes.
 
@@ -637,7 +592,6 @@ async def _proxy_file_watcher(interval: float = 15.0) -> None:
                             pass
         except Exception as e:
             _log(f"[Proxy] file watcher error: {e}", level="warn")
-
 
 async def _start_all_async(cfg: dict) -> None:
     global _running, _start_time
@@ -722,7 +676,6 @@ async def _start_all_async(cfg: dict) -> None:
             _log(f"[{wid}] Starting worker...")
             asyncio.create_task(_run_worker(wid, cfg, None))
 
-
 async def _stop_all_async() -> None:
     global _running
     _running = False
@@ -742,7 +695,6 @@ async def _stop_all_async() -> None:
             state["status"] = "stopped"
     _log("[App] All workers stopped (browser parked on Discord - reused on next Start)")
 
-
 def _run_in_loop(coro) -> Optional[object]:
     if not _loop:
         _log("[Loop] Event loop not running!", level="error")
@@ -755,7 +707,6 @@ def _run_in_loop(coro) -> Optional[object]:
         import traceback
         traceback.print_exc()
         return None
-
 
 async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     """Navigate the live tab and self-heal a dead proxy tunnel.
@@ -821,7 +772,6 @@ async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     st["error"] = f"site unreachable after retries ({first_err})"
     return st
 
-
 async def _start_live_browser(wid: str, url: str = "",
                               force: bool = False) -> dict:
     """Attach (or cold-launch) the worker's real browser for the LIVE tab.
@@ -866,10 +816,7 @@ async def _start_live_browser(wid: str, url: str = "",
         if bot is None:
             bot = DiscordAutomation(
                 headless=bool(cfg.get("headless", True)),
-                proxy=None,
-                worker_id=wid,
                 domain=_pick_domain(cfg),
-                email=cfg.get("custom_email") or "",
             )
             state["bot"] = bot
         try:
@@ -920,7 +867,6 @@ async def _start_live_browser(wid: str, url: str = "",
     finally:
         state["launching"] = False
 
-
 async def _close_live_browser(wid: str) -> bool:
     state = _workers.get(wid)
     bot = state.get("bot") if state else None
@@ -938,16 +884,13 @@ async def _close_live_browser(wid: str) -> bool:
     state["last_shot_b64"] = ""
     return True
 
-
 # ── Flask app ─────────────────────────────────────────────
 
 app = Flask(__name__)
 
-
 @app.route('/')
 def handle_root():
     return Response(DASHBOARD_HTML, content_type='text/html')
-
 
 @app.route('/start', methods=['POST'])
 def handle_start():
@@ -964,12 +907,10 @@ def handle_start():
     except Exception as e:
         return jsonify({"ok": False, "msg": f"Start error: {e}"})
 
-
 @app.route('/stop', methods=['POST'])
 def handle_stop():
     _run_in_loop(_stop_all_async())
     return "Stopped"
-
 
 @app.route('/proxies/refresh', methods=['POST'])
 def handle_proxy_refresh():
@@ -977,7 +918,6 @@ def handle_proxy_refresh():
         _run_in_loop(proxy_pool.refresh())
         return jsonify(proxy_pool.stats())
     return jsonify({"error": "proxies module not loaded"})
-
 
 def _mask_proxy_key(key: str) -> str:
     """Display-safe form of a proxy key (user:pass@host:port) — never leak
@@ -989,7 +929,6 @@ def _mask_proxy_key(key: str) -> str:
         sid = "s-" + m.group(1)[:10]
     return f"{sid} @ {host}" if sid else host
 
-
 @app.route('/proxies')
 def handle_proxies():
     """Proxy dashboard data: valid / used / invalid / unproven sessions.
@@ -998,8 +937,6 @@ def handle_proxies():
     tab still shows history (and the pool skips already-used sticky IPs)
     after a redeploy."""
     rows = []
-    if _db_available and db is not None:
-        rows = _run_in_loop(db.list_proxies()) or []
     db_map = {r.get("key"): r for r in rows}
 
     def _mk(key, rec, live_flag=False):
@@ -1090,7 +1027,6 @@ def handle_status():
         "proxies": proxy_pool.stats() if (_proxies_available and proxy_pool is not None) else {},
     })
 
-
 @app.route('/latest')
 def handle_latest_screenshot():
     wid = request.args.get("worker", "B1")
@@ -1113,7 +1049,6 @@ def handle_latest_screenshot():
             except Exception:
                 pass
     return Response(status=404)
-
 
 # ── LIVE CONTROL routes ──────────────────────────────────
 
@@ -1143,7 +1078,6 @@ def handle_browser_state():
     st["status"] = s.get("status", "")
     return jsonify(st)
 
-
 @app.route('/browser/navigate', methods=['POST'])
 def handle_browser_navigate():
     wid = request.args.get("worker", "B1")
@@ -1164,7 +1098,6 @@ def handle_browser_navigate():
         s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
-
 @app.route('/browser/action', methods=['POST'])
 def handle_browser_action():
     wid = request.args.get("worker", "B1")
@@ -1180,7 +1113,6 @@ def handle_browser_action():
                         "error": "event loop unavailable"}), 503
     return jsonify(st)
 
-
 @app.route('/browser/start', methods=['POST'])
 def handle_browser_start():
     wid = request.args.get("worker", "B1")
@@ -1193,13 +1125,11 @@ def handle_browser_start():
                         "error": "event loop unavailable"}), 503
     return jsonify(st)
 
-
 @app.route('/browser/close', methods=['POST'])
 def handle_browser_close():
     wid = request.args.get("worker", "B1")
     closed = _run_in_loop(_close_live_browser(wid))
     return jsonify({"closed": bool(closed)})
-
 
 @app.route('/worker/<wid>/logs')
 def handle_worker_logs(wid):
@@ -1229,14 +1159,12 @@ def handle_worker_logs(wid):
         "logs": merged,  # store caps (500 bot / 400 app) bound the size
     })
 
-
 @app.route('/tokens')
 def handle_tokens():
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"count": 0, "valid": 0, "expired": 0, "pending": 0,
                         "accounts": [], "stats": {"total": 0, "valid": 0,
                         "expired": 0, "pending": 0}, "error": "DB not available"})
-    accounts = _run_in_loop(db.list_accounts(limit=500)) or []
     expired = sum(1 for a in accounts if a.get("status") == "invalid")
     valid = sum(1 for a in accounts if a.get("status") == "valid")
     pending = len(accounts) - expired - valid
@@ -1250,24 +1178,19 @@ def handle_tokens():
                    "expired": expired, "pending": pending},
     })
 
-
 @app.route('/validate', methods=['POST'])
 def handle_validate():
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     # Cap at 200 so the synchronous validate stays inside the 120s loop budget
-    accounts = _run_in_loop(db.list_accounts(limit=200)) or []
-    valid = _run_in_loop(db.validate_all_tokens(accounts)) if accounts else 0
-    accounts = _run_in_loop(db.list_accounts(limit=200)) or []
     expired = sum(1 for a in accounts if a.get("status") == "invalid")
     return jsonify({"count": len(accounts), "valid": valid, "expired": expired,
                     "accounts": accounts})
 
-
 @app.route('/export', methods=['POST'])
 def handle_export():
     """Preview the next N accounts for export (does NOT delete)."""
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     data = request.get_json(silent=True) or {}
     try:
@@ -1275,7 +1198,6 @@ def handle_export():
     except Exception:
         count = 5
     mode = 'full' if data.get('mode') == 'full' else 'tokens'
-    accounts = _run_in_loop(db.list_accounts(limit=500)) or []
     chosen = [a for a in accounts if a.get('token')][:count]
     out = []
     for a in chosen:
@@ -1297,11 +1219,10 @@ def handle_export():
         })
     return jsonify({"count": len(out), "accounts": out})
 
-
 @app.route('/export/delete', methods=['POST'])
 def handle_export_delete():
     """Delete exported accounts after the user confirms the copy."""
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     data = request.get_json(silent=True) or {}
     ids = []
@@ -1312,9 +1233,7 @@ def handle_export_delete():
             pass
     if not ids:
         return jsonify({"ok": False, "msg": "no ids"})
-    deleted = _run_in_loop(db.delete_accounts(ids)) or 0
     return jsonify({"ok": True, "deleted": deleted})
-
 
 @app.route('/config', methods=['GET', 'POST'])
 def handle_config():
@@ -1342,13 +1261,11 @@ def handle_config():
                     "burned_domains": sorted(_BURNED_DOMAINS),
                     "available_domains": avail})
 
-
 # ── Background event loop ─────────────────────────────────
 
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
-
 
 def main() -> None:
     global _loop
@@ -1364,8 +1281,6 @@ def main() -> None:
     t.start()
 
     # Auto-migrate DB (DATABASE_URL from env)
-    if _db_available and db is not None:
-        _run_in_loop(db.init_db())
 
     print("=" * 56, flush=True)
     print("  EYES GEN - multi-browser Discord token generator", flush=True)
@@ -1375,7 +1290,6 @@ def main() -> None:
 
     app.run(host='0.0.0.0', port=web_port, debug=False,
             use_reloader=False, threaded=True)
-
 
 # ═══════════════════════════════════════════════════════════
 # EYES GEN DASHBOARD — mobile-first
@@ -1629,7 +1543,6 @@ input:focus{border-color:var(--dim)}
   </div>
   <div id="accList"><div class="empty">No accounts yet - run the generator first.</div></div>
 </div>
-
 
 <div class="overlay" id="viewOverlay" onclick="if(event.target===this)closeView()">
   <div class="modal">
