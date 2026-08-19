@@ -17,6 +17,7 @@ from captcha_solver import (
 )
 from duckmail import TempMail
 from vision_solver import OllamaVisionClient
+from drag_solver import DragSolver
 
 
 # ── Shared JS: robust login-link / back-to-login detection ──────────────
@@ -2100,38 +2101,49 @@ class DiscordAutomation:
         self._log(f"[Nav] Form never rendered - rotating to {proxy_label}", level="warn")
         return False
 
-    async def _recover_crashed_page(self, url: str) -> bool:
-        """Resurrect a crashed tab by opening a fresh page in the SAME
-        context (same proxy + fingerprint) and re-issuing the goto.
-
-        A renderer crash is usually a transient memory spike, not a dead
-        circuit — so recover in place once before rotating. If the fresh tab
-        crashes too, _goto_register rotates to a new circuit."""
-        self._log("[Nav] Recovering crashed tab - fresh page on same circuit...", level="warn")
-        try:
-            if self._context is None:
-                self._log("[Nav] Crash recovery impossible - context is gone (browser closed)", level="error")
-                return False
-            if self._page is not None:
+        async def _recover_crashed_page(self, url: str) -> bool:
+            """Resurrect a crashed tab. If the browser died, relaunch it."""
+            self._log('[Nav] Recovering crashed tab...', level='warn')
+            browser_dead = False
+            if self._browser is None:
+                browser_dead = True
+            else:
                 try:
-                    await self._page.close()
+                    browser_dead = not await self._browser.is_connected()
                 except Exception:
-                    pass
-            self._page = await self._context.new_page()
-            self._attach_rqdata_capture()
-            self._attach_crash_listener()
-            await asyncio.wait_for(
-                self._page.goto(url, wait_until="domcontentloaded", timeout=30000),
-                timeout=33.0)
-            # Give the fresh tab a beat to start committing before the
-            # render-wait loop resumes polling it.
-            await asyncio.sleep(0.5)
-            self._log("[Nav] Crash recovery OK - new tab navigating on same circuit")
-            return True
-        except Exception as e:
-            self._log(f"[Nav] Crash recovery failed ({type(e).__name__}: {e}) - rotating circuit", level="error")
-            return False
-
+                    browser_dead = True
+            if browser_dead:
+                self._log('[Nav] Browser died - relaunching', level='warn')
+                try:
+                    await self._relaunch_browser()
+                    if self._page is None:
+                        return False
+                    await asyncio.wait_for(self._page.goto(url, wait_until='domcontentloaded', timeout=30000), timeout=33.0)
+                    await asyncio.sleep(0.5)
+                    self._log('[Nav] Browser relaunch OK', level='info')
+                    return True
+                except Exception as e:
+                    self._log(f'[Nav] Browser relaunch failed: {e}', level='error')
+                    return False
+            try:
+                if self._context is None:
+                    self._log('[Nav] No context', level='error')
+                    return False
+                if self._page is not None:
+                    try:
+                        await self._page.close()
+                    except Exception:
+                        pass
+                self._page = await self._context.new_page()
+                self._attach_rqdata_capture()
+                self._attach_crash_listener()
+                await asyncio.wait_for(self._page.goto(url, wait_until='domcontentloaded', timeout=30000), timeout=33.0)
+                await asyncio.sleep(0.5)
+                self._log('[Nav] Crash recovery OK', level='info')
+                return True
+            except Exception as e:
+                self._log(f'[Nav] Recovery failed ({type(e).__name__}: {e})', level='error')
+                return False
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
@@ -3401,12 +3413,13 @@ class DiscordAutomation:
                     self._log(f"[Captcha] Captcha check error: {e}", level="warn")
                 return False
 
-            # ---- VISION SOLVER: local Ollama model reads the image grid ----
+            # ---- VISION SOLVER: reads the image grid via vision_solver ----
             # No paid token APIs (NoneCap / Nopecha are gone). The bot reads
-            # the challenge instruction, screenshots every tile, asks a local
-            # Ollama vision model which tiles match, clicks them + Verify, and
-            # hCaptcha itself mints the token. See vision_solver.py for the
-            # recommended model (qwen3-vl:2b).
+            # the challenge instruction, screenshots every tile, asks a
+            # vision model (local Ollama or remote VISION_API_BASE endpoint)
+            # which tiles match, clicks them + Verify, and hCaptcha itself
+            # mints the token. See vision_solver.py for the recommended
+            # model (qwen3-vl:2b).
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -3423,8 +3436,8 @@ class DiscordAutomation:
                 ok, models = await self._vision.check()
                 if not ok:
                     self._log(
-                        "[Captcha] Ollama server unreachable - set OLLAMA_BASE or run "
-                        "'ollama serve' (recommended model: qwen3-vl:2b)",
+                        "[Captcha] Ollama server unreachable - set VISION_API_BASE (or OLLAMA_BASE) "
+                        "or run 'ollama serve' (recommended model: qwen3-vl:2b)",
                         level="error")
                 elif self._vision.model not in models:
                     self._log(
@@ -3652,9 +3665,27 @@ class DiscordAutomation:
             return False
 
     async def _solve_funcaptcha(self) -> bool:
-        """FunCAPTCHA (Arkose) has no in-browser solver configured - rotating."""
-        self._log("[FunCAPTCHA] No FunCAPTCHA solver configured — rotating", level="error")
-        return False
+        """FunCAPTCHA (Arkose) solver using vision AI (DragSolver).
+
+        Uses the vision model (configured via VISION_API_BASE / OLLAMA_BASE)
+        to handle slider puzzles, tile-click challenges, and drag-to-match
+        challenges served by Arkose Labs FunCAPTCHA.
+        """
+        try:
+            solver = DragSolver(
+                page=self._page,
+                vision=self._vision,
+                log=self._log,
+            )
+            if await solver.detect(timeout=8.0):
+                self._log("[FunCAPTCHA] DragSolver engaged", level="info")
+                return await solver.solve(timeout=45.0)
+            self._log("[FunCAPTCHA] No FunCAPTCHA frame detected by DragSolver",
+                      level="warn")
+            return False
+        except Exception as e:
+            self._log(f"[FunCAPTCHA] DragSolver error: {e}", level="error")
+            return False
 
     async def _form_ready(self) -> dict:
         """Evaluate _FORM_READY_JS with the locale-aware DOB label table."""

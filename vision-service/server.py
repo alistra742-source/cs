@@ -31,6 +31,13 @@ OLLAMA_MODEL = (
     or "ahmadwaqar/smolvlm2-256m-video:q8_0"
 ).strip()
 API_KEY = os.environ.get("VISION_API_KEY", "")
+# The external/public URL clients use to reach this gateway.  Set by Railway
+# as RAILWAY_PUBLIC_DOMAIN, or override manually with VISION_API_BASE.
+VISION_API_BASE = (
+    os.environ.get("VISION_API_BASE")
+    or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    or ""
+).rstrip("/")
 REQUEST_TIMEOUT = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "180"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "8"))
@@ -148,15 +155,15 @@ class VisionHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         if self.path == "/":
-            self._send(
-                HTTPStatus.OK,
-                {
-                    "service": "small-vision-ai",
-                    "model": OLLAMA_MODEL,
-                    "endpoint": "POST /v1/analyze",
-                    "authentication": "Bearer token or X-API-Key",
-                },
-            )
+            info = {
+                "service": "small-vision-ai",
+                "model": OLLAMA_MODEL,
+                "endpoint": "POST /v1/analyze",
+                "authentication": "Bearer token or X-API-Key",
+            }
+            if VISION_API_BASE:
+                info["base_url"] = VISION_API_BASE
+            self._send(HTTPStatus.OK, info)
             return
         self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
@@ -241,5 +248,6 @@ class VisionServer(ThreadingHTTPServer):
 if __name__ == "__main__":
     if not API_KEY:
         raise SystemExit("VISION_API_KEY is required.")
-    print(f"[vision-service] Gateway ready on {HOST}:{PORT} using {OLLAMA_MODEL}", flush=True)
+    url_part = f" ({VISION_API_BASE})" if VISION_API_BASE else ""
+    print(f"[vision-service] Gateway ready on {HOST}:{PORT}{url_part} using {OLLAMA_MODEL}", flush=True)
     VisionServer((HOST, PORT), VisionHandler).serve_forever()

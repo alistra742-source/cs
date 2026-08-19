@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""vision_solver.py — local Ollama vision solver for the hCaptcha image grid.
+"""vision_solver.py — local/remote vision solver for the hCaptcha image grid.
 
-Replaces the paid NoneCap / Nopecha token APIs with a model you own and run
-locally. Instead of minting a token server-side, the bot:
+Replaces the paid NoneCap / Nopecha token APIs with a vision model you own
+and run. Instead of minting a token server-side, the bot:
 
   1. reads the challenge prompt ("Please select all images with a boat") from
      the hCaptcha challenge frame,
   2. screenshots every tile of the image grid,
-  3. sends the prompt + tile images to a local Ollama vision model,
+  3. sends the prompt + tile images to a vision model,
   4. the model answers with the tile numbers that satisfy the task,
   5. the bot clicks those tiles + Verify (see server.py's
      ``_solve_hcaptcha_if_present``), and hCaptcha itself mints the token.
 
 Configuration (env vars):
 
-  OLLAMA_BASE   base URL of the Ollama server (default http://localhost:11434)
-  OLLAMA_MODEL  vision model to use (default qwen3-vl:2b)
-  OLLAMA_TIMEOUT  per-request timeout in seconds (default 180)
+  VISION_API_BASE  base URL of the vision API endpoint. Overrides
+                   OLLAMA_BASE when set. Points to an Ollama-compatible API
+                   (default: http://localhost:11434 — the fallback when
+                   neither VISION_API_BASE nor OLLAMA_BASE is set).
+  OLLAMA_BASE      legacy alias — used only when VISION_API_BASE is empty.
+  VISION_API_KEY   Bearer token for authenticated vision endpoints
+                   (optional — added as ``Authorization: Bearer <key>``
+                   header to every request when set).
+  OLLAMA_MODEL     vision model to use (default qwen3-vl:2b)
+  OLLAMA_TIMEOUT   per-request timeout in seconds (default 180)
 
 Model recommendation (small, better than Moondream):
 
@@ -48,7 +55,14 @@ from typing import Callable, List, Optional
 
 import aiohttp
 
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434").rstrip("/")
+# ── VISION_API_BASE is the canonical env var.  OLLAMA_BASE is the legacy
+# fallback when only the old name is set.  Neither is required: the default
+# http://localhost:11434 serves the local-Ollama development workflow.
+VISION_API_BASE = os.environ.get("VISION_API_BASE", "").rstrip("/")
+_OLLAMA_BASE_LEGACY = os.environ.get("OLLAMA_BASE", "").rstrip("/")
+OLLAMA_BASE = VISION_API_BASE or _OLLAMA_BASE_LEGACY or "http://localhost:11434"
+
+VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:2b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 
@@ -71,18 +85,36 @@ _JSON_STRING_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
 
 class OllamaVisionClient:
-    """Async client for a local Ollama vision model (no paid API involved)."""
+    """Async client for a vision model endpoint (Ollama or authenticated gateway).
+
+    Connects to the endpoint defined by the env vars:
+      - ``VISION_API_BASE`` (canonical) or ``OLLAMA_BASE`` (legacy)
+      - ``VISION_API_KEY`` for Bearer auth when talking to an authenticated gateway
+    """
 
     def __init__(self, log: Optional[Callable] = None,
                  base: str = OLLAMA_BASE, model: str = OLLAMA_MODEL):
         self._log = log or (lambda msg, level="info": None)
         self.base = base.rstrip("/")
         self.model = model or "qwen3-vl:2b"
+        self._api_key = VISION_API_KEY
         self.stats = {"calls": 0, "ok": 0, "failed": 0}
+        # Log which env var supplied the base, so diagnostics are clear.
+        src = "VISION_API_BASE" if os.environ.get("VISION_API_BASE", "").strip() else \
+              ("OLLAMA_BASE" if os.environ.get("OLLAMA_BASE", "").strip() else "default")
+        self._log(f"[Vision] API endpoint: {self.base} (from {src})"
+                  f"{' [authenticated]' if self._api_key else ''}")
 
     @property
     def configured(self) -> bool:
         return bool(self.base)
+
+    async def _headers(self) -> dict:
+        """HTTP headers including optional Bearer auth."""
+        h = {"Content-Type": "application/json"}
+        if self._api_key:
+            h["Authorization"] = f"Bearer {self._api_key}"
+        return h
 
     async def check(self) -> tuple:
         """Probe the Ollama server and list pulled models.
@@ -93,7 +125,8 @@ class OllamaVisionClient:
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(f"{self.base}/api/tags") as r:
+                async with s.get(f"{self.base}/api/tags",
+                                 headers=await self._headers()) as r:
                     if r.status != 200:
                         self._log(f"[Ollama] /api/tags HTTP {r.status}", level="warn")
                         return False, []
@@ -119,7 +152,7 @@ class OllamaVisionClient:
           None  — model unreachable or answer unparseable
         """
         if not self.configured:
-            self._log("[Ollama] No OLLAMA_BASE configured", level="error")
+            self._log("[Ollama] No vision API base configured (set VISION_API_BASE or OLLAMA_BASE)", level="error")
             return None
         if not images:
             return None
@@ -148,7 +181,8 @@ class OllamaVisionClient:
         try:
             timeout_cfg = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(f"{self.base}/api/chat", json=payload) as r:
+                async with s.post(f"{self.base}/api/chat", json=payload,
+                                  headers=await self._headers()) as r:
                     if r.status != 200:
                         body = await r.text()
                         self._log(

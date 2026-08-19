@@ -25,6 +25,18 @@ VISION_API_KEY=<generate-a-long-random-secret>
 you set both, make their values identical. Do not set `PORT` because Railway
 provides it automatically.
 
+### Optional variables
+
+```text
+VISION_API_BASE=https://your-service.up.railway.app
+```
+
+Set `VISION_API_BASE` to the public URL of this service. When provided, the
+gateway returns it in the `base_url` field of its `GET /` health-check
+response and includes it in the startup log. Railway's own
+`RAILWAY_PUBLIC_DOMAIN` variable is also recognised if `VISION_API_BASE` is
+not set.
+
 ### Recommended volume
 
 Attach a Railway volume mounted at:
