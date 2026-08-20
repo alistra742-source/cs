@@ -42,6 +42,7 @@ TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0
 
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
+import live_ui
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -890,7 +891,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def handle_root():
-    return Response(DASHBOARD_HTML, content_type='text/html')
+    html = DASHBOARD_HTML
+    idx = html.rfind("</body>")
+    if idx != -1:
+        html = html[:idx] + live_ui.LIVE_INJECTION + html[idx:]
+    return Response(html, content_type='text/html')
 
 @app.route('/start', methods=['POST'])
 def handle_start():
@@ -1015,13 +1020,15 @@ def handle_status():
         })
     try:
         cfg_now = load_config()
-        _mail_domains = cfg_now.get("mail_domains", []) or []
     except Exception:
-        _mail_domains = []
+        cfg_now = dict(DEFAULT_CONFIG)
+    _mail_domains = cfg_now.get("mail_domains", []) or []
     return jsonify({
         "running": _running,
         "uptime": int(time.time() - _start_time) if _start_time else 0,
         "workers": workers,
+        "headless": bool(cfg_now.get("headless", True)),
+        "workerCount": int(cfg_now.get("worker_count", WORKER_COUNT)),
         "mail_domains": _mail_domains,
         "custom_email": cfg_now.get("custom_email", ""),
         "proxies": proxy_pool.stats() if (_proxies_available and proxy_pool is not None) else {},
@@ -1420,7 +1427,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <label>Headless</label>
 <div class="flex mb">
 <button id="hlOn" onclick="setHeadless(true)">ON</button>
-<button id="hOff" onclick="setHeadless(false)">OFF</button>
+<button id="hlOff" onclick="setHeadless(false)">OFF</button>
 </div>
 <label>Workers</label>
 <select id="workerCount" onchange="saveConfig()">
@@ -1495,7 +1502,7 @@ function refreshStatus(){
   fetch('/status').then(function(r){return r.json()}).then(function(s){
     try{
       $('statusDot').className='dot'+(s&&s.running?' on':'');
-      $('statusText').textContent=s&&s.running?'running ('+s.workers+' workers)':'idle';
+      $('statusText').textContent=s&&s.running?'running ('+((s.workers&&s.workers.length)||0)+' workers)':'idle';
       $('statGenerated').textContent=(s&&s.generated)||0;
       $('statValid').textContent=(s&&s.valid)||0;
       $('statExpired').textContent=(s&&s.expired)||0;
@@ -1525,9 +1532,9 @@ function refreshLogs(){
         // strip ancient lines so the UI shows only fresh activity
         var logs=(d.all_logs||d.logs);
         var cutoff=Date.now()/1000-300;
-        var fresh=logs.filter(function(l){return(l.time||0)>=cutoff});
+        var fresh=logs.filter(function(l){return(l.timestamp||l.time||0)>=cutoff});
         box.textContent=fresh.length?fresh.slice(-80).map(function(l){
-          return (l.t||'') + ' ' + (l.m||'');
+          return (l.time||'') + ' ' + (l.message||l.m||'');
         }).join('\n'):'No recent activity.';
         box.scrollTop=box.scrollHeight;
       }
@@ -1567,7 +1574,7 @@ window.refreshProxies=refreshProxies;
 function viewAllLogs(){
   fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
     var logs=(d&&d.all_logs||d&&d.logs||[]);
-    var text=logs.map(function(l){return(l.t||'')+' '+(l.m||'')}).join('\n');
+    var text=logs.map(function(l){return(l.time||'')+' '+(l.message||l.m||'')}).join('\n');
     var w=window.open('','_blank','width=900,height=600');
     if(!w){alert('Popup blocked'); return;}
     w.document.write('<html><head><title>Logs</title></head>');
