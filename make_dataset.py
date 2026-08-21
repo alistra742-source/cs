@@ -3,9 +3,10 @@
 make_dataset.py — procedural, deterministic, network-free generator of
 labeled hCaptcha-tile-style training images.
 
-49 classes: the original 13 traffic classes plus the 36 families merged from
-synth_shapes.py (animals, tools, materials, household/terrain) so the offline
-solver models also cover reference-affordance grids and point/drag rounds.
+60 classes: the original 13 traffic classes plus the 47 families merged from
+synth_shapes.py (animals, tools, materials, household/terrain, plus 11 extra
+safari/farm/water/household classes) so the offline solver models also cover
+reference-affordance grids and point/drag rounds.
 
 Everything is drawn with Pillow: no downloads, no external assets, no
 randomness beyond a seeded PRNG, so two runs with the same --seed produce
@@ -525,7 +526,7 @@ GEOMETRY = {
     "parking_meter": (0.48, 0.86, 0.44),
 }
 
-# ── merge the extra families from synth_shapes (13 -> 49 classes) ─────────
+# ── merge the extra families from synth_shapes (13 -> 60 classes) ─────────
 #
 # synth_shapes supplies animals / tools / materials / household painters with
 # the same fn(draw, w, h, rng, mood) contract. Merging here keeps one stable

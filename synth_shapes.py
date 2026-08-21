@@ -2,8 +2,8 @@
 """
 synth_shapes.py — extra procedural painters for the hCaptcha offline solver.
 
-Adds 36 object families on top of the 13 traffic classes drawn by
-make_dataset.py (49 classes total): animals (parametric quadrupeds + bird,
+Adds 47 object families on top of the 13 traffic classes drawn by
+make_dataset.py (60 classes total): animals (parametric quadrupeds + bird,
 frog, turtle, snail, kangaroo), tools, materials and household/terrain
 objects. These families are what the *other* hCaptcha challenge types ask
 about:
@@ -811,6 +811,358 @@ def paint_boot(d, w, h, rng, mood):
            width=max(1, _i(w * 0.03)))
 
 
+# ── batch-3 families (49 -> 60 classes) ───────────────────────────────────
+#
+# Eleven more object families so the offline tile classifier covers 60
+# classes: safari / farm / water animals, an insect, fruit, flora and two
+# man-made objects. Every painter keeps the same
+# ``fn(draw, w, h, rng, mood)`` contract and draws into an RGBA layer the
+# size of the object box, so make_dataset.render() pastes, rotates and
+# shadows them exactly like the other families.
+
+
+def paint_zebra(d, w, h, rng, mood):
+    # white horse-like body with bold black stripes
+    _quadruped(d, w, h, rng, mood, coat=(232, 230, 224),
+               ears="small", tail="tuft", mane=True, stocky=0.0)
+    # overlay stripes across the body region with thick dark arcs
+    dark = (28, 26, 24)
+    by0, by1 = h * 0.28, h * 0.62
+    bx0, bx1 = w * 0.18, w * 0.78
+    for i in range(7):
+        t = 0.12 + 0.11 * i
+        cx = bx0 + (bx1 - bx0) * t
+        d.arc([cx - w * 0.08, by0 - 2, cx + w * 0.08, by1 + 6],
+              start=205, end=335, fill=dark, width=max(2, _i(w * 0.022)))
+    # a few leg stripes
+    for fx in (0.24, 0.40, 0.60, 0.74):
+        x = w * fx
+        d.line([(x - w * 0.03, h * 0.62), (x + w * 0.02, h * 0.86)],
+               fill=dark, width=max(1, _i(w * 0.018)))
+
+
+def paint_giraffe(d, w, h, rng, mood):
+    coat = _jit(rng, (214, 178, 96), 12)
+    dark = _shade(coat, 0.55)
+    spot = (150, 104, 54)
+    # long legs
+    leg_w = w * 0.055
+    for i, fx in enumerate((0.30, 0.40, 0.62, 0.72)):
+        x = w * fx
+        d.rectangle([x - leg_w / 2, h * 0.50, x + leg_w / 2, h * 0.95],
+                    fill=_shade(coat, 0.9) if i % 2 else coat)
+        d.ellipse([x - leg_w / 2, h * 0.93, x + leg_w / 2, h * 0.99], fill=dark)
+    # sloped back body
+    d.polygon([(w * 0.26, h * 0.52), (w * 0.78, h * 0.40),
+               (w * 0.76, h * 0.62), (w * 0.24, h * 0.66)],
+              fill=coat, outline=dark)
+    # long neck + head
+    d.polygon([(w * 0.66, h * 0.42), (w * 0.74, h * 0.40),
+               (w * 0.70, h * 0.06), (w * 0.62, h * 0.08)],
+              fill=coat, outline=dark)
+    d.ellipse([w * 0.64, h * 0.0, w * 0.84, h * 0.14], fill=coat, outline=dark)
+    # ossicones
+    for fx in (0.69, 0.76):
+        d.line([(w * fx, h * 0.02), (w * (fx + 0.005), h * -0.05)],
+               fill=dark, width=max(1, _i(w * 0.02)))
+        d.ellipse([w * (fx - 0.012), h * -0.07, w * (fx + 0.02), h * -0.025],
+                  fill=dark)
+    # spots
+    for _ in range(14):
+        sx = rng.uniform(w * 0.30, w * 0.74)
+        sy = rng.uniform(h * 0.42, h * 0.62)
+        r = rng.uniform(w * 0.03, w * 0.06)
+        d.ellipse([sx - r, sy - r * 0.8, sx + r, sy + r * 0.8], fill=spot)
+    for _ in range(5):
+        nx = rng.uniform(w * 0.64, w * 0.72)
+        ny = rng.uniform(h * 0.10, h * 0.36)
+        r = rng.uniform(w * 0.025, w * 0.045)
+        d.ellipse([nx - r, ny - r * 0.7, nx + r, ny + r * 0.7], fill=spot)
+    # eye
+    d.ellipse([w * 0.78, h * 0.04, w * 0.81, h * 0.08], fill=(20, 18, 16))
+
+
+def paint_lion(d, w, h, rng, mood):
+    coat = _jit(rng, (206, 160, 86), 12)
+    mane = _jit(rng, (140, 92, 44), 12)
+    dark = _shade(coat, 0.55)
+    # body
+    d.ellipse([w * 0.16, h * 0.36, w * 0.72, h * 0.74], fill=coat, outline=dark)
+    # legs
+    for fx in (0.24, 0.36, 0.56, 0.68):
+        x = w * fx
+        d.rectangle([x - w * 0.05, h * 0.66, x + w * 0.05, h * 0.92],
+                    fill=_shade(coat, 0.9))
+    # tail tuft
+    d.line([(w * 0.20, h * 0.52), (w * 0.08, h * 0.36)], fill=coat,
+           width=max(2, _i(w * 0.04)))
+    d.ellipse([w * 0.05, h * 0.30, w * 0.13, h * 0.40], fill=mane)
+    # big mane ring around head
+    hx, hy, hr = w * 0.80, h * 0.40, w * 0.22
+    d.ellipse([hx - hr * 1.25, hy - hr * 1.25, hx + hr * 1.25, hy + hr * 1.25],
+              fill=mane, outline=_shade(mane, 0.6))
+    # shaggy mane tufts
+    for k in range(10):
+        import math as _m
+        ang = k * (2 * _m.pi / 10)
+        tx = hx + _m.cos(ang) * hr * 1.25
+        ty = hy + _m.sin(ang) * hr * 1.25
+        d.ellipse([tx - hr * 0.28, ty - hr * 0.28, tx + hr * 0.28, ty + hr * 0.28],
+                  fill=_jit(rng, mane, 16))
+    # face
+    d.ellipse([hx - hr * 0.7, hy - hr * 0.65, hx + hr * 0.7, hy + hr * 0.7],
+              fill=coat, outline=dark)
+    d.ellipse([hx - hr * 0.22, hy - hr * 0.15, hx - hr * 0.05, hy + hr * 0.02],
+              fill=(24, 20, 16))
+    d.ellipse([hx + hr * 0.05, hy - hr * 0.15, hx + hr * 0.22, hy + hr * 0.02],
+              fill=(24, 20, 16))
+    d.ellipse([hx - hr * 0.10, hy + hr * 0.25, hx + hr * 0.10, hy + hr * 0.42],
+              fill=_shade(coat, 0.7))
+
+
+def paint_bear(d, w, h, rng, mood):
+    coat = _jit(rng, rng.choice([(110, 78, 50), (60, 44, 34), (180, 150, 110)]), 12)
+    dark = _shade(coat, 0.55)
+    # stout body
+    d.ellipse([w * 0.18, h * 0.38, w * 0.80, h * 0.86], fill=coat, outline=dark)
+    # legs
+    for fx in (0.28, 0.70):
+        x = w * fx
+        d.ellipse([x - w * 0.11, h * 0.74, x + w * 0.11, h * 0.96], fill=dark)
+    # arms
+    for sx in (-1, 1):
+        x = w * (0.5 + sx * 0.30)
+        d.ellipse([x - w * 0.10, h * 0.50, x + w * 0.10, h * 0.78],
+                  fill=_shade(coat, 0.88))
+    # head + round ears
+    hx, hy, hr = w * 0.50, h * 0.30, w * 0.20
+    for sx in (-1, 1):
+        d.ellipse([hx + sx * hr * 0.9 - hr * 0.35, hy - hr * 1.0,
+                   hx + sx * hr * 0.9 + hr * 0.35, hy - hr * 0.30],
+                  fill=coat, outline=dark)
+    d.ellipse([hx - hr, hy - hr * 0.75, hx + hr, hy + hr * 0.85],
+              fill=coat, outline=dark)
+    # muzzle
+    d.ellipse([hx - hr * 0.45, hy + hr * 0.20, hx + hr * 0.45, hy + hr * 0.75],
+              fill=_mix(coat, (255, 255, 255), 0.4))
+    d.ellipse([hx - hr * 0.12, hy + hr * 0.28, hx + hr * 0.12, hy + hr * 0.48],
+              fill=(28, 22, 18))
+    # eyes
+    for sx in (-1, 1):
+        d.ellipse([hx + sx * hr * 0.35 - hr * 0.07, hy - hr * 0.05,
+                   hx + sx * hr * 0.35 + hr * 0.07, hy + hr * 0.10],
+                  fill=(20, 18, 16))
+
+
+def paint_sheep(d, w, h, rng, mood):
+    wool = _jit(rng, (232, 228, 216), 12)
+    face = _jit(rng, (90, 72, 54), 10)
+    dark = _shade(wool, 0.7)
+    # fluffy body built from overlapping circles
+    cx, cy = w * 0.48, h * 0.56
+    for k in range(14):
+        import math as _m
+        ang = k * (2 * _m.pi / 14)
+        rx = cx + _m.cos(ang) * w * 0.28
+        ry = cy + _m.sin(ang) * h * 0.22
+        r = w * (0.16 if k % 2 else 0.13)
+        d.ellipse([rx - r, ry - r, rx + r, ry + r * 1.1], fill=wool)
+    d.ellipse([w * 0.22, h * 0.40, w * 0.74, h * 0.82], fill=wool, outline=dark)
+    # legs
+    for fx in (0.30, 0.40, 0.58, 0.68):
+        d.rectangle([w * fx - w * 0.03, h * 0.78, w * fx + w * 0.03, h * 0.95],
+                    fill=face)
+    # black face
+    d.ellipse([w * 0.66, h * 0.26, w * 0.92, h * 0.58], fill=face,
+              outline=_shade(face, 0.6))
+    # ears
+    for sy in (-1, 1):
+        d.ellipse([w * 0.64, h * (0.40 + sy * 0.12),
+                   w * 0.74, h * (0.46 + sy * 0.12)], fill=face)
+    # eyes
+    for fx in (0.74, 0.84):
+        d.ellipse([w * fx - w * 0.02, h * 0.35, w * fx + w * 0.02, h * 0.40],
+                  fill=(238, 238, 230))
+
+
+def paint_duck(d, w, h, rng, mood):
+    body = _jit(rng, rng.choice([(240, 236, 220), (180, 200, 210), (228, 214, 150)]), 10)
+    dark = _shade(body, 0.62)
+    # body
+    d.ellipse([w * 0.10, h * 0.42, w * 0.78, h * 0.84], fill=body, outline=dark)
+    # tail
+    d.polygon([(w * 0.10, h * 0.52), (w * 0.0, h * 0.46), (w * 0.08, h * 0.64)],
+              fill=_shade(body, 0.85))
+    # wing
+    d.ellipse([w * 0.30, h * 0.48, w * 0.72, h * 0.78], fill=_shade(body, 0.88),
+              outline=dark)
+    # neck + head
+    d.polygon([(w * 0.66, h * 0.48), (w * 0.76, h * 0.46),
+               (w * 0.78, h * 0.22), (w * 0.68, h * 0.22)], fill=body)
+    d.ellipse([w * 0.66, h * 0.10, w * 0.92, h * 0.36], fill=body, outline=dark)
+    # beak
+    d.polygon([(w * 0.90, h * 0.22), (w * 1.02, h * 0.28),
+               (w * 0.90, h * 0.34)], fill=(232, 150, 44))
+    # eye
+    d.ellipse([w * 0.80, h * 0.18, w * 0.84, h * 0.24], fill=(18, 18, 20))
+    # feet
+    for fx in (0.34, 0.56):
+        d.ellipse([w * fx - w * 0.08, h * 0.82, w * fx + w * 0.08, h * 0.92],
+                  fill=(232, 150, 44))
+
+
+def paint_fish(d, w, h, rng, mood):
+    body = _jit(rng, rng.choice(_RED + _YELLOW + _BLUE + [(96, 180, 200)]), 12)
+    dark = _shade(body, 0.55)
+    # body ellipse pointing right
+    d.ellipse([w * 0.12, h * 0.28, w * 0.74, h * 0.74], fill=body, outline=dark)
+    # tail
+    d.polygon([(w * 0.14, h * 0.50), (w * -0.02, h * 0.26),
+               (w * 0.02, h * 0.50), (w * -0.02, h * 0.76)],
+              fill=_shade(body, 0.85), outline=dark)
+    # top + bottom fins
+    d.polygon([(w * 0.40, h * 0.30), (w * 0.50, h * 0.10),
+               (w * 0.62, h * 0.32)], fill=_shade(body, 0.85))
+    d.polygon([(w * 0.42, h * 0.70), (w * 0.52, h * 0.92),
+               (w * 0.60, h * 0.70)], fill=_shade(body, 0.85))
+    # stripes
+    for i in range(3):
+        sx = w * (0.30 + 0.12 * i)
+        d.arc([sx - w * 0.05, h * 0.30, sx + w * 0.05, h * 0.74],
+              start=200, end=340, fill=dark, width=max(1, _i(w * 0.02)))
+    # gill + eye
+    d.arc([w * 0.60, h * 0.34, w * 0.78, h * 0.68], start=270, end=90,
+          fill=dark, width=max(1, _i(w * 0.018)))
+    d.ellipse([w * 0.66, h * 0.38, w * 0.72, h * 0.46], fill=(245, 245, 240))
+    d.ellipse([w * 0.68, h * 0.40, w * 0.71, h * 0.45], fill=(18, 18, 20))
+
+
+def paint_butterfly(d, w, h, rng, mood):
+    wing = _jit(rng, rng.choice([(206, 72, 130), (72, 120, 200),
+                                 (232, 150, 52), (140, 90, 190)]), 12)
+    dark = _shade(wing, 0.45)
+    cx = w * 0.5
+    # four wings (upper + lower, both sides)
+    for sx in (-1, 1):
+        x0 = cx + sx * w * 0.04
+        x1 = cx + sx * w * 0.46
+        # upper
+        d.ellipse([min(x0, x1), h * 0.12, max(x0, x1), h * 0.52],
+                  fill=wing, outline=dark)
+        # lower
+        lx0 = cx + sx * w * 0.06
+        lx1 = cx + sx * w * 0.36
+        d.ellipse([min(lx0, lx1), h * 0.46, max(lx0, lx1), h * 0.86],
+                  fill=_shade(wing, 0.82), outline=dark)
+        # spots
+        for _ in range(3):
+            sx0 = rng.uniform(w * 0.12, w * 0.38)
+            sy = rng.uniform(h * 0.20, h * 0.44)
+            r = w * rng.uniform(0.03, 0.06)
+            d.ellipse([cx + sx * sx0 - r, sy - r, cx + sx * sx0 + r, sy + r],
+                      fill=(245, 240, 220))
+    # body + antennae
+    d.ellipse([cx - w * 0.025, h * 0.18, cx + w * 0.025, h * 0.78],
+              fill=(40, 36, 40))
+    for sx in (-1, 1):
+        d.arc([cx - w * 0.18, h * 0.02, cx + w * 0.18, h * 0.28],
+              start=270 if sx < 0 else 180,
+              end=360 if sx < 0 else 90,
+              fill=(40, 36, 40), width=max(1, _i(w * 0.015)))
+
+
+def paint_banana(d, w, h, rng, mood):
+    peel = _jit(rng, rng.choice([(244, 214, 74), (228, 190, 56), (200, 190, 90)]), 10)
+    dark = _shade(peel, 0.55)
+    # curved banana as a thick arc
+    d.arc([w * -0.10, h * -0.20, w * 1.05, h * 1.10],
+          start=200, end=330, fill=peel, width=max(8, _i(w * 0.20)))
+    d.arc([w * -0.10, h * -0.20, w * 1.05, h * 1.10],
+          start=200, end=330, fill=dark, width=max(1, _i(w * 0.02)))
+    # inner highlight
+    d.arc([w * -0.04, h * -0.10, w * 0.96, h * 1.02],
+          start=205, end=325, fill=_mix(peel, (255, 255, 255), 0.4),
+          width=max(2, _i(w * 0.05)))
+    # stem + tip
+    d.ellipse([w * 0.79, h * 0.12, w * 0.92, h * 0.24], fill=(90, 70, 38))
+    d.ellipse([w * 0.03, h * 0.66, w * 0.13, h * 0.76], fill=dark)
+
+
+def paint_guitar(d, w, h, rng, mood):
+    wood = _jit(rng, rng.choice([(180, 130, 70), (150, 96, 50), (200, 160, 100)]), 10)
+    dark = _shade(wood, 0.5)
+    # neck (diagonal lower-left to upper-right)
+    d.polygon([(w * 0.12, h * 0.92), (w * 0.26, h * 0.80),
+               (w * 0.74, h * 0.16), (w * 0.62, h * 0.04)],
+              fill=_shade(wood, 0.7), outline=dark)
+    # headstock
+    d.polygon([(w * 0.62, h * 0.04), (w * 0.74, h * 0.16),
+               (w * 0.86, h * 0.04), (w * 0.74, h * -0.08)],
+              fill=_shade(wood, 0.6), outline=dark)
+    # tuning pegs
+    for i in range(3):
+        ty = h * (-0.02 + 0.06 * i)
+        d.ellipse([w * 0.68 - w * 0.02, ty, w * 0.68 + w * 0.02, ty + h * 0.04],
+                  fill=(220, 220, 226))
+        d.ellipse([w * 0.80 - w * 0.02, ty, w * 0.80 + w * 0.02, ty + h * 0.04],
+                  fill=(220, 220, 226))
+    # body (two lobes + waist) around lower-left
+    bx, by = w * 0.20, h * 0.82
+    d.ellipse([bx - w * 0.20, by - h * 0.22, bx + w * 0.12, by + h * 0.12],
+              fill=wood, outline=dark)
+    d.ellipse([bx - w * 0.12, by - h * 0.10, bx + w * 0.22, by + h * 0.24],
+              fill=wood, outline=dark)
+    # sound hole
+    d.ellipse([bx - w * 0.05, by - h * 0.06, bx + w * 0.05, by + h * 0.05],
+              fill=_shade(wood, 0.4))
+    d.ellipse([bx - w * 0.035, by - h * 0.04, bx + w * 0.035, by + h * 0.035],
+              fill=(30, 24, 18))
+    # frets
+    for i in range(5):
+        t = 0.30 + 0.10 * i
+        d.line([(w * (0.18 + t * 0.55), h * (0.86 - t * 0.78)),
+                (w * (0.28 + t * 0.55), h * (0.78 - t * 0.78))],
+               fill=(220, 210, 180), width=max(1, _i(w * 0.012)))
+    # strings
+    for k in range(4):
+        off = (k - 1.5) * w * 0.012
+        d.line([(bx + off, by + h * 0.10), (w * 0.78, h * 0.10 + off * 0.5)],
+               fill=(235, 230, 210), width=max(1, _i(w * 0.006)))
+
+
+def paint_cactus(d, w, h, rng, mood):
+    green = _jit(rng, rng.choice([(72, 130, 70), (90, 150, 80), (60, 110, 60)]), 10)
+    dark = _shade(green, 0.55)
+    rid = _shade(green, 0.72)
+    # main column
+    d.rounded_rectangle([w * 0.40, h * 0.10, w * 0.62, h * 0.96],
+                        radius=max(4, _i(w * 0.11)), fill=green, outline=dark)
+    # left arm
+    d.rounded_rectangle([w * 0.18, h * 0.40, w * 0.42, h * 0.52],
+                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    d.rounded_rectangle([w * 0.18, h * 0.24, w * 0.30, h * 0.52],
+                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    # right arm
+    d.rounded_rectangle([w * 0.60, h * 0.32, w * 0.86, h * 0.44],
+                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    d.rounded_rectangle([w * 0.74, h * 0.16, w * 0.86, h * 0.44],
+                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    # vertical ridges
+    for fx in (0.46, 0.56):
+        d.line([(w * fx, h * 0.14), (w * fx, h * 0.94)], fill=rid,
+               width=max(1, _i(w * 0.014)))
+    # spines
+    for _ in range(28):
+        sx = rng.choice([rng.uniform(w * 0.42, w * 0.60),
+                         rng.uniform(w * 0.20, w * 0.28),
+                         rng.uniform(w * 0.76, w * 0.84)])
+        sy = rng.uniform(h * 0.16, h * 0.92)
+        d.point((sx, sy), fill=(238, 236, 220))
+    # flower on top
+    d.ellipse([w * 0.44, h * 0.04, w * 0.58, h * 0.14],
+              fill=rng.choice([(230, 90, 120), (240, 200, 70), (220, 110, 200)]))
+
+
 # ── registries ────────────────────────────────────────────────────────────
 
 EXTRA_PAINTERS = {
@@ -854,6 +1206,18 @@ EXTRA_PAINTERS = {
     "house": paint_house,
     "mountain": paint_mountain,
     "boot": paint_boot,
+    # batch 3 (49 -> 60)
+    "zebra": paint_zebra,
+    "giraffe": paint_giraffe,
+    "lion": paint_lion,
+    "bear": paint_bear,
+    "sheep": paint_sheep,
+    "duck": paint_duck,
+    "fish": paint_fish,
+    "butterfly": paint_butterfly,
+    "banana": paint_banana,
+    "guitar": paint_guitar,
+    "cactus": paint_cactus,
 }
 
 # (scale_min, scale_max, aspect w/h) — same semantics as make_dataset.GEOMETRY
@@ -894,6 +1258,18 @@ EXTRA_GEOMETRY = {
     "house":       (0.60, 0.94, 1.05),
     "mountain":    (0.85, 1.00, 1.00),
     "boot":        (0.42, 0.76, 1.10),
+    # batch 3 (49 -> 60)
+    "zebra":       (0.58, 0.90, 1.55),
+    "giraffe":     (0.55, 0.88, 0.80),
+    "lion":        (0.58, 0.90, 1.45),
+    "bear":        (0.55, 0.88, 1.20),
+    "sheep":       (0.50, 0.84, 1.40),
+    "duck":        (0.48, 0.82, 1.30),
+    "fish":        (0.55, 0.88, 1.60),
+    "butterfly":   (0.50, 0.86, 1.10),
+    "banana":      (0.50, 0.84, 1.50),
+    "guitar":      (0.60, 0.92, 0.55),
+    "cactus":      (0.46, 0.80, 0.62),
 }
 
 EXTRA_GROUND = {
@@ -921,4 +1297,16 @@ EXTRA_GROUND = {
     "clock": "grass",
     "umbrella": "grass",
     "boot": "grass",
+    # batch 3 (49 -> 60)
+    "zebra": "grass",
+    "giraffe": "grass",
+    "lion": "grass",
+    "bear": "grass",
+    "sheep": "grass",
+    "duck": "water",
+    "fish": "water",
+    "butterfly": "grass",
+    "banana": "grass",
+    "guitar": "grass",
+    "cactus": "grass",
 }
