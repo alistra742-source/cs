@@ -17,3 +17,10 @@ env/
 
 # runtime proxy usage record (regenerated per run)
 data/used_proxies.json
+# regenerable solver corpora (make_dataset.py / make_challenges.py) - don't commit
+data_v2/
+
+# real photo corpus fetched via image search (docs: SOLVER.md);
+# third-party photos - never committed
+image-search/
+data_real/
