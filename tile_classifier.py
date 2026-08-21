@@ -76,7 +76,7 @@ class _Base:
             self.classes = meta.get("classes", [])
             self.size = int(meta.get("size", 96))
             self.width = int(meta.get("width", 16))
-            n = len(self.classes) or 49
+            n = len(self.classes) or 60
             state = torch.load(pt, map_location="cpu")
             # checkpoints predate the background channel: fall back to the
             # plain C-channel head when the saved tensor shape says so
@@ -96,7 +96,7 @@ class _Base:
 
 
 class TileClassifier(_Base):
-    """49-way tile classifier (models/tile.pt)."""
+    """60-way tile classifier (models/tile.pt)."""
 
     task = "tile"
 

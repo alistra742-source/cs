@@ -271,30 +271,35 @@ def classify(payload: dict = None, dom: dict = None, prompt: str = "") -> str:
 # construction.
 
 SIZE_RANK = {
-    "nail": 1, "screw": 2, "bolt": 3, "snail": 4, "flower": 5, "apple": 6,
-    "cup": 7, "frog": 8, "bird": 9, "rabbit": 10, "book": 11, "clock": 12,
-    "turtle": 13, "boot": 14, "cat": 15, "umbrella": 16, "pizza": 17,
-    "dog": 18, "chair": 19, "kangaroo": 20, "bicycle": 21, "table": 22,
-    "motorcycle": 23, "cow": 24, "car": 25, "horse": 26, "boat": 27,
-    "truck": 28, "bus": 29, "train": 30, "airplane": 31, "elephant": 32,
+    "nail": 1, "screw": 2, "bolt": 3, "butterfly": 3, "snail": 4, "flower": 5,
+    "fish": 5, "apple": 6, "banana": 7, "cup": 7, "frog": 8, "bird": 9,
+    "duck": 10, "rabbit": 10, "book": 11, "clock": 12, "turtle": 13,
+    "cactus": 14, "boot": 14, "cat": 15, "umbrella": 16, "pizza": 17,
+    "dog": 18, "guitar": 19, "chair": 19, "kangaroo": 20, "bicycle": 21,
+    "table": 22, "sheep": 23, "motorcycle": 23, "cow": 24, "zebra": 25,
+    "car": 25, "lion": 26, "bear": 27, "horse": 26, "boat": 27, "truck": 28,
+    "bus": 29, "giraffe": 30, "train": 30, "airplane": 31, "elephant": 32,
     "tree": 33, "house": 34, "mountain": 35,
 }
 
 JUMP_RANK = {
-    "snail": 1, "turtle": 2, "elephant": 3, "cow": 4, "horse": 5, "dog": 6,
-    "cat": 7, "bird": 8, "rabbit": 9, "frog": 10, "kangaroo": 11,
+    "snail": 1, "fish": 1, "turtle": 2, "elephant": 3, "cow": 4, "sheep": 5,
+    "duck": 5, "horse": 6, "bear": 6, "dog": 7, "giraffe": 7, "butterfly": 8,
+    "cat": 8, "bird": 8, "rabbit": 9, "zebra": 9, "frog": 10, "lion": 10,
+    "kangaroo": 11,
 }
 
 SPEED_RANK = {
-    "snail": 1, "turtle": 2, "frog": 3, "elephant": 4, "cow": 5, "rabbit": 6,
-    "dog": 7, "kangaroo": 8, "bird": 9, "horse": 10, "bicycle": 11,
-    "motorcycle": 12, "car": 13, "bus": 14, "truck": 15, "boat": 16,
-    "train": 17, "airplane": 18,
+    "snail": 1, "turtle": 2, "frog": 3, "butterfly": 4, "elephant": 5,
+    "cow": 5, "fish": 6, "rabbit": 6, "dog": 7, "kangaroo": 8, "duck": 8,
+    "bird": 9, "horse": 10, "bicycle": 11, "sheep": 11, "motorcycle": 12,
+    "bear": 12, "car": 13, "giraffe": 13, "bus": 14, "truck": 15, "zebra": 15,
+    "boat": 16, "lion": 16, "train": 17, "airplane": 18,
 }
 
 TEMP_RANK = {
-    "mountain": 1, "flower": 3, "apple": 4, "tree": 4, "boot": 5, "house": 5,
-    "umbrella": 5, "cup": 8, "pizza": 9,
+    "mountain": 1, "fish": 2, "flower": 3, "apple": 4, "tree": 4, "banana": 5,
+    "boot": 5, "house": 5, "umbrella": 5, "cactus": 9, "cup": 8, "pizza": 9,
 }
 
 # What you can "work on" with each tool (reference-image affordance grids).
@@ -308,8 +313,9 @@ TOOL_AFFORDANCE = {
 }
 
 ANIMALS = {"dog", "cat", "rabbit", "horse", "elephant", "cow", "bird",
-           "frog", "turtle", "snail", "kangaroo"}
-EDIBLE = {"apple", "pizza"}
+           "frog", "turtle", "snail", "kangaroo", "zebra", "giraffe", "lion",
+           "bear", "sheep", "duck", "fish", "butterfly"}
+EDIBLE = {"apple", "pizza", "banana", "fish"}
 WHEELED = {"car", "bus", "truck", "bicycle", "motorcycle"}
 MOTORISED = {"car", "bus", "truck", "motorcycle", "boat", "airplane", "train"}
 TOOLS = set(TOOL_AFFORDANCE)
@@ -349,6 +355,18 @@ SYNONYMS = {
     "flower": "flower", "house": "house", "home": "house",
     "mountain": "mountain", "hill": "mountain", "boot": "boot",
     "shoe": "boot",
+    # batch 3 (49 -> 60)
+    "zebra": "zebra",
+    "giraffe": "giraffe",
+    "lion": "lion",
+    "bear": "bear", "teddy": "bear",
+    "sheep": "sheep", "lamb": "sheep", "ram": "sheep", "ewe": "sheep",
+    "duck": "duck", "duckling": "duck", "mallard": "duck",
+    "fish": "fish", "goldfish": "fish",
+    "butterfly": "butterfly", "monarch": "butterfly",
+    "banana": "banana", "plantain": "banana",
+    "guitar": "guitar", "acoustic_guitar": "guitar",
+    "cactus": "cactus", "cacti": "cactus", "saguaro": "cactus",
 }
 
 

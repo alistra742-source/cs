@@ -536,7 +536,7 @@ class TestModels(unittest.TestCase):
         the honest synthetic->real transfer check. Labels come from the
         image-search query itself, so label noise is expected; the gate is a
         regression floor, the printed number is the honest metric (a small
-        49-way photo corpus transfers in the ~30% range — see SOLVER.md)."""
+        60-way photo corpus transfers in the ~30% range — see SOLVER.md)."""
         import realdata
         from PIL import Image
         val = os.path.join(realdata.REAL_DIR, "val")

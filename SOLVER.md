@@ -99,8 +99,8 @@ max-pool after blocks 1–3; channel widths `w, 2w, 4w, 8w`.
 
 | model | head | input | width | output |
 |---|---|---|---|---|
-| TileNet | adaptive-avg-pool → FC | 64 px | 16 | 49-class softmax |
-| PointNet | 1×1 conv → 49-channel heatmap | 96 px | 24 | target point |
+| TileNet | adaptive-avg-pool → FC | 64 px | 16 | 60-class softmax |
+| PointNet | 1×1 conv → 60-channel heatmap | 96 px | 24 | target point |
 | DragNet | 1×1 conv → 2-channel heatmap | 96 px | 24 | piece + slot points |
 
 PointNet/DragNet are **heatmap** models: `heatmap(x, onehot)` selects the
@@ -132,7 +132,7 @@ a drag round).
 ## Data (real photographs + procedural filler, seeded)
 
 **Real photographs.** `realdata.py` organises image-search downloads into
-`data_real/`: 96×96 real photo tiles for **48 of the 49 classes** (~3–5 per
+`data_real/`: 96×96 real photo tiles for **59 of the 60 classes** (~3–5 per
 class, split 90/10 by file so an oversampled photo can never leak into
 validation), plus 25 real background scenes (streets, meadows, beaches,
 desks, asphalt). The one deliberately synthetic class is **`red_light`**:
@@ -141,7 +141,7 @@ exactly the confusion the `red_light` vs `traffic_light` label split exists
 to prevent (the same negative examples do serve `traffic_light`, after
 manually dropping any red-lit frames).
 
-`make_dataset.py` + `synth_shapes.py` still draw the 49-class procedural
+`make_dataset.py` + `synth_shapes.py` still draw the 60-class procedural
 tiles (deterministic per-class seeds, `"seed|class|index"`, never `hash()`);
 the trainer loads painted and real tiles together, repeating the real
 photos ~30× with augmentation so a few photos stand up to hundreds of
@@ -200,7 +200,7 @@ real scene backgrounds, disjoint seeds)
 
 | metric | result |
 |---|---|
-| tile classifier, 49 classes (painted tiles) | 95.2% |
+| tile classifier, 60 classes (painted tiles) | 95.2% |
 | tile classifier, NEVER-TRAINED real photographs | 31.6% |
 | grid rounds solved exactly, end-to-end (hybrid tiles) | 45 / 60 |
 | point localiser, named target, within 10% | 72% |

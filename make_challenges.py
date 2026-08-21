@@ -45,7 +45,7 @@ import make_dataset as md
 import hcaptcha_types as hct
 import realdata
 
-CLASSES = md.CLASSES                       # all 49, stable order
+CLASSES = md.CLASSES                       # all 60, stable order
 CID = {name: i for i, name in enumerate(CLASSES)}
 
 # Objects that can be point targets / scene members. crosswalk is a

@@ -10,7 +10,7 @@ One conv backbone shared by all three nets:
 
 Heads
 -----
-TileNet   49-way tile classifier (input 64 px by default)
+TileNet   60-way tile classifier (input 64 px by default)
 PointNet  spatial heatmap head, ONE CHANNEL PER CLASS. ``heatmap(x, onehot)``
           selects the target class channel; a point is decoded with
           soft-argmax. Loss = spatial cross-entropy on the target cell
