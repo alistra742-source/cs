@@ -306,12 +306,27 @@ def train_tile(a):
         print("  real photos in train: %d x%d (augmented) | "
               "held-out real in val: %d"
               % (n_real_train, a.real_repeat, len(extra_va)))
+    
+    # Enhanced model with more capacity for 100 classes
     model = TileNet(N_CLASSES, a.width)
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    # Use AdamW with weight decay for better generalization
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
+    
+    # Cosine annealing for smoother learning rate decay
+    sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=len(tr) // a.batch, T_mult=2, eta_min=1e-6
+    )
+    
     steps_per_ep = math.ceil(len(tr) / a.batch)
     print("  TileNet %d params | %d train / %d val | %d steps/epoch" % (
         sum(p.numel() for p in model.parameters()), len(tr), len(va),
         steps_per_ep))
+    
+    best_acc = 0.0
+    best_model_state = None
+    patience = 3
+    no_improve = 0
+    
     for ep in range(a.epochs):
         model.train()
         random.Random(a.seed * 100 + ep).shuffle(tr)
@@ -322,16 +337,39 @@ def train_tile(a):
             loss = F.cross_entropy(model(x), ys[b])
             opt.zero_grad()
             loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
+            sched.step(epoch=ep * steps_per_ep + s)
             tot_loss += loss.item()
+        
         acc = _eval_tile(model, xs, ys, va, a.batch)
-        print("  epoch %d/%d  loss %.4f  val %.4f  (%.0fs)"
-              % (ep + 1, a.epochs, tot_loss / steps_per_ep, acc,
+        
+        # Save best model
+        if acc > best_acc:
+            best_acc = acc
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+        
+        print("  epoch %d/%d  loss %.4f  val %.4f  best %.4f  (%.0fs)"
+              % (ep + 1, a.epochs, tot_loss / steps_per_ep, acc, best_acc,
                  time.time() - t0))
+        
+        # Early stopping
+        if no_improve >= patience and ep >= a.epochs // 2:
+            print("  Early stopping at epoch %d" % (ep + 1))
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
     acc = _eval_tile(model, xs, ys, va, a.batch)
     _save("tile", model, {
         "kind": "tile", "classes": CLASSES, "size": a.size,
-        "width": a.width, "metrics": {"val_accuracy": acc},
+        "width": a.width, "metrics": {"val_accuracy": acc, "best_val_accuracy": best_acc},
     }, a.models)
 
 
@@ -392,15 +430,28 @@ def train_point(a):
     ty = torch.tensor([[m["x"], m["y"]] for m in metas], dtype=torch.float32)
     tc = torch.tensor([m["target_id"] for m in metas], dtype=torch.long)
     tr, va = _split(len(xs))
+    
+    # Enhanced model for point localization
     model = PointNet(N_CLASSES, a.width)
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr)
-    # gentle LR decay consolidates the click-tail (hit@10%) in the late epochs
-    sched = torch.optim.lr_scheduler.MultiStepLR(
-        opt, milestones=[max(1, a.epochs // 2 - 1), a.epochs - 3], gamma=0.5)
+    
+    # AdamW with weight decay
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
+    
+    # Cosine annealing with warmup
+    sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=len(tr) // a.batch, T_mult=2, eta_min=1e-6
+    )
+    
     steps_per_ep = math.ceil(len(tr) / a.batch)
     print("  PointNet %d params | %d train / %d val | %d steps/epoch" % (
         sum(p.numel() for p in model.parameters()), len(tr), len(va),
         steps_per_ep))
+    
+    best_med = float('inf')
+    best_model_state = None
+    patience = 3
+    no_improve = 0
+    
     for ep in range(a.epochs):
         model.train()
         random.Random(a.seed * 100 + ep).shuffle(tr)
@@ -411,19 +462,38 @@ def train_point(a):
             loss = _point_loss_bg(hm, tc[b], ty[b])
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
+            sched.step(epoch=ep * steps_per_ep + s)
             tot_loss += loss.item()
-        sched.step()
+        
         med, hit = _eval_point(model, xs, tc, ty, va)
-        print("  epoch %d/%d  loss %.4f  val med-err %.4f  hit@10%% %.3f"
-              "  (%.0fs)"
-              % (ep + 1, a.epochs, tot_loss / steps_per_ep, med, hit,
+        
+        # Save best model (lower median error is better)
+        if med < best_med:
+            best_med = med
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+        
+        print("  epoch %d/%d  loss %.4f  val med-err %.4f  hit@10%% %.3f  best %.4f  (%.0fs)"
+              % (ep + 1, a.epochs, tot_loss / steps_per_ep, med, hit, best_med,
                  time.time() - t0))
+        
+        if no_improve >= patience and ep >= a.epochs // 2:
+            print("  Early stopping at epoch %d" % (ep + 1))
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
     med, hit = _eval_point(model, xs, tc, ty, va)
     _save("point", model, {
         "kind": "point", "classes": CLASSES, "size": a.size,
         "width": a.width,
-        "metrics": {"val_median_err": med, "val_hit_at_10": hit},
+        "metrics": {"val_median_err": med, "val_hit_at_10": hit, "best_median_err": best_med},
     }, a.models)
 
 
@@ -448,12 +518,28 @@ def train_drag(a):
     tf = torch.tensor([[m["fx"], m["fy"]] for m in metas], dtype=torch.float32)
     tt = torch.tensor([[m["tx"], m["ty"]] for m in metas], dtype=torch.float32)
     tr, va = _split(len(xs))
+    
+    # Enhanced model for drag localization
     model = DragNet(2, a.width)
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    
+    # AdamW with weight decay
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
+    
+    # Cosine annealing with warmup
+    sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=len(tr) // a.batch, T_mult=2, eta_min=1e-6
+    )
+    
     steps_per_ep = math.ceil(len(tr) / a.batch)
     print("  DragNet %d params | %d train / %d val | %d steps/epoch" % (
         sum(p.numel() for p in model.parameters()), len(tr), len(va),
         steps_per_ep))
+    
+    best_both = 0.0
+    best_model_state = None
+    patience = 3
+    no_improve = 0
+    
     for ep in range(a.epochs):
         model.train()
         random.Random(a.seed * 100 + ep).shuffle(tr)
@@ -467,19 +553,40 @@ def train_drag(a):
             loss = lf + lt
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
+            sched.step(epoch=ep * steps_per_ep + s)
             tot_loss += loss.item()
+        
         medf, hitf, medt, hitt, both = _eval_drag(model, xs, tf, tt, va)
-        print("  epoch %d/%d  loss %.4f  from hit %.3f  to hit %.3f  both %.3f"
-              "  (%.0fs)"
-              % (ep + 1, a.epochs, tot_loss / steps_per_ep, hitf, hitt, both,
+        
+        # Save best model (higher both hit is better)
+        if both > best_both:
+            best_both = both
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+        
+        print("  epoch %d/%d  loss %.4f  from hit %.3f  to hit %.3f  both %.3f  best %.3f  (%.0fs)"
+              % (ep + 1, a.epochs, tot_loss / steps_per_ep, hitf, hitt, both, best_both,
                  time.time() - t0))
+        
+        if no_improve >= patience and ep >= a.epochs // 2:
+            print("  Early stopping at epoch %d" % (ep + 1))
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
     medf, hitf, medt, hitt, both = _eval_drag(model, xs, tf, tt, va)
     _save("drag", model, {
         "kind": "drag", "classes": ["piece", "slot"], "size": a.size,
         "width": a.width, "metrics": {"val_hit_from": hitf,
                                       "val_hit_to": hitt,
-                                      "val_hit_both": both},
+                                      "val_hit_both": both,
+                                      "best_hit_both": best_both},
     }, a.models)
 
 
@@ -510,25 +617,27 @@ def _eval_drag(model, xs, tf, tt, va):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Train hCaptcha solver models (enhanced for 100+ classes)")
     ap.add_argument("--task", choices=["tile", "point", "drag"],
                     required=True)
-    ap.add_argument("--epochs", type=int, default=7)
-    ap.add_argument("--batch", type=int, default=96)
-    ap.add_argument("--size", type=int, default=64)
-    ap.add_argument("--width", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    # Increased epochs and width for better accuracy with 100 classes
+    ap.add_argument("--epochs", type=int, default=12)
+    ap.add_argument("--batch", type=int, default=64)  # Smaller batch for larger model
+    ap.add_argument("--size", type=int, default=80)   # Slightly larger input
+    ap.add_argument("--width", type=int, default=32)  # Double width for more capacity
+    ap.add_argument("--lr", type=float, default=5e-4)  # Slightly lower LR for stability
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=None)
     ap.add_argument("--models", default=DEFAULT_MODELS)
     ap.add_argument("--real_root", default=os.path.join(
         ROOT, "data_real", "tiles"))
-    ap.add_argument("--real_repeat", type=int, default=30)
+    ap.add_argument("--real_repeat", type=int, default=50)  # More augmentation
     a = ap.parse_args()
     if a.data is None:
         a.data = DEFAULT_TILES if a.task == "tile" else DEFAULT_ROUNDS
     print("== train %s | size %d width %d batch %d epochs %d ==" % (
         a.task, a.size, a.width, a.batch, a.epochs))
+    print("== %d classes | Enhanced training ==" % N_CLASSES)
     t0 = time.time()
     {"tile": train_tile, "point": train_point, "drag": train_drag}[a.task](a)
     print("== %s done in %.0fs ==" % (a.task, time.time() - t0))

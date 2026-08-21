@@ -633,6 +633,38 @@ def render(label, S, rng):
     if rng.random() < 0.35:
         img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.2, 0.8)))
 
+    # ── DRAWING STYLE EFFECTS ──────────────────────────────────────────────
+    # Apply artistic/sketch effects to make images look like hand-drawn art
+    
+    draw_style = rng.choice([
+        "normal", "normal", "normal",  # 30% normal
+        "sketch", "sketch",  # 20% sketch
+        "lineart",  # 10% line art
+        "watercolor",  # 10% watercolor
+        "crosshatch",  # 10% crosshatch
+        "stipple",  # 10% stipple
+        "bold",  # 10% bold outlines
+    ])
+    
+    if draw_style == "sketch":
+        # Pencil sketch effect - high contrast edges
+        img = _apply_sketch_effect(img, rng)
+    elif draw_style == "lineart":
+        # Line art - black outlines with flat colors
+        img = _apply_lineart_effect(img, rng)
+    elif draw_style == "watercolor":
+        # Watercolor painting effect
+        img = _apply_watercolor_effect(img, rng)
+    elif draw_style == "crosshatch":
+        # Cross-hatching shading
+        img = _apply_crosshatch_effect(img, rng)
+    elif draw_style == "stipple":
+        # Stipple drawing effect
+        img = _apply_stipple_effect(img, rng)
+    elif draw_style == "bold":
+        # Bold outlines with enhanced edges
+        img = _apply_bold_effect(img, rng)
+
     # light grain
     px = img.load()
     for _ in range(int(S * S * 0.02)):
@@ -642,6 +674,176 @@ def render(label, S, rng):
         px[x, y] = (clamp(r + n), clamp(g + n), clamp(b + n))
 
     return img
+
+
+def _apply_sketch_effect(img: Image.Image, rng) -> Image.Image:
+    """Convert to pencil sketch style with edge emphasis."""
+    # Convert to grayscale for sketch effect
+    gray = img.convert('L')
+    gray = gray.filter(ImageFilter.GaussianBlur(rng.uniform(0.5, 1.5)))
+    
+    # Create edge mask
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageEnhance.Contrast(edges).enhance(rng.uniform(2.0, 4.0))
+    
+    # Blend back with original
+    sketch = Image.new('RGB', img.size)
+    for x in range(img.width):
+        for y in range(img.height):
+            orig = img.getpixel((x, y))
+            edge = edges.getpixel((x, y))
+            edge_val = edge if isinstance(edge, int) else int(sum(edge) / len(edge))
+            # Invert edges for sketch look
+            sketch.putpixel((x, y), (
+                clamp(orig[0] - edge_val + 128),
+                clamp(orig[1] - edge_val + 128),
+                clamp(orig[2] - edge_val + 128),
+            ))
+    return sketch
+
+
+def _apply_lineart_effect(img: Image.Image, rng) -> Image.Image:
+    """Create line art with bold black outlines."""
+    # Find edges
+    gray = img.convert('L')
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageEnhance.Contrast(edges).enhance(3.0)
+    edges = edges.filter(ImageFilter.MaxFilter(3))
+    
+    # Create line art
+    result = Image.new('RGB', img.size, (255, 255, 255))
+    threshold = rng.randint(40, 80)
+    
+    for x in range(img.width):
+        for y in range(img.height):
+            edge = edges.getpixel((x, y))
+            edge_val = edge if isinstance(edge, int) else int(sum(edge) / len(edge))
+            if edge_val > threshold:
+                result.putpixel((x, y), (20, 20, 20))
+            else:
+                orig = img.getpixel((x, y))
+                # Desaturate slightly
+                avg = sum(orig) // 3
+                result.putpixel((x, y), (
+                    clamp(int(orig[0] * 0.7 + avg * 0.3)),
+                    clamp(int(orig[1] * 0.7 + avg * 0.3)),
+                    clamp(int(orig[2] * 0.7 + avg * 0.3)),
+                ))
+    return result
+
+
+def _apply_watercolor_effect(img: Image.Image, rng) -> Image.Image:
+    """Watercolor painting effect."""
+    # Blur heavily for soft edges
+    result = img.filter(ImageFilter.GaussianBlur(rng.uniform(1.5, 3.0)))
+    
+    # Add some edge softening
+    result = result.filter(ImageFilter.SMOOTH_MORE)
+    
+    # Adjust colors to be more muted/artistic
+    result = ImageEnhance.Color(result).enhance(rng.uniform(0.6, 0.9))
+    result = ImageEnhance.Contrast(result).enhance(rng.uniform(0.85, 1.1))
+    
+    return result
+
+
+def _apply_crosshatch_effect(img: Image.Image, rng) -> Image.Image:
+    """Apply cross-hatching shading pattern."""
+    result = img.copy()
+    pixels = result.load()
+    S = img.size[0]
+    
+    # Draw diagonal lines based on darkness
+    spacing = rng.randint(3, 6)
+    angle = rng.choice([45, 135])
+    
+    for y in range(0, S, spacing):
+        for x in range(0, S, 1):
+            # Calculate position along line
+            if angle == 45:
+                line_y = y + (x % spacing)
+            else:
+                line_y = y + ((S - x) % spacing)
+            
+            if line_y < S:
+                px = pixels[x % S, line_y]
+                brightness = (px[0] + px[1] + px[2]) // 3
+                
+                # Darker areas get more hatching
+                if brightness < 150:
+                    offset = rng.randint(-2, 2)
+                    nx, ny = clamp(x + offset, 0, S-1), clamp(line_y + offset, 0, S-1)
+                    pixels[nx, ny] = (
+                        clamp(pixels[nx, ny][0] - 20),
+                        clamp(pixels[nx, ny][1] - 20),
+                        clamp(pixels[nx, ny][2] - 20),
+                    )
+    
+    return result
+
+
+def _apply_stipple_effect(img: Image.Image, rng) -> Image.Image:
+    """Apply stipple drawing effect (dots)."""
+    result = Image.new('RGB', img.size, (255, 255, 255))
+    pixels_result = result.load()
+    pixels_orig = img.load()
+    S = img.size[0]
+    
+    density = rng.randint(2, 4)  # spacing between dots
+    
+    for y in range(0, S, density):
+        for x in range(0, S, density):
+            orig = pixels_orig[x, y]
+            brightness = (orig[0] + orig[1] + orig[2]) // 3
+            
+            # Darker areas get more/larger dots
+            if brightness < 180:
+                dot_size = max(1, (180 - brightness) // 60)
+                for dx in range(dot_size):
+                    for dy in range(dot_size):
+                        nx, ny = x + dx, y + dy
+                        if nx < S and ny < S:
+                            pixels_result[nx, ny] = (
+                                clamp(orig[0] - 40),
+                                clamp(orig[1] - 40),
+                                clamp(orig[2] - 40),
+                            )
+    
+    return result
+
+
+def _apply_bold_effect(img: Image.Image, rng) -> Image.Image:
+    """Bold outlines with enhanced edges."""
+    # Find edges
+    gray = img.convert('L')
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageEnhance.Contrast(edges).enhance(2.5)
+    edges = edges.filter(ImageFilter.MaxFilter(3))  # Fixed: use 3 instead of 2
+    
+    result = Image.new('RGB', img.size)
+    pixels_result = result.load()
+    pixels_edges = edges.load()
+    
+    threshold = rng.randint(30, 60)
+    
+    for x in range(img.width):
+        for y in range(img.height):
+            orig = img.getpixel((x, y))
+            edge_val = pixels_edges[x, y]
+            edge_val = edge_val if isinstance(edge_val, int) else int(sum(edge_val) / len(edge_val))
+            
+            if edge_val > threshold:
+                # Dark outline
+                result.putpixel((x, y), (10, 10, 15))
+            else:
+                # Slightly enhanced color
+                result.putpixel((x, y), (
+                    clamp(int(orig[0] * 1.1)),
+                    clamp(int(orig[1] * 1.1)),
+                    clamp(int(orig[2] * 1.1)),
+                ))
+    
+    return result
 
 
 def contact_sheet(columns, cell=96):
