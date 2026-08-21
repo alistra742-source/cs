@@ -80,6 +80,57 @@ _SYSTEM_PROMPT = (
     'Use [] when no tile matches. Tile numbers must be integers.'
 )
 
+# ── per-answer-shape system prompts (one hCaptcha family each) ───────────
+# All coordinates are normalised 0.0-1.0, origin TOP-LEFT.
+
+_SYSTEM_POINT = (
+    "You are a precise point solver for an hCaptcha challenge. You are given "
+    "ONE canvas image and an instruction asking you to click something in it "
+    '(e.g. "click on the animal who jumps the highest"). '
+    "Decide where the target is and answer with ONLY a JSON object: "
+    '{"points": [[x, y]]} where x and y are NORMALISED coordinates between '
+    "0.0 and 1.0 (x = fraction from the left edge, y = fraction from the top "
+    "edge). Give exactly one point, at the CENTRE of the requested object."
+)
+
+_SYSTEM_BBOX = (
+    "You are a precise bounding-box solver for an hCaptcha challenge. You are "
+    "given ONE canvas image and an instruction asking you to draw a box around "
+    'something (e.g. "draw a box around the cat\'s head"). '
+    "Answer with ONLY a JSON object: "
+    '{"bbox": {"x1": a, "y1": b, "x2": c, "y2": d}} where all values are '
+    "NORMALISED 0.0-1.0 fractions of the image size (origin top-left), "
+    "x1 < x2 and y1 < y2, hugging the target tightly."
+)
+
+_SYSTEM_DRAG = (
+    "You are a precise drag-and-drop solver for an hCaptcha challenge. You are "
+    "given ONE canvas image containing a loose puzzle element (usually with a "
+    '"Move" badge) and a matching empty slot silhouette. Answer with ONLY a '
+    "JSON object: "
+    '{"drag": {"from": [x1, y1], "to": [x2, y2]}} where "from" is the CENTRE '
+    'of the draggable element and "to" is the CENTRE of the slot it fits '
+    "into, both NORMALISED 0.0-1.0 fractions of the image size (origin "
+    "top-left)."
+)
+
+_SYSTEM_CHOICE = (
+    "You are a precise multiple-choice solver for an hCaptcha challenge. You "
+    "are given an instruction, a list of numbered answer options and one "
+    "reference image. Pick the single most accurate option and answer with "
+    'ONLY a JSON object: {"choice": N} where N is the 1-based option number '
+    "(integer)."
+)
+
+_SYSTEM_BY_SHAPE = {
+    "tiles": _SYSTEM_PROMPT,
+    "points": _SYSTEM_POINT,
+    "bbox": _SYSTEM_BBOX,
+    "drag": _SYSTEM_DRAG,
+    "choice": _SYSTEM_CHOICE,
+    "text": _SYSTEM_PROMPT,
+}
+
 _JSON_ARRAY_RE = re.compile(r"\[\s*(?:\d+\s*(?:,\s*\d+\s*)*)?\]")
 _JSON_STRING_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
@@ -141,15 +192,26 @@ class OllamaVisionClient:
             return False, []
 
     async def solve(self, prompt: str, images: List[bytes],
+                    shape: str = "tiles", examples: Optional[List[bytes]] = None,
                     timeout: float = OLLAMA_TIMEOUT) -> Optional[dict]:
-        """Ask the model which tiles match ``prompt``.
+        """Ask the model to answer an hCaptcha round.
 
-        ``images`` are the grid tiles as PNG/JPEG bytes in reading order
-        (tile 1 = top-left). Returns one of:
+        ``images`` are the answer surfaces as PNG/JPEG bytes. For
+        shape="tiles" they are the grid tiles in reading order (tile 1 =
+        top-left); for "points"/"bbox"/"drag" it is the ONE big challenge
+        canvas; for "choice" the reference image(s). ``examples`` are the
+        prompt-header reference images (the "item shown"): they are
+        PREPENDED to the message and the text explains which is which.
 
-          {"type": "tiles", "indices": [1, 3, 7]}
-          {"type": "text",  "text": "abc123"}
-          None  — model unreachable or answer unparseable
+        Returns, by shape:
+
+          tiles     {"type": "tiles",  "indices": [1, 3, 7]}
+          points    {"type": "points", "points": [(x, y)]}         (0-1)
+          bbox      {"type": "bbox",   "bbox": {x1,y1,x2,y2}}      (0-1)
+          drag      {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1)
+          choice    {"type": "choice", "index": 2}                 (1-based)
+          text      {"type": "text",   "text": "abc123"}
+          None      model unreachable or answer unparseable
         """
         if not self.configured:
             self._log("[Ollama] No vision API base configured (set VISION_API_BASE or OLLAMA_BASE)", level="error")
@@ -157,16 +219,31 @@ class OllamaVisionClient:
         if not images:
             return None
         self.stats["calls"] += 1
+        examples = list(examples or [])
+        system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)
+        if examples:
+            content = (
+                f"REFERENCE IMAGES: the first {len(examples)} image(s) come "
+                "from the challenge header and SHOW WHAT TO LOOK FOR — they "
+                "are examples, NOT answer choices.\n"
+                f"ANSWER SURFACES: the remaining {len(images)} image(s) are "
+                "what you answer on (tiles in reading order, or the big "
+                "canvas).\n"
+                f"CHALLENGE TASK: {prompt}\n\n"
+                "Answer with the JSON object only.")
+        else:
+            content = (f"CHALLENGE TASK: {prompt}\n\n"
+                       f"There are {len(images)} image(s). "
+                       "Answer with the JSON object only.")
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {
                     "role": "user",
-                    "content": f"CHALLENGE TASK: {prompt}\n\n"
-                               f"There are {len(images)} tiles. "
-                               f"Answer with the JSON object only.",
-                    "images": [base64.b64encode(b).decode("ascii") for b in images],
+                    "content": content,
+                    "images": [base64.b64encode(b).decode("ascii")
+                               for b in list(examples) + list(images)],
                 },
             ],
             "stream": False,
@@ -196,7 +273,9 @@ class OllamaVisionClient:
                 self._log("[Ollama] Empty response from model", level="warn")
                 self.stats["failed"] += 1
                 return None
-            parsed = self._parse_answer(content, len(images))
+            parsed = self._parse_geometry(content, shape, len(images))
+            if parsed is None and shape in ("tiles", "text"):
+                parsed = self._parse_answer(content, len(images))
             if parsed is None:
                 self._log(f"[Ollama] Unparseable model answer: {content[:160]}",
                           level="warn")
@@ -208,6 +287,186 @@ class OllamaVisionClient:
             self._log(f"[Ollama] Solve error: {e}", level="error")
             self.stats["failed"] += 1
             return None
+
+    # ── geometry answer parsing (points / bbox / drag / choice) ──────────
+
+    @staticmethod
+    def _loads_repaired(text: str):
+        """json.loads with the repairs small vision models always need:
+        bare-dot decimals (".8" -> "0.8"), trailing commas, ```json fences,
+        prose around the object."""
+        text = (text or "").strip()
+        if not text:
+            return None
+
+        def repair(t):
+            t = re.sub(r"(?<=[:\[,\s])\.(\d)", r"0.\1", t)   # .8 -> 0.8
+            t = re.sub(r",\s*([}\]])", r"\1", t)             # trailing comma
+            return t
+
+        candidates = [text]
+        fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.I)
+        if fence:
+            candidates.insert(0, fence.group(1).strip())
+        lo, hi = text.find("{"), text.rfind("}")
+        if 0 <= lo < hi:
+            candidates.append(text[lo:hi + 1])
+        lo, hi = text.find("["), text.rfind("]")
+        if 0 <= lo < hi:
+            candidates.append(text[lo:hi + 1])
+        for cand in candidates:
+            for variant in (cand, repair(cand)):
+                try:
+                    return json.loads(variant)
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _num(v):
+        """Coerce a coordinate: 0-1 floats stay, 0-100 read as percents,
+        larger ("pixel-ish") values map through a nominal 500 px canvas.
+        Always clamped to 0..1."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f:  # NaN
+            return None
+        if f < 0:
+            f = 0.0
+        if f > 100.0:
+            f = f / 500.0
+        elif f > 1.0:
+            f = f / 100.0
+        return max(0.0, min(1.0, f))
+
+    @staticmethod
+    def _point(p):
+        """[x, y] / {"x","y"} / {"left","top"} / {"cx","cy"} -> (x, y) 0-1."""
+        if isinstance(p, dict):
+            for kx, ky in (("x", "y"), ("cx", "cy"), ("left", "top")):
+                if kx in p and ky in p:
+                    a, b = OllamaVisionClient._num(p[kx]), \
+                        OllamaVisionClient._num(p[ky])
+                    if a is not None and b is not None:
+                        return (a, b)
+            return None
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            a, b = OllamaVisionClient._num(p[0]), OllamaVisionClient._num(p[1])
+            if a is not None and b is not None:
+                return (a, b)
+        return None
+
+    @staticmethod
+    def _parse_geometry(content: str, shape: str, tile_count: int = 0):
+        """Parse points/bbox/drag/choice/tiles answers into structured form.
+
+        Accepts the key variants every small model invents:
+        points/point/clicks/coordinates, bbox/box/bounding_box (dict or
+        4-list), drag/drags/path or a bare from/to pair, choice/option/
+        answer_index, tiles/indices."""
+        obj = OllamaVisionClient._loads_repaired(content)
+        if obj is None:
+            return None
+        num = OllamaVisionClient._num
+        pt = OllamaVisionClient._point
+
+        # bare top-level atoms
+        if isinstance(obj, (int, float)) and not isinstance(obj, bool) \
+                and shape == "choice":
+            return {"type": "choice", "index": int(round(obj))}
+        if isinstance(obj, list):
+            if obj and all(isinstance(x, (int, float))
+                           and not isinstance(x, bool) for x in obj):
+                if shape in ("points",):
+                    p = pt(obj)
+                    return {"type": "points", "points": [p]} if p else None
+                return {"type": "tiles",
+                        "indices": [int(x) for x in obj]}
+            if obj and all(isinstance(x, (list, tuple, dict)) for x in obj):
+                pts = [q for q in (pt(x) for x in obj) if q]
+                if shape == "drag" and len(pts) >= 2:
+                    return {"type": "drag", "from": pts[0], "to": pts[-1]}
+                if pts:
+                    return {"type": "points", "points": pts}
+            return None
+        if not isinstance(obj, dict):
+            return None
+
+        def first(keys):
+            for k in keys:
+                if k in obj and obj[k] is not None:
+                    return obj[k]
+            return None
+
+        # tiles / choice are valid payloads regardless of requested shape
+        raw_t = first(("tiles", "indices", "selection", "answers"))
+        if isinstance(raw_t, list) and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool)
+                for x in raw_t):
+            return {"type": "tiles", "indices": [int(x) for x in raw_t]}
+        raw_c = first(("choice", "option", "answer_index", "answerIndex"))
+        if isinstance(raw_c, (int, float)) and not isinstance(raw_c, bool):
+            return {"type": "choice", "index": int(round(raw_c))}
+
+        raw_p = first(("points", "point", "clicks", "coordinates",
+                       "locations"))
+        if raw_p is not None:
+            pts = []
+            if isinstance(raw_p, (list, tuple)) and raw_p \
+                    and all(isinstance(x, (list, tuple, dict)) for x in raw_p):
+                pts = [q for q in (pt(x) for x in raw_p) if q]
+            else:
+                p = pt(raw_p)
+                if p:
+                    pts = [p]
+            if pts:
+                return {"type": "points", "points": pts}
+
+        raw_b = first(("bbox", "box", "bounding_box", "boundingBox",
+                       "rectangle", "rect"))
+        if raw_b is not None:
+            vals = None
+            if isinstance(raw_b, dict):
+                for keys in (("x1", "y1", "x2", "y2"),
+                             ("left", "top", "right", "bottom")):
+                    if all(k in raw_b for k in keys):
+                        vals = [num(raw_b[k]) for k in keys]
+                        break
+                if vals is None and all(k in raw_b for k in
+                                        ("x", "y", "width", "height")):
+                    x, y = num(raw_b["x"]), num(raw_b["y"])
+                    w, h = num(raw_b["width"]), num(raw_b["height"])
+                    if None not in (x, y, w, h):
+                        vals = [x, y, min(1.0, x + w), min(1.0, y + h)]
+            elif isinstance(raw_b, (list, tuple)) and len(raw_b) >= 4:
+                vals = [num(raw_b[i]) for i in range(4)]
+            if vals and None not in vals:
+                x1, y1, x2, y2 = vals
+                return {"type": "bbox", "bbox": {
+                    "x1": min(x1, x2), "y1": min(y1, y2),
+                    "x2": max(x1, x2), "y2": max(y1, y2)}}
+
+        raw_d = first(("drag", "drags", "path", "gesture"))
+        if isinstance(raw_d, dict):
+            f = pt(raw_d.get("from") or raw_d.get("start"))
+            t = pt(raw_d.get("to") or raw_d.get("end"))
+            if f and t:
+                return {"type": "drag", "from": f, "to": t}
+        elif isinstance(raw_d, (list, tuple)) and len(raw_d) >= 2:
+            pts = [q for q in (pt(x) for x in raw_d) if q]
+            if len(pts) >= 2:
+                return {"type": "drag", "from": pts[0], "to": pts[-1]}
+        if "from" in obj and "to" in obj:
+            f, t = pt(obj["from"]), pt(obj["to"])
+            if f and t:
+                return {"type": "drag", "from": f, "to": t}
+
+        raw_txt = first(("answer", "text"))
+        if isinstance(raw_txt, str) and raw_txt.strip():
+            return {"type": "text", "text": raw_txt.strip()}
+        return None
 
     @staticmethod
     def _parse_answer(content: str, tile_count: int) -> Optional[dict]:

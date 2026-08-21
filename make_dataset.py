@@ -3,6 +3,10 @@
 make_dataset.py — procedural, deterministic, network-free generator of
 labeled hCaptcha-tile-style training images.
 
+49 classes: the original 13 traffic classes plus the 36 families merged from
+synth_shapes.py (animals, tools, materials, household/terrain) so the offline
+solver models also cover reference-affordance grids and point/drag rounds.
+
 Everything is drawn with Pillow: no downloads, no external assets, no
 randomness beyond a seeded PRNG, so two runs with the same --seed produce
 byte-identical output.
@@ -520,6 +524,30 @@ GEOMETRY = {
     "fire_hydrant":  (0.48, 0.84, 0.52),
     "parking_meter": (0.48, 0.86, 0.44),
 }
+
+# ── merge the extra families from synth_shapes (13 -> 49 classes) ─────────
+#
+# synth_shapes supplies animals / tools / materials / household painters with
+# the same fn(draw, w, h, rng, mood) contract. Merging here keeps one stable
+# class list (order fixed => stable class ids) and auto-fills PROMPTS for any
+# class without an explicit one. Seeds stay per-class stable: the generator
+# keys randomness on "%d|%d|%d" % (seed, class_id, index) — never hash().
+try:
+    from synth_shapes import EXTRA_PAINTERS, EXTRA_GEOMETRY, EXTRA_GROUND
+except Exception:  # pragma: no cover - synth_shapes is part of the repo
+    EXTRA_PAINTERS, EXTRA_GEOMETRY, EXTRA_GROUND = {}, {}, {}
+
+for _name in EXTRA_PAINTERS:
+    if _name not in PAINTERS:
+        PAINTERS[_name] = EXTRA_PAINTERS[_name]
+        CLASSES.append(_name)
+GEOMETRY.update(EXTRA_GEOMETRY)
+GROUND_KIND.update(EXTRA_GROUND)
+for _name in CLASSES:
+    if _name not in PROMPTS:
+        PROMPTS[_name] = ("Please click each image containing a %s"
+                          % _name.replace("_", " "))
+del _name
 
 
 # ── one image ─────────────────────────────────────────────────────────────
