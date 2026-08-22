@@ -27,7 +27,7 @@ training corpora) without touching the filesystem.
 
 CLI:
     python make_challenges.py --out data_v2/challenges \
-        --n_point 7000 --n_drag 4000 --n_grid 1500
+        --n_point 7000 --n_drag 4000 --n_grid 1500 --n_count 500
 """
 
 from __future__ import annotations
@@ -72,10 +72,12 @@ _POINT_SUPERLATIVES = (
     ("Please click on the smallest object in the image", "SIZE", "min"),
     ("Please click on the fastest moving object", "SPEED", "max"),
     ("Please click on the slowest moving object", "SPEED", "min"),
+    ("Please click on the animal from the coldest place", "TEMP", "min"),
+    ("Please click on the animal from the warmest place", "TEMP", "max"),
 )
 
 _TABLES = {"JUMP": hct.JUMP_RANK, "SIZE": hct.SIZE_RANK,
-           "SPEED": hct.SPEED_RANK}
+           "SPEED": hct.SPEED_RANK, "TEMP": hct.TEMP_RANK}
 
 _DRAG_PROMPTS = (
     "Please drag the element to the place where it fits",
@@ -198,6 +200,8 @@ def make_point_round(rng: random.Random, size: int = 96):
         # pick objects with UNIQUE table values so the argmax target is
         # unambiguous — dedupe BEFORE pasting so labels match pixels
         pool = [c for c in RANKABLE if c in table]
+        if table_name == "TEMP":   # the prompt says "animal" — keep it true
+            pool = [c for c in pool if c in hct.ANIMALS]
         rng.shuffle(pool)
         names, seen = [], set()
         for cand in pool:
@@ -239,6 +243,115 @@ def make_point_round(rng: random.Random, size: int = 96):
         "y": round(tgt["y"], 4),
         "relational": relational,
         "objects": objects,
+    }
+    return img, meta
+
+
+def make_count_round(rng: random.Random, size: int = 96):
+    """Counting round: k separated instances of ONE class on a scene,
+    prompt "How many X are in this image?", ground-truth count k."""
+    name = rng.choice(POINT_CLASSES)
+    k = rng.randint(2, 5)
+    img = _scene_bg(size, rng)
+    centers = _spread_centers(rng, k, lo=0.14, hi=0.86, min_gap=0.30)
+    k = len(centers)
+    if k < 2:
+        return make_count_round(rng, size)      # degenerate rng; resample
+    objects = []
+    for c in centers:
+        scale = rng.uniform(0.16, 0.26)
+        x, y, r = _paste_object(img, name, (c[0], c[1], scale), rng)
+        objects.append({"x": round(x, 4), "y": round(y, 4),
+                        "r": round(r, 4)})
+    prompt = "How many %ss are in this image?" % name.replace("_", " ")
+    meta = {
+        "type": "count",
+        "prompt": prompt,
+        "target": name,
+        "target_id": CID[name],
+        "count": k,
+        "objects": objects,
+    }
+    return img, meta
+
+
+def make_pattern_round(rng: random.Random, size: int = 96):
+    """Pattern-completion drag round: a 3x3 grid of painted icons with ONE
+    empty cell and 3 candidates below. Placing the right candidate makes
+    every row and column hold three distinct labels (Latin square).
+
+    meta: grid (9 labels, None for the hole), hole (0-8), candidates
+    (labels), correct (candidate index), cell_boxes, candidate_boxes
+    (normalised rects) for the offline crop-classify test path."""
+    animals = [c for c in POINT_CLASSES if c in hct.ANIMALS]
+    pool = rng.sample(animals, 3)
+    base = [pool[0], pool[1], pool[2],
+            pool[1], pool[2], pool[0],
+            pool[2], pool[0], pool[1]]
+    # random Latin-square-preserving shuffle: permute rows, then columns
+    rp = list(range(3))
+    rng.shuffle(rp)
+    rows = [[base[r * 3 + c] for c in range(3)] for r in rp]
+    cp = list(range(3))
+    rng.shuffle(cp)
+    rows = [[row[c] for c in cp] for row in rows]
+    flat = [x for row in rows for x in row]
+    hole = rng.randrange(9)
+    correct_label = flat[hole]
+    flat[hole] = None
+    cands = list(pool)
+    rng.shuffle(cands)
+    correct = cands.index(correct_label)
+
+    # landscape canvas like the real UI (grid on top, candidates below) and
+    # ~40px cells: the 64px-input tile classifier labels >=40px painted
+    # tiles at ~94% (25px crops only reach ~52%, which defeats the offline
+    # pattern logic before it starts)
+    W = int(size * 2.0)
+    H = int(W * 1.25)
+    cell = int(W * 0.21)
+    gap = int(W * 0.035)
+    gx0 = int(W * 0.05)
+    gy0 = int(H * 0.05)
+    img = Image.new("RGB", (W, H), (236, 236, 240))
+    cell_boxes = []
+    for i in range(9):
+        r, c = divmod(i, 3)
+        x0 = gx0 + c * (cell + gap)
+        y0 = gy0 + r * (cell + gap)
+        cell_boxes.append({"x": round(x0 / W, 4), "y": round(y0 / H, 4),
+                           "w": round(cell / W, 4),
+                           "h": round(cell / H, 4)})
+        if flat[i] is None:
+            d = ImageDraw.Draw(img)
+            d.rectangle([x0, y0, x0 + cell, y0 + cell],
+                        fill=(250, 250, 252), outline=(168, 170, 180),
+                        width=2)
+            continue
+        tile = md.render(flat[i], cell, rng)
+        img.paste(tile, (x0, y0))
+    cy0 = gy0 + 3 * (cell + gap)
+    cw = cell
+    cand_boxes = []
+    for i, name in enumerate(cands):
+        x0 = gx0 + i * (cw + gap)
+        cand_boxes.append({"x": round(x0 / W, 4),
+                           "y": round(cy0 / H, 4),
+                           "w": round(cw / W, 4),
+                           "h": round(cw / H, 4)})
+        tile = md.render(name, cw, rng)
+        img.paste(tile, (x0, cy0))
+    prompt = ("Put one of the animals into the empty spot to complete the "
+              "pattern")
+    meta = {
+        "type": "pattern",
+        "prompt": prompt,
+        "grid": flat,
+        "hole": hole,
+        "candidates": cands,
+        "correct": correct,
+        "cell_boxes": cell_boxes,
+        "candidate_boxes": cand_boxes,
     }
     return img, meta
 
@@ -417,6 +530,8 @@ def main():
     ap.add_argument("--n_point", type=int, default=7000)
     ap.add_argument("--n_drag", type=int, default=4000)
     ap.add_argument("--n_grid", type=int, default=1500)
+    ap.add_argument("--n_count", type=int, default=500)
+    ap.add_argument("--n_pattern", type=int, default=300)
     ap.add_argument("--size", type=int, default=96)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
@@ -426,7 +541,9 @@ def main():
     with open(manifest_path, "w", encoding="utf-8") as mf:
         for sub, count, fn in (("point", a.n_point, make_point_round),
                                ("drag", a.n_drag, make_drag_round),
-                               ("grid", a.n_grid, make_grid_round)):
+                               ("grid", a.n_grid, make_grid_round),
+                               ("count", a.n_count, make_count_round),
+                               ("pattern", a.n_pattern, make_pattern_round)):
             d = os.path.join(a.out, sub)
             os.makedirs(d, exist_ok=True)
             for i in range(count):

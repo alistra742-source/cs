@@ -5,14 +5,20 @@ test_solver.py — offline test suite for the hCaptcha multi-family solver.
 NO browser, NO network, NO model server. Covers:
 
   * challenge-family routing from the /getcaptcha payload, from DOM facts
-    and from prompt wording (incl. the three staged live rounds: the
-    affordance reference grid, the relational point round and the drag
-    round);
+    and from prompt wording (incl. the staged live rounds: the affordance
+    reference grid, the relational point round, the drag round, the
+    counting round — "How many X are in this image?" — and the
+    pattern-completion drag round — "put one of the animals into the
+    empty spot to complete the pattern");
   * vision-answer parsing for every answer shape, including the sloppy
-    JSON small models emit (.8 decimals, trailing commas, fenced markdown);
+    JSON small models emit (.8 decimals, trailing commas, fenced markdown)
+    and integer count answers;
   * normalised->page coordinate mapping/clamping (_denorm);
   * the offline knowledge base (superlatives, tool affordance, traffic
-    light vs red light, empty answers, unknown prompts);
+    light vs red light, empty answers, unknown prompts, the long-tail
+    alias table: helicopter→airplane, police car→car, owl→bird,
+    volcano→mountain, watch→clock, ... — and the Latin-square pattern
+    resolver for "complete the pattern" rounds);
   * pointer trajectories (no teleport hops, never straight line,
     accelerate-then-decelerate);
   * scoring the trained offline models on HELD-OUT rounds (hybrid
@@ -20,7 +26,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 47 passed (41 when the models are not trained yet).
+Expected: 65 passed (58 when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -65,6 +71,13 @@ class TestRoutePayload(unittest.TestCase):
              "tasklist": [{"datapoint_uri": "https://imgs/x.jpg"}]}
         self.assertEqual(hct.classify_from_payload(p), hct.BINARY)
 
+    def test_payload_count(self):
+        p = {"request_type": "image_count",
+             "requester_question": {"en": "How many cars are in this image?"},
+             "tasklist": [{"datapoint_uri": "https://imgs/x.jpg"}]}
+        self.assertEqual(hct.classify_from_payload(p), hct.COUNT)
+        self.assertEqual(hct.answer_shape(hct.COUNT), "count")
+
     def test_payload_area_point(self):
         p = {"request_type": "image_label_area_select",
              "requester_question": {"en": "Please click on the animal who "
@@ -82,6 +95,26 @@ class TestRoutePayload(unittest.TestCase):
              "requester_question": {"en": "Please outline the target"},
              "request_config": {"asset_type": "bounding_box"}}
         self.assertEqual(hct.classify_from_payload(p), hct.AREA_BBOX)
+
+    def test_payload_mixed_binary_then_point_defers(self):
+        # hCaptcha's MIXED round shares image_label_area_select: a binary
+        # tile-grid stage ("click each image containing...") followed by an
+        # area stage ("...then click on..."). The payload only carries the
+        # stage-1 question, so the payload tier must DEFER to the live
+        # DOM/prompt tiers, which classify each stage as it renders.
+        p = {"request_type": "image_label_area_select",
+             "requester_question": {"en": "Please click each image "
+                                          "containing a bicycle, then "
+                                          "click on the car"}}
+        self.assertEqual(hct.classify_from_payload(p), hct.UNKNOWN)
+        dom_grid = {"tiles": 9, "images": 9, "choices": 0, "inputs": 0,
+                    "canvases": 0, "draggables": 0, "move_badge": False}
+        self.assertEqual(hct.classify(p, dom_grid, hct.question_text(p)),
+                         hct.BINARY)
+        dom_area = {"tiles": 0, "images": 1, "choices": 0, "inputs": 0,
+                    "canvases": 1, "draggables": 0, "move_badge": False}
+        self.assertEqual(hct.classify(p, dom_area, "Please click on the car"),
+                         hct.AREA_POINT)
 
     def test_payload_drag(self):
         p = {"request_type": "image_drag_drop",
@@ -140,6 +173,26 @@ class TestRouteDOM(unittest.TestCase):
              "images": 1, "draggables": 0, "move_badge": False}
         self.assertEqual(hct.classify_from_dom(f, ""), hct.MULTIPLE_CHOICE)
 
+    def test_dom_count_number_options(self):
+        # same DOM shape as multiple choice (one photo + option buttons)
+        # but counting wording — must route to COUNT, not choice
+        f = {"tiles": 0, "choices": 5, "inputs": 0, "canvases": 0,
+             "images": 1, "draggables": 0, "move_badge": False}
+        self.assertEqual(hct.classify_from_dom(
+            f, "How many cars are in this image?"), hct.COUNT)
+
+    def test_dom_pattern_grid_with_draggables(self):
+        # a pattern round shows a 3x3 grid PLUS draggable candidates —
+        # many tiles, which must NOT fall through to binary
+        f = {"tiles": 11, "choices": 0, "inputs": 0, "canvases": 0,
+             "images": 11, "draggables": 3, "move_badge": False}
+        self.assertEqual(hct.classify_from_dom(
+            f, "Put one of the animals into the empty spot to complete "
+               "the pattern"), hct.DRAG_DROP)
+        # same DOM without pattern wording stays binary
+        self.assertEqual(hct.classify_from_dom(
+            f, "Please click each image containing a bus"), hct.BINARY)
+
     def test_dom_point_single_surface(self):
         f = {"tiles": 1, "choices": 0, "inputs": 0, "canvases": 0,
              "images": 1, "draggables": 0, "move_badge": False}
@@ -189,6 +242,54 @@ class TestRoutePrompt(unittest.TestCase):
     def test_prompt_text(self):
         self.assertEqual(hct.classify_from_prompt(
             "Type the characters you see in the image"), hct.TEXT_ENTRY)
+
+    def test_prompt_count(self):
+        self.assertEqual(hct.classify_from_prompt(
+            "How many pandas are in this image?"), hct.COUNT)
+        self.assertEqual(hct.classify_from_prompt(
+            "Please count the number of bicycles shown"), hct.COUNT)
+
+    def test_prompt_drag_puzzle_variants(self):
+        for prompt in (
+                "drag puzzle, drag the pipe from the right to complete the "
+                "puzzle",
+                "drag the missing piece into the empty space",
+                "move the piece to its matching outline",
+                "drag the element on the right to the shape that is most "
+                "similar"):
+            self.assertEqual(hct.classify_from_prompt(prompt), hct.DRAG_DROP)
+
+    def test_prompt_pattern_completion(self):
+        p = ("Put one of the animals into the empty spot to complete the "
+             "pattern")
+        self.assertEqual(hct.classify_from_prompt(p), hct.DRAG_DROP)
+        self.assertTrue(hct.is_pattern_prompt(p))
+        self.assertEqual(hct.classify_from_prompt(
+            "Fill the empty cell to finish the pattern"), hct.DRAG_DROP)
+        self.assertTrue(hct.is_pattern_prompt(
+            "Which animal belongs in the blank space?"))
+        # ...but the plain binary grid is NOT a pattern round
+        self.assertFalse(hct.is_pattern_prompt(
+            "Please click each image containing a bus"))
+
+    def test_prompt_select_all_variants(self):
+        for prompt in (
+                "Select all the images with a car",
+                "Pick every picture containing a bus",
+                "Choose all the tiles that show a bicycle",
+                "Mark all the images with a motorcycle",
+                "Check all photos of a train"):
+            self.assertEqual(hct.classify_from_prompt(prompt), hct.BINARY)
+
+    def test_prompt_alias_binary(self):
+        # long-tail prompt nouns resolve through the alias table to the
+        # binary family + the trained classes (offline path can fire)
+        self.assertEqual(hct.classify_from_prompt(
+            "Please click each image containing a police car"), hct.BINARY)
+        self.assertEqual(hct.extract_target(
+            "Please click each image containing a police car"), "car")
+        self.assertEqual(hct.extract_target(
+            "Please click each image containing a helicopter"), "airplane")
 
 
 # ── routing: the three rounds staged from real screenshots ───────────────
@@ -269,6 +370,32 @@ class TestParseGeometry(unittest.TestCase):
         self.assertEqual(got["bbox"], {"x1": 0.2, "y1": 0.1,
                                        "x2": 0.6, "y2": 0.9})  # re-ordered
 
+    def test_parse_count(self):
+        self.assertEqual(GEO('{"count": 4}', "count", 1),
+                         {"type": "count", "count": 4})
+        self.assertEqual(GEO('{"number": 7}', "count", 1),
+                         {"type": "count", "count": 7})
+        self.assertEqual(GEO("3", "count", 1),
+                         {"type": "count", "count": 3})
+        self.assertEqual(
+            OllamaVisionClient._parse_answer("The answer is 5", 1, "count"),
+            {"type": "count", "count": 5})
+        # ...while bare ints stay CHOICE answers when the shape says so
+        self.assertEqual(GEO("3", "choice", 1),
+                         {"type": "choice", "index": 3})
+
+    def test_parse_pattern_drag(self):
+        # pattern rounds answer with a candidate->hole drag; the parser
+        # accepts both the "pattern" and "drag" keys
+        got = GEO('{"pattern": {"from": [0.3, 0.8], "to": [0.5, 0.2]}}',
+                  "drag")
+        self.assertEqual(got, {"type": "drag", "from": (0.3, 0.8),
+                               "to": (0.5, 0.2)})
+        got = GEO('{"drag": {"from": [0.3, 0.8], "to": [0.5, 0.2]}}',
+                  "drag")
+        self.assertEqual(got, {"type": "drag", "from": (0.3, 0.8),
+                               "to": (0.5, 0.2)})
+
     def test_parse_drag(self):
         got = GEO('{"drag": {"from": [0.25, 0.5], "to": [0.75, 0.5]}}',
                   "drag")
@@ -322,6 +449,82 @@ class TestDenorm(unittest.TestCase):
 
 
 class TestKnowledgeBase(unittest.TestCase):
+
+    def test_alias_canonicalisation(self):
+        # the long tail of hCaptcha prompt nouns maps onto the 60 classes
+        # the offline models can emit — only where visually defensible
+        cases = {
+            "helicopter": "airplane", "seaplane": "airplane",
+            "subway": "train", "tram": "train", "sailboat": "boat",
+            "ferry": "boat", "fire_truck": "truck", "pickup_truck": "truck",
+            "police_car": "car", "taxi": "car", "school_bus": "bus",
+            "moped": "motorcycle",
+            "owl": "bird", "parrot": "bird", "penguin": "bird",
+            "chicken": "bird", "shark": "fish", "dolphin": "fish",
+            "deer": "horse", "donkey": "horse", "goat": "sheep",
+            "llama": "sheep", "bison": "cow", "panda": "bear",
+            "koala": "bear",
+            "palm_tree": "tree", "pine_tree": "tree", "forest": "tree",
+            "rose": "flower", "sunflower": "flower", "volcano": "mountain",
+            "building": "house", "barn": "house",
+            "traffic_signal": "traffic_light",
+            "pedestrian_crossing": "crosswalk",
+            "bench": "chair", "sofa": "chair", "desk": "table",
+            "pie": "pizza", "watch": "clock", "alarm_clock": "clock",
+            "nut": "bolt", "teacup": "cup",
+        }
+        for word, want in cases.items():
+            self.assertEqual(hct.canonical(word), want, word)
+        # ...and the deliberately-unmapped ones stay None so the server
+        # falls back to the vision model instead of trusting a wrong label
+        for word in ("tiger", "monkey", "snake", "mushroom", "skyscraper",
+                     "waterfall", "smartphone", "camera", "ladder",
+                     "chainsaw", "bridge"):
+            self.assertIsNone(hct.canonical(word), word)
+
+    def test_alias_plural_extraction(self):
+        self.assertEqual(hct.extract_target(
+            "How many pandas are in this image?"), "bear")
+        self.assertEqual(hct.extract_target(
+            "Please click each image containing buses"), "bus")
+        self.assertEqual(hct.extract_target(
+            "Select all the images with palm trees"), "tree")
+        self.assertEqual(hct.extract_target(
+            "Click each image containing a fire truck"), "truck")
+
+    def test_alias_resolves_grid_round(self):
+        # alias-backed prompt resolves offline against CNN labels
+        idx = hct.resolve_semantic(
+            "Please click each image containing a police car",
+            ["bus", "car", "tree"])
+        self.assertEqual(idx, [2])
+
+    def test_pattern_latin_square(self):
+        #    cat  dog  [ ]
+        #    dog  elephant cat
+        #    elephant  cat  dog   -> the hole needs "elephant"
+        grid = ["cat", "dog", None,
+                "dog", "elephant", "cat",
+                "elephant", "cat", "dog"]
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["dog", "elephant", "cat"]), 1)
+        # shuffled candidate order is respected
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["elephant", "cat", "dog"]), 0)
+
+    def test_pattern_rows_only_and_ambiguous(self):
+        # rows constrained but columns not: still solvable via rows rule
+        grid = ["cat", "dog", None,
+                "cat", "dog", "elephant",
+                "dog", "elephant", "cat"]
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["cat", "elephant", "dog"]), 1)
+        # two candidates both complete it -> refuse to guess
+        self.assertIsNone(hct.resolve_pattern(
+            grid, 2, ["elephant", "elephant", "dog"]))
+        # bad shapes refuse outright
+        self.assertIsNone(hct.resolve_pattern(["cat"], 0, ["cat"]))
+        self.assertIsNone(hct.resolve_pattern(grid, 99, ["cat"]))
 
     def test_jumps_highest(self):
         idx = hct.resolve_semantic(
@@ -454,7 +657,7 @@ class TestModels(unittest.TestCase):
         ok = sum(1 for g, w in zip(got, want) if g[0] == w)
         acc = ok / len(want)
         print("\n  tile accuracy: %.3f (%d/%d)" % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.90)
+        self.assertGreaterEqual(acc, 0.95)
 
     def test_grid_rounds_end_to_end(self):
         import make_challenges as mc
@@ -476,7 +679,7 @@ class TestModels(unittest.TestCase):
             if idx is not None and sorted(idx) == sorted(meta["correct"]):
                 exact += 1
         print("\n  grid rounds exact: %d/%d" % (exact, total))
-        self.assertGreaterEqual(exact, 40)
+        self.assertGreaterEqual(exact, 45)
 
     def test_point_named_targets(self):
         rounds = _heldout_point_rounds("named", 100)
@@ -509,8 +712,8 @@ class TestModels(unittest.TestCase):
         n = len(rounds)
         print("\n  relational point: right class %d/%d, click %d/%d"
               % (right_class, n, clicks, n))
-        self.assertGreaterEqual(right_class, 20)
-        self.assertGreaterEqual(clicks, 20)
+        self.assertGreaterEqual(right_class, 40)
+        self.assertGreaterEqual(clicks, 45)
 
     def test_drag_both_ends(self):
         import make_challenges as mc
@@ -529,14 +732,79 @@ class TestModels(unittest.TestCase):
             if ef <= 0.10 and et <= 0.10:
                 both += 1
         print("\n  drag both-ends hit@10%%: %d/%d" % (both, total))
-        self.assertGreaterEqual(both, 50)
+        self.assertGreaterEqual(both, 55)
+
+    def test_count_rounds_offline(self):
+        import make_challenges as mc
+        exact = gated = total = 0
+        for i in range(60):
+            rng = random.Random("heldout|count|%d" % i)
+            img, meta = mc.make_count_round(rng, 96)
+            got = _PL.count(img, meta["target"])
+            total += 1
+            if got is None:
+                gated += 1
+            elif got == meta["count"]:
+                exact += 1
+        print("\n  offline count exact: %d/%d (%d self-gated to vision)"
+              % (exact, total, gated))
+        self.assertGreaterEqual(exact, 40)
+
+    def test_pattern_rounds_offline(self):
+        """Pattern completion end-to-end without a browser: crop the grid
+        cells and candidates from the generated round, classify them with
+        the tile CNN, and resolve the Latin square — the exact path
+        _solve_pattern_round takes when the DOM probe succeeds."""
+        import make_challenges as mc
+        import numpy as np
+        from PIL import Image as PILImage
+        solved = gated = total = 0
+        for i in range(60):
+            rng = random.Random("heldout|pattern|%d" % i)
+            img, meta = mc.make_pattern_round(rng, 96)
+            W, H = img.size
+            total += 1
+            # hole = brightest cell (same heuristic as the server: the
+            # empty cell is near-white; painted tiles are darker)
+            means = []
+            for b in meta["cell_boxes"]:
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                means.append(float(np.asarray(
+                    img.crop((x0, y0, x1, y1)).convert("L")).mean()))
+            hole = int(np.argmax(means))
+            grid = [None] * 9
+            confs = []
+            for i2, b in enumerate(meta["cell_boxes"]):
+                if i2 == hole:
+                    continue
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
+                grid[i2] = g[0]
+                confs.append(g[1])
+            clab, cconf = [], []
+            for b in meta["candidate_boxes"]:
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
+                clab.append(g[0])
+                cconf.append(g[1])
+            win = hct.resolve_pattern(grid, hole, clab)
+            if win is None:
+                gated += 1
+            elif win == meta["correct"]:
+                solved += 1
+        print("\n  offline pattern solved: %d/%d (%d gated to vision)"
+              % (solved, total, gated))
+        self.assertGreaterEqual(solved, 35)
 
     def test_real_photo_tiles(self):
         """Held-out REAL photographs (data_real/val/) the trainer never saw —
         the honest synthetic->real transfer check. Labels come from the
         image-search query itself, so label noise is expected; the gate is a
-        regression floor, the printed number is the honest metric (a small
-        60-way photo corpus transfers in the ~30% range — see SOLVER.md)."""
+        regression floor, the printed number is the honest metric (see
+        SOLVER.md for the corpus and the measured transfer)."""
         import realdata
         from PIL import Image
         val = os.path.join(realdata.REAL_DIR, "val")
@@ -554,7 +822,7 @@ class TestModels(unittest.TestCase):
         acc = ok / len(want)
         print("\n  REAL-photo tile accuracy: %.3f (%d/%d)"
               % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.25)
+        self.assertGreaterEqual(acc, 0.45)
 
 
 if __name__ == "__main__":

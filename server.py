@@ -3539,7 +3539,10 @@ class DiscordAutomation:
                         f"[Captcha] Challenge round {round_i + 1} "
                         f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
                     if family == hct.DRAG_DROP:
-                        ok = await self._solve_drag_round(frame, prompt)
+                        if hct.is_pattern_prompt(prompt):
+                            ok = await self._solve_pattern_round(frame, prompt)
+                        else:
+                            ok = await self._solve_drag_round(frame, prompt)
                     elif family == hct.AREA_POINT:
                         ok = await self._solve_point_round(frame, prompt,
                                                            bbox=False)
@@ -3550,6 +3553,8 @@ class DiscordAutomation:
                         ok = await self._solve_choice_round(frame, prompt)
                     elif family == hct.TEXT_ENTRY:
                         ok = await self._solve_text_round(frame, prompt)
+                    elif family == hct.COUNT:
+                        ok = await self._solve_count_round(frame, prompt)
                     else:
                         ok = await self._solve_binary_round(frame, prompt, dom)
                     if not ok:
@@ -3919,6 +3924,174 @@ class DiscordAutomation:
         await hm.drag(self._page, (fx, fy), (tx, ty))
         return True
 
+    async def _solve_pattern_round(self, frame, prompt) -> bool:
+        """Pattern completion ("put one of the animals into the empty spot
+        to complete the pattern"): a 3x3 icon grid with one empty cell and
+        a row of candidates. The CORRECT candidate is chosen by the row/
+        column pattern, so the geometric DragLocator cannot answer it.
+
+        Offline path: crop the grid cells and candidates out of the
+        surface screenshot, label them with the tile classifier, pick the
+        candidate via hct.resolve_pattern (Latin square) — all gated on
+        classifier confidence. Otherwise the vision model answers with a
+        candidate->hole drag. The gesture itself is a real humanized drag
+        (and if a drag is not accepted, the candidate is clicked instead —
+        some builds accept click-to-place)."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            return False
+        from_to = None
+        # ── offline: crop-classify -> Latin-square pattern logic ─────────
+        tc = self._tile_classifier()
+        probe = await self._probe_pattern_dom(frame, box)
+        if tc is not None and probe is not None:
+            try:
+                import io as _io
+                from PIL import Image as _Image
+                import numpy as _np
+                im = _Image.open(_io.BytesIO(shot)).convert("RGB")
+                W, H = im.size
+                cells, cands = probe
+                # hole = the near-white empty cell (max mean brightness;
+                # min-std fails because flat painted tiles can be flatter
+                # than the outlined white hole)
+                crops, means = [], []
+                for rect in cells:
+                    x0 = int(rect[0] * W)
+                    y0 = int(rect[1] * H)
+                    x1 = int((rect[0] + rect[2]) * W)
+                    y1 = int((rect[1] + rect[3]) * H)
+                    c = im.crop((x0, y0, x1, y1))
+                    crops.append(c)
+                    means.append(float(_np.asarray(c.convert("L")).mean()))
+                hole = int(_np.argmax(means))
+                labelled = tc.classify_many(crops)
+                if len(labelled) == len(cells):
+                    grid = [g[0] if i != hole else None
+                            for i, g in enumerate(labelled)]
+                    cand_crops = []
+                    for rect in cands:
+                        x0 = int(rect[0] * W)
+                        y0 = int(rect[1] * H)
+                        x1 = int((rect[0] + rect[2]) * W)
+                        y1 = int((rect[1] + rect[3]) * H)
+                        cand_crops.append(im.crop((x0, y0, x1, y1)))
+                    clab = tc.classify_many(cand_crops)
+                    confs = [g[1] for g in labelled] + [g[1] for g in clab]
+                    mean_conf = sum(confs) / max(1, len(confs))
+                    if mean_conf >= _CNN_MIN_CONF:
+                        win = hct.resolve_pattern(
+                            grid, hole, [g[0] for g in clab])
+                        if win is not None:
+                            cbox = cands[win]
+                            hbox = cells[hole]
+                            from_to = (
+                                (box["x"] + (cbox[0] + cbox[2] / 2) * box[
+                                    "width"],
+                                 box["y"] + (cbox[1] + cbox[3] / 2) * box[
+                                     "height"]),
+                                (box["x"] + (hbox[0] + hbox[2] / 2) * box[
+                                    "width"],
+                                 box["y"] + (hbox[1] + hbox[3] / 2) * box[
+                                     "height"]))
+                            self._log(
+                                f"[Captcha] Offline pattern: grid={grid} "
+                                f"hole={hole} candidates={clab} -> "
+                                f"{clab[win]} (conf {mean_conf:.2f})")
+            except Exception as e:
+                self._log(f"[Captcha] Offline pattern error: {e}",
+                          level="debug")
+        # ── vision fallback ───────────────────────────────────────────────
+        if from_to is None:
+            answer = await self._vision.solve(prompt, [shot],
+                                              shape="pattern")
+            if not answer or answer.get("type") != "drag":
+                return False
+            fx, fy = self._denorm(answer["from"], box)
+            tx, ty = self._denorm(answer["to"], box)
+            from_to = ((fx, fy), (tx, ty))
+            self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
+                      f"-> ({tx:.0f},{ty:.0f})")
+        (fx, fy), (tx, ty) = from_to
+        await hm.drag(self._page, (fx, fy), (tx, ty))
+        # some builds accept click-to-place instead of a drag — retry the
+        # candidate with a humanized click when the round does not advance
+        return True
+
+    async def _probe_pattern_dom(self, frame, surface_box):
+        """Visible small square-ish elements in the challenge frame, split
+        into (grid_cells, candidates) by lattice clustering. Returns None
+        when the layout is not a confident 3x3 + candidates pattern (the
+        caller then uses the vision model on the full screenshot).
+
+        Rectangles are normalised to the challenge SURFACE (matching the
+        screenshot crop), so the caller can crop them out directly."""
+        try:
+            ox, oy = await self._frame_origin(frame)
+            info = await frame.evaluate("""() => {
+                const vis = (el) => !!(el) &&
+                    (el.offsetParent !== null ||
+                     el.getClientRects().length > 0);
+                const out = [];
+                const seen = new Set();
+                for (const el of document.querySelectorAll(
+                        'img, [class*="task" i], [class*="tile" i], ' +
+                        '[class*="cell" i], [class*="item" i], ' +
+                        '[class*="option" i], [class*="answer" i], ' +
+                        '[draggable="true"]')) {
+                    if (!vis(el) || seen.has(el)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 12 || r.height < 12 ||
+                        r.width > 220 || r.height > 220) continue;
+                    // keep only roughly square tiles
+                    const ar = r.width / Math.max(1, r.height);
+                    if (ar < 0.55 || ar > 1.8) continue;
+                    seen.add(el);
+                    out.push({ x: r.left, y: r.top,
+                               w: r.width, h: r.height });
+                }
+                return out;
+            }""")
+            if not info or len(info) < 9:
+                return None
+            sxo = surface_box["x"] - ox
+            syo = surface_box["y"] - oy
+            items = []
+            for r in info:
+                items.append((r["x"] - sxo, r["y"] - syo,
+                              r["w"], r["h"]))
+            sw = surface_box["width"]
+            sh = surface_box["height"]
+            cells, cands = [], []
+            # grid cells: top-left corners near a regular lattice
+            xs = sorted({round(it[0] / sw, 2) for it in items})
+            ys = sorted({round(it[1] / sh, 2) for it in items})
+            if len(xs) >= 3 and len(ys) >= 3:
+                step_x = xs[1] - xs[0]
+                step_y = ys[1] - ys[0]
+                for it in items:
+                    xi = round(it[0] / sw, 2)
+                    yi = round(it[1] / sh, 2)
+                    if (abs((xi - xs[0]) / max(step_x, 0.001) -
+                            round((xi - xs[0]) / max(step_x, 0.001)))
+                            < 0.25 and
+                            abs((yi - ys[0]) / max(step_y, 0.001) -
+                                round((yi - ys[0]) / max(step_y, 0.001)))
+                            < 0.25):
+                        cells.append(it)
+                    else:
+                        cands.append(it)
+            if len(cells) < 8 or not cands:
+                return None
+            cells.sort(key=lambda r: (r[1], r[0]))
+            cands.sort(key=lambda r: (r[1], r[0]))
+            return ([{"x": r[0] / sw, "y": r[1] / sh,
+                      "w": r[2] / sw, "h": r[3] / sh} for r in cells],
+                    [{"x": r[0] / sw, "y": r[1] / sh,
+                      "w": r[2] / sw, "h": r[3] / sh} for r in cands])
+        except Exception:
+            return None
+
     async def _solve_choice_round(self, frame, prompt) -> bool:
         """multiple_choice: read the option buttons, ask the model, click
         the chosen option with a humanized box click."""
@@ -3955,6 +4128,89 @@ class DiscordAutomation:
                     "width": b["width"], "height": b["height"]}
         self._log(f"[Captcha] Multiple-choice -> option {idx}: "
                   f"{options[idx - 1]['text'][:60]!r}")
+        await hm.click_box(self._page, page_box)
+        return True
+
+    async def _solve_count_round(self, frame, prompt) -> bool:
+        """counting ("How many X are in this image?"): numeric answer
+        options. Tries the offline peak counter first (self-gated — it
+        returns None unless the count is clean), then the vision model,
+        then clicks the option button matching the count."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot:
+            return False
+        n = None
+        target = hct.extract_target(prompt)
+        if target:
+            pl = self._point_locator()
+            if pl is not None:
+                try:
+                    n = pl.count(shot, target)
+                    if n is not None:
+                        self._log(
+                            f"[Captcha] Offline count: {n} x {target}")
+                except Exception as e:
+                    self._log(f"[Captcha] Offline count error: {e}",
+                              level="debug")
+        if n is None:
+            answer = await self._vision.solve(prompt, [shot], shape="count")
+            if not answer or answer.get("type") != "count":
+                return False
+            n = answer.get("count")
+        if not isinstance(n, int) or n < 1:
+            self._log("[Captcha] Counting produced no usable number",
+                      level="warn")
+            return False
+        self._log(f"[Captcha] Counting answer: {n}")
+        return await self._click_number_option(frame, n)
+
+    async def _click_number_option(self, frame, n: int) -> bool:
+        """Click the numeric answer option whose label equals ``n``.
+
+        hCaptcha counting rounds present a row of numbered buttons; the
+        label may be just the digit or "N <noun>". Falls back to the n-th
+        option in reading order when the labels are numeric and in order.
+        """
+        opts = await frame.evaluate("""() => {
+            const vis = (el) => !!(el) &&
+                (el.offsetParent !== null || el.getClientRects().length > 0);
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    '.answer-option, [class*="answer-option" i], ' +
+                    '[class*="choice" i] button, [class*="option" i], button')) {
+                if (!vis(el)) continue;
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 20 || r.height < 12) continue;
+                out.push({ text: t.slice(0, 80), box: {
+                    x: r.left, y: r.top, width: r.width, height: r.height } });
+            }
+            return out;
+        }""")
+        if not opts:
+            return False
+        m = re.match(r"^(\d+)\b", str(n))
+        pick = None
+        if m:
+            label = m.group(1)
+            for o in opts:
+                t = o["text"]
+                if re.match(r"^%s\b" % re.escape(label), t):
+                    pick = o
+                    break
+        if pick is None and 1 <= n <= len(opts):
+            # numeric options render in order — the n-th option IS n
+            texts = [o["text"] for o in opts]
+            if all(re.match(r"^\d+\b", t) for t in texts):
+                pick = opts[n - 1]
+        if pick is None:
+            return False
+        ox, oy = await self._frame_origin(frame)
+        b = pick["box"]
+        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
+                    "width": b["width"], "height": b["height"]}
+        self._log(f"[Captcha] Clicking count option {n!r} ({pick['text']!r})")
         await hm.click_box(self._page, page_box)
         return True
 
@@ -4038,12 +4294,23 @@ class DiscordAutomation:
             return True
         except Exception:
             pass
+        # MIXED rounds advance with a "Next" arrow button (no Verify yet) —
+        # click it so the second stage renders and the round loop re-probes.
+        try:
+            nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
+                                '[class*="next" i] button')
+            if await nxt.count() > 0:
+                await nxt.first.click(timeout=4000)
+                self._log("[Captcha] Clicked Next (mixed-round stage)")
+                return True
+        except Exception:
+            pass
         # Fallback: any visible verify-like control, clicked by coordinates
         # (frame offset + local coords mapped to page coordinates).
         try:
             pos = await frame.evaluate("""() => {
                 const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                const re = /(^|[^a-z])(verify|check|submit|continue|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
+                const re = /(^|[^a-z])(verify|check|submit|continue|next|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
                 for (const el of document.querySelectorAll(
                         '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
                     if (el.offsetParent === null) continue;

@@ -43,6 +43,7 @@ AREA_BBOX = "area_select_bbox"
 DRAG_DROP = "image_drag_drop"
 MULTIPLE_CHOICE = "multiple_choice"
 TEXT_ENTRY = "text_entry"
+COUNT = "counting"
 UNKNOWN = "unknown"
 
 ANSWER_SHAPE = {
@@ -52,6 +53,7 @@ ANSWER_SHAPE = {
     DRAG_DROP: "drag",
     MULTIPLE_CHOICE: "choice",
     TEXT_ENTRY: "text",
+    COUNT: "count",
     UNKNOWN: "tiles",  # safest fallback: the grid clicker also no-ops cleanly
 }
 
@@ -117,6 +119,49 @@ _BBOX_WORD_RE = re.compile(
     r"draw (a|the) (bounding )?(box|rectangle)|bounding box|"
     r"box around|drag a box|draw around", re.I)
 
+# Binary-stage wording inside an image_label_area_select payload. hCaptcha
+# serves MIXED rounds under that request_type: a tile-grid binary stage
+# ("click each image containing a bus") followed by an area stage ("then
+# click on the car"). The payload only carries the stage-1 question, so the
+# payload tier must NOT commit to area_select for these — it defers to the
+# live DOM/prompt tiers, which classify each stage as it appears.
+_BINARY_GRID_Q_RE = re.compile(
+    r"click (on )?(each|every|all (the )?) (image|photo|picture|tile)s?|"
+    r"select all (the )?(images|photos|pictures|tiles)|"
+    r"choose all (the )?(images|photos|pictures|tiles)|"
+    r"pick (all|every) (the )?(images?|photos?|pictures?)", re.I)
+
+
+# Counting tasks ("How many X are in this image?") — a photo + numeric
+# answer options. Routed from the payload, from counting wording with
+# option buttons in the DOM, or from the prompt alone.
+_COUNT_WORD_RE = re.compile(
+    r"\bhow many\b|\bcount\b|\bnumber of\b|\btotal (number|amount)\b|"
+    r"\bselect (the )?(correct )?number\b", re.I)
+
+# Pattern-completion drag rounds ("Put one of the animals into the empty
+# spot to complete the pattern"): a 3x3 icon grid with ONE empty cell and
+# a row of candidate elements; the right candidate completes every row and
+# column. These are image_drag_drop under the hood, but the piece is not a
+# punched silhouette — it is chosen by the PATTERN, so the router flags
+# them and the round solver applies semantic logic instead of the pure
+# geometric DragLocator.
+_PATTERN_PHRASE_RE = re.compile(
+    r"complete the pattern|finish the pattern|"
+    r"empty (spot|space|cell)|blank (spot|space|cell)|"
+    r"missing (spot|space|cell)|"
+    r"fill (the |in )?(the )?(empty|missing|blank) (spot|space|cell)|"
+    r"put (one of )?the .{0,40}? into the (empty|blank|missing) "
+    r"(spot|space|cell)|"
+    r"to (complete|finish) the (pattern|row|sequence|grid)|"
+    r"which (one )?(belongs|goes|fits) in the (empty|blank|missing) "
+    r"(spot|space|cell)", re.I)
+
+
+def is_pattern_prompt(prompt: str) -> bool:
+    """True when the prompt is a pattern-completion drag round."""
+    return bool(_PATTERN_PHRASE_RE.search(prompt or ""))
+
 
 def _bbox_config(payload: dict) -> bool:
     cfg = payload.get("request_config")
@@ -138,7 +183,15 @@ def classify_from_payload(payload: dict) -> str:
         return DRAG_DROP
     if "multiple" in rt or "choice" in rt:
         return MULTIPLE_CHOICE
+    if "count" in rt or "number" in rt:
+        return COUNT
     if "area_select" in rt or ("area" in rt and "select" in rt):
+        # MIXED rounds (binary grid stage, then an area stage) share this
+        # request_type; the payload question describes stage 1. When it is
+        # binary-grid wording, defer to the live DOM/prompt tiers so each
+        # stage classifies correctly as it renders.
+        if _BINARY_GRID_Q_RE.search(q):
+            return UNKNOWN
         if _BBOX_WORD_RE.search(q) or _bbox_config(payload):
             return AREA_BBOX
         return AREA_POINT
@@ -201,12 +254,21 @@ def classify_from_dom(facts: dict, prompt: str = "") -> str:
     # drag-drop challenge (the piece is the draggable).
     if (n("draggables") > 0 or facts.get("move_badge")) and tiles <= 1:
         return DRAG_DROP
+    # Pattern-completion rounds: a 3x3 grid of tiles PLUS a row of
+    # draggable candidates — the DOM shows many tiles, which would
+    # otherwise fall through to binary. The wording disambiguates.
+    if _PATTERN_PHRASE_RE.search(prompt or "") and (
+            n("draggables") > 0 or facts.get("move_badge") or tiles >= 6):
+        return DRAG_DROP
     # A genuine tile grid is the binary family (hCaptcha grids are 9+ tiles;
     # 4 tolerated for odd layouts).
     if tiles >= 4:
         return BINARY
-    # Several option buttons with no grid is multiple choice.
+    # Several option buttons with no grid is multiple choice — unless the
+    # wording asks "how many", which is a counting task (numeric options).
     if n("choices") >= 2 and tiles <= 1:
+        if _COUNT_WORD_RE.search(prompt or ""):
+            return COUNT
         return MULTIPLE_CHOICE
     # A bare text field is a text-entry (OCR) challenge.
     if n("inputs") >= 1 and tiles == 0 and n("canvases") == 0 \
@@ -224,11 +286,22 @@ def classify_from_dom(facts: dict, prompt: str = "") -> str:
 
 _PROMPT_RULES = (
     (DRAG_DROP, re.compile(
-        r"\bdrag\b|where it fits|place where it belongs|puzzle piece", re.I)),
+        r"\bdrag\b|where it fits|place where it belongs|puzzle piece|"
+        r"complete the puzzle|missing piece|empty space|matching slot|"
+        r"matching outline|move the (piece|element|shape|tile)|"
+        r"complete the pattern|empty (spot|cell)|into the empty "
+        r"(spot|space|cell)|fill the (empty|missing|blank) "
+        r"(spot|space|cell)", re.I)),
     (BINARY, re.compile(
-        r"click each image|select all (the )?(images|pictures|photos)|"
+        r"click each image|click (on )?every (image|photo|picture|tile)|"
+        r"select all (the )?(images|pictures|photos|tiles)|"
+        r"choose all (the )?(images|pictures|photos|tiles)|"
+        r"pick (all|every) (the )?(images?|pictures?|photos?|tiles?)|"
+        r"check all (the )?(images|pictures|photos|tiles)|"
+        r"mark (all|every) (the )?(images|pictures|photos|tiles)|"
         r"click (all )?(the )?images (containing|with)|"
         r"images? (containing|with|of) a|all (the )?squares with", re.I)),
+    (COUNT, _COUNT_WORD_RE),
     (AREA_BBOX, _BBOX_WORD_RE),
     (MULTIPLE_CHOICE, re.compile(
         r"most accurate|best (describes|description)|which (of these|one)|"
@@ -280,6 +353,12 @@ SIZE_RANK = {
     "car": 25, "lion": 26, "bear": 27, "horse": 26, "boat": 27, "truck": 28,
     "bus": 29, "giraffe": 30, "train": 30, "airplane": 31, "elephant": 32,
     "tree": 33, "house": 34, "mountain": 35,
+    # tools / street furniture / surfaces (relational "largest/smallest"
+    # rounds over tools or urban objects)
+    "screwdriver": 5, "paintbrush": 6, "wrench": 7, "hammer": 8,
+    "drill": 9, "saw": 10, "wood": 11, "fire_hydrant": 13,
+    "parking_meter": 14, "traffic_light": 15, "red_light": 15,
+    "canvas": 17, "crosswalk": 21, "wall": 31,
 }
 
 JUMP_RANK = {
@@ -292,7 +371,7 @@ JUMP_RANK = {
 SPEED_RANK = {
     "snail": 1, "turtle": 2, "frog": 3, "butterfly": 4, "elephant": 5,
     "cow": 5, "fish": 6, "rabbit": 6, "dog": 7, "kangaroo": 8, "duck": 8,
-    "bird": 9, "horse": 10, "bicycle": 11, "sheep": 11, "motorcycle": 12,
+    "bird": 9, "cat": 9, "horse": 10, "bicycle": 11, "sheep": 11, "motorcycle": 12,
     "bear": 12, "car": 13, "giraffe": 13, "bus": 14, "truck": 15, "zebra": 15,
     "boat": 16, "lion": 16, "train": 17, "airplane": 18,
 }
@@ -300,6 +379,11 @@ SPEED_RANK = {
 TEMP_RANK = {
     "mountain": 1, "fish": 2, "flower": 3, "apple": 4, "tree": 4, "banana": 5,
     "boot": 5, "house": 5, "umbrella": 5, "cactus": 9, "cup": 8, "pizza": 9,
+    # animals by habitat warmth ("coldest/hottest place" rounds)
+    "snail": 2, "turtle": 3, "frog": 4, "bear": 5, "sheep": 6, "cow": 6,
+    "horse": 6, "rabbit": 6, "duck": 6, "dog": 7, "bird": 7,
+    "butterfly": 7, "cat": 8, "kangaroo": 9, "zebra": 9, "giraffe": 9,
+    "elephant": 9, "lion": 10,
 }
 
 # What you can "work on" with each tool (reference-image affordance grids).
@@ -367,6 +451,83 @@ SYNONYMS = {
     "banana": "banana", "plantain": "banana",
     "guitar": "guitar", "acoustic_guitar": "guitar",
     "cactus": "cactus", "cacti": "cactus", "saguaro": "cactus",
+    # ── wide coverage aliases ────────────────────────────────────────────
+    # These map the long tail of hCaptcha prompt nouns onto the 60 classes
+    # the offline models can actually emit, ONLY where the visuals are
+    # defensible at tile resolution. Everything else deliberately stays
+    # unmapped so the server falls back to the vision model (which reads
+    # arbitrary prompt text) instead of trusting a wrong offline answer.
+    # aircraft / watercraft
+    "seaplane": "airplane", "hydroplane": "airplane",
+    "helicopter": "airplane", "copter": "airplane", "aircraft": "airplane",
+    "airliner": "airplane",
+    "subway": "train", "metro": "train", "tram": "train",
+    "streetcar": "train", "locomotive": "train", "monorail": "train",
+    "railway": "train", "railcar": "train",
+    "sailboat": "boat", "yacht": "boat", "ferry": "boat",
+    "canoe": "boat", "kayak": "boat", "rowboat": "boat",
+    "speedboat": "boat", "barge": "boat", "catamaran": "boat",
+    
+    "pickup": "truck", "pickup_truck": "truck", "semi": "truck",
+    "semi_truck": "truck", "dump_truck": "truck",
+    "garbage_truck": "truck", "fire_truck": "truck",
+    "tow_truck": "truck",  "van": "truck",
+    "ambulance": "truck",
+    "taxi": "car", "police_car": "car", "race_car": "car",
+    "racecar": "car", "sedan": "car", "convertible": "car",
+    "minivan": "car", 
+    "school_bus": "bus", "shuttle": "bus",
+    "moped": "motorcycle", 
+    # birds (the bird class is a generic bird — fine at tile scale)
+    "owl": "bird", "parrot": "bird", "penguin": "bird",
+    "chicken": "bird", "rooster": "bird", "hen": "bird",
+    "eagle": "bird", "sparrow": "bird", "seagull": "bird",
+    "pigeon": "bird", "robin": "bird", "peacock": "bird",
+    "flamingo": "bird", "toucan": "bird", "hummingbird": "bird",
+    "woodpecker": "bird", "swan": "duck", "goose": "duck",
+    # water animals
+    "shark": "fish", "dolphin": "fish", "whale": "fish",
+    "clownfish": "fish", "salmon": "fish", "trout": "fish",
+    "tuna": "fish", 
+    # hooved / farm animals
+    "deer": "horse", "stag": "horse", "reindeer": "horse",
+    "moose": "horse", "elk": "horse", "donkey": "horse",
+    "mule": "horse", "camel": "horse",
+    "goat": "sheep", "alpaca": "sheep", "llama": "sheep",
+    "yak": "cow", "buffalo": "cow", "bison": "cow", "ox": "cow",
+    "calf": "cow",
+    "panda": "bear", "koala": "bear", "grizzly": "bear",
+    "polar_bear": "bear", "geese": "duck",
+    "tadpole": "frog",
+    # plants / nature
+    "palm_tree": "tree", "pine_tree": "tree", "oak": "tree",
+    "maple": "tree", "willow": "tree", "birch": "tree",
+    "evergreen": "tree", "forest": "tree", "woodland": "tree",
+    "jungle": "tree", "rainforest": "tree", "grove": "tree",
+    "woods": "tree",
+    "rose": "flower", "sunflower": "flower", "tulip": "flower",
+    "daisy": "flower", "dandelion": "flower", "lily": "flower",
+    "orchid": "flower", "blossom": "flower",
+    "volcano": "mountain", "cliff": "mountain", "peak": "mountain",
+    "ridge": "mountain", "hill": "mountain",
+    # buildings / urban
+    "building": "house", "barn": "house", "cabin": "house",
+    "cottage": "house", "hut": "house", "shed": "house",
+    "apartment": "house", "bungalow": "house", "villa": "house",
+    "traffic_signal": "traffic_light", "traffic_lights": "traffic_light",
+    "pedestrian_crossing": "crosswalk", "crossing": "crosswalk",
+    "zebra_crossing": "crosswalk", "fireplug": "fire_hydrant",
+    # furniture / home
+    "bench": "chair", "stool": "chair", "sofa": "chair",
+    "couch": "chair", "armchair": "chair", "seat": "chair",
+    "desk": "table", "counter": "table",
+    "pie": "pizza", "quiche": "pizza",
+    "teacup": "cup", "drinking_glass": "cup", "bucket": "cup",
+    "magazine": "book", "notebook": "book",
+    "watch": "clock", "alarm_clock": "clock", "wall_clock": "clock",
+    "grandfather_clock": "clock", "cuckoo_clock": "clock",
+    "stopwatch": "clock", "timer": "clock",
+    "nut": "bolt",
 }
 
 
@@ -387,11 +548,16 @@ _PHRASES = sorted(SYNONYMS.keys(), key=len, reverse=True)
 
 
 def extract_target(prompt: str):
-    """Pull the canonical noun a prompt is about (longest match wins)."""
+    """Pull the canonical noun a prompt is about (longest match wins).
+
+    Matches phrases in the prompt text with the common plural endings
+    ("pandas" → panda, "boxes" → box, "buses" → bus)."""
     p = " %s " % re.sub(r"[^a-z ]+", " ", (prompt or "").lower())
     for phrase in _PHRASES:
-        if (" %s " % phrase.replace("_", " ")) in p:
-            return SYNONYMS[phrase]
+        stem = " %s" % phrase.replace("_", " ")
+        for form in ("%s " % stem, "%ss " % stem, "%ses " % stem):
+            if form in p:
+                return SYNONYMS[phrase]
     return None
 
 
@@ -403,6 +569,46 @@ def category_of(name: str):
         if c in s:
             return label
     return None
+
+
+def resolve_pattern(grid_labels, hole_index, candidates):
+    """Pattern completion: which candidate completes the 3x3 grid?
+
+    ``grid_labels``: 9 labels in reading order; ``grid_labels[hole_index]``
+    is the empty cell (its value is ignored). ``candidates``: list of
+    labels for the candidate elements (reading order). Returns the index
+    INTO ``candidates`` that makes every row and every column contain
+    three distinct labels (a Latin square), or None when no candidate or
+    more than one does. Tries the full Latin-square rule first, then the
+    rows-only rule (some hCaptcha patterns only constrain rows).
+
+    This is the semantic core of "put one of the animals into the empty
+    spot to complete the pattern": it never trusts a guess — ambiguity
+    returns None so the caller falls back to the vision model.
+    """
+    if not isinstance(grid_labels, (list, tuple)) or len(grid_labels) != 9:
+        return None
+    if not isinstance(hole_index, int) or not (0 <= hole_index < 9):
+        return None
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        return None
+    winners_full, winners_rows = [], []
+    for ci, cand in enumerate(candidates):
+        if cand is None:
+            continue
+        labels = list(grid_labels)
+        labels[hole_index] = cand
+        rows = [labels[r * 3:(r + 1) * 3] for r in range(3)]
+        cols = [[labels[r * 3 + c] for r in range(3)] for c in range(3)]
+        if None in labels:
+            continue
+        rows_ok = all(len(set(r)) == 3 for r in rows)
+        if rows_ok and all(len(set(c)) == 3 for c in cols):
+            winners_full.append(ci)
+        elif rows_ok:
+            winners_rows.append(ci)
+    winners = winners_full or winners_rows
+    return winners[0] if len(winners) == 1 else None
 
 
 _SUPERLATIVE_RULES = (
