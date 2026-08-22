@@ -80,9 +80,10 @@ async def live_screenshot(bot) -> str:
         b64 = base64.b64encode(shot).decode("utf-8")
         shots = getattr(bot, "_screenshots", None)
         if shots is not None:
+            # Same tiny-ring policy as server.capture_screenshot (memory).
             shots.append(b64)
-            if len(shots) > 100:
-                bot._screenshots = shots[-50:]
+            if len(shots) > 10:
+                bot._screenshots = shots[-8:]
         return b64
     try:
         bot._log(f"[Live] screenshot failed: {last_err}", level="warn")

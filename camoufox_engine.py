@@ -78,6 +78,37 @@ except Exception:  # pragma: no cover - raised as a clear error at launch
 # pref so no JS shim can be detected.
 _FRAME_RATES = (60, 60, 60, 60, 60, 60, 60, 60, 75, 90, 120, 144)
 
+# Memory-safe Firefox prefs. The runtime is a ~1 GB cgroup shared with the
+# Python app, TOR and the vision client, and Firefox's desktop defaults have
+# OOM-killed the renderer mid-Discord-load there: unbounded memory cache, up
+# to 8 pre-spawned content processes and GPU compositing. These prefs cap
+# the footprint without touching the fingerprint (runtime prefs, invisible
+# to page JS).
+_MEMORY_SAFE_PREFS = {
+    # No disk cache: the profile is a fresh temp dir per launch, and /tmp is
+    # often RAM-backed in containers.
+    "browser.cache.disk.enable": False,
+    # Bound the in-memory cache (KB — the default is 4 GB, a no-cap in
+    # practice). 256 MB is far more than a register page + captcha images.
+    "browser.cache.memory.capacity": 262144,
+    # Don't hold extra copies of the current document for history viewers.
+    "browser.sessionhistory.max_total_viewers": 0,
+    # We render in software (LIBGL_ALWAYS_SOFTWARE) anyway — no GPU
+    # compositor buffers.
+    "layers.acceleration.disabled": True,
+    # No speculative parallel connections: fewer sockets/buffers, less
+    # churn through slow proxy tunnels.
+    "network.http.speculative-parallel-limit": 0,
+    # Bound pre-spawned content processes (default 8); each one costs tens
+    # of MB of heap.
+    "dom.ipc.processPrelimit": 4,
+}
+
+
+def _low_memory_mode() -> bool:
+    """Same knob as server.py: 1 GB container mode (default on)."""
+    return (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
+
 # Only these context options are forwarded to the engine. Everything else the
 # bot passes (user_agent, timezone_id, locale, geolocation, device_scale_factor,
 # extra_http_headers, proxy, permissions...) is identity — the engine owns it
@@ -106,10 +137,16 @@ async def _launch_browser(headless: bool = True, proxy: Optional[dict] = None):
     # every session move at the same speed — a giveaway. Randomize per
     # launch (Camoufox default cap is ~1.5s; humans vary a lot more).
     _humanize_max = round(random.uniform(0.8, 1.8), 2)
+    # 60 Hz only in low-memory mode: a 120/144 Hz panel makes a
+    # memory-starved renderer repaint 2-2.4x more often for no visible
+    # benefit in a headless feed.
+    _frame_rates = (60,) if _low_memory_mode() else _FRAME_RATES
+    prefs = dict(_MEMORY_SAFE_PREFS)
+    prefs["layout.frame_rate"] = random.choice(_frame_rates)
     opts = {
         "headless": bool(headless),
         "humanize": _humanize_max,
-        "firefox_user_prefs": {"layout.frame_rate": random.choice(_FRAME_RATES)},
+        "firefox_user_prefs": prefs,
     }
     if proxy:
         opts["proxy"] = proxy

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import json
 import os
 import random
@@ -1089,6 +1090,30 @@ def _tor_check():
         return False
 
 
+def _cgroup_oom_kills() -> int:
+    """Total cgroup OOM kills for this container (0 when unreadable).
+
+    cgroup v2 exposes the counter in memory.events ("oom_kill N"); v1 in
+    memory.oom_control. A rising counter while a renderer "Page crashed"
+    means the KILLER was the container memory limit — not a dead proxy —
+    so rotating circuits cannot fix it.
+    """
+    for path in ("/sys/fs/cgroup/memory.events",
+                 "/sys/fs/cgroup/memory/memory.oom_control"):
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == "oom_kill":
+                        try:
+                            return int(parts[1])
+                        except ValueError:
+                            return 0
+        except Exception:
+            pass
+    return 0
+
+
 PAST_CAPTCHA_KEYWORDS = ['/channels', '/verify', '/welcome', '@me', 'discord.com/app']
 
 _BIO_POOL = [
@@ -1420,6 +1445,12 @@ class DiscordAutomation:
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
         self._last_browser_diag = 0.0
+        # OOM tracking: cgroup OOM-kill counter at browser launch + crash
+        # timestamps. A renderer crash accompanied by a rising counter is a
+        # MEMORY kill — recovery must reclaim + retry the SAME transport
+        # instead of rotating circuits (which cannot fix memory pressure).
+        self._oom_kills_at_launch = 0
+        self._oom_crash_times: list = []
         # Camoufox owns the identity: a fresh temporary profile per launch and
         # a freshly randomized fingerprint per context (engine-owned) —
         # there is no bot-side fingerprint to keep.
@@ -1497,6 +1528,7 @@ class DiscordAutomation:
                 "cgroup_memory_current": _read("/sys/fs/cgroup/memory.current"),
                 "cgroup_memory_max": _read("/sys/fs/cgroup/memory.max"),
                 "cgroup_memory_events": _read("/sys/fs/cgroup/memory.events"),
+                "cgroup_oom_kills": _cgroup_oom_kills(),
                 "cgroup_pids_current": _read("/sys/fs/cgroup/pids.current"),
                 "cgroup_pids_max": _read("/sys/fs/cgroup/pids.max"),
                 "process_status": _read("/proc/self/status", 1200),
@@ -1505,6 +1537,20 @@ class DiscordAutomation:
         try:
             diagnostics = await asyncio.to_thread(_collect)
             self._log("[Diag] Browser failure " + json.dumps(diagnostics, sort_keys=True), level="error")
+            # Make the #1 container killer impossible to miss in ALL LOGS:
+            # a non-zero cgroup OOM-kill counter means the browser process
+            # was killed by the container memory limit, NOT by a bad proxy
+            # or a dead circuit — rotating cannot fix it.
+            try:
+                if int(diagnostics.get("cgroup_oom_kills") or 0) > 0:
+                    self._log(
+                        f"[Diag] cgroup OOM killer has fired {diagnostics.get('cgroup_oom_kills')}x "
+                        f"in total — browser processes are being KILLED by the container memory "
+                        f"limit (max={diagnostics.get('cgroup_memory_max')}). This is a memory "
+                        "problem, not a proxy/circuit problem; raise the container memory limit.",
+                        level="error")
+            except Exception:
+                pass
         except Exception as diag_error:
             self._log(f"[Diag] Browser failure diagnostics unavailable: {type(diag_error).__name__}: {diag_error}", level="error")
 
@@ -1672,8 +1718,13 @@ class DiscordAutomation:
         self._attach_rqdata_capture()
         self._attach_crash_listener()
 
-        # CDP-level webdriver removal — runs BEFORE init scripts, catches early checks
+        # Identity spoofing (incl. navigator.webdriver) is engine-owned inside
+        # the Camoufox browser build — apply_cdp_stealth is a contract no-op.
         await apply_cdp_stealth(self._context, self._page)
+
+        # Baseline for OOM attribution: a renderer crash with a HIGHER cgroup
+        # OOM-kill counter than this is a memory kill, not a dead proxy.
+        self._oom_kills_at_launch = _cgroup_oom_kills()
 
         # Report the real egress IP of this session (bounded, never blocks).
         asyncio.create_task(self._log_proxy_exit_ip())
@@ -2533,34 +2584,82 @@ class DiscordAutomation:
 
         A renderer crash or a TargetClosedError can leave the browser
         transport technically connected while its page/context is unusable.
-        Restarting the complete browser once avoids trying to poll a target
-        that no longer exists; a second failure is left to normal rotation.
+        Restarting the complete browser avoids polling a target that no
+        longer exists; exhaustion is left to normal rotation.
+
+        OOM-aware: when the cgroup OOM-kill counter rose since this browser
+        launched, the crash was a MEMORY kill — rotating circuits cannot fix
+        memory pressure. So recovery retries the SAME transport a few times
+        with reclaim pauses (kernel memory reclaim + Python GC) between
+        attempts, and after repeated OOM crashes it backs off hard and tells
+        the operator the container memory limit is the problem.
         """
         if self._stopped.is_set():
             return False
-        self._log(f'[Nav] {reason} - restarting browser process once', level='warn')
-        try:
-            await self._relaunch_browser()
-            if self._page is None:
-                raise RuntimeError('browser restart produced no page')
-            self._page_crashed = False
-            await asyncio.wait_for(
-                self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
-                timeout=33.0,
-            )
-            await asyncio.sleep(0.5)
-            self._log('[Nav] Browser restart after renderer crash completed', level='info')
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._page_crashed = True
-            await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
-            self._log(
-                f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})',
-                level='error',
-            )
-            return False
+        oom_now = _cgroup_oom_kills()
+        oom_since_launch = oom_now - getattr(self, "_oom_kills_at_launch", 0)
+        is_oom = oom_since_launch > 0
+
+        # Track OOM crashes in a 5-minute window. Three of them means the
+        # container cap is simply too small for Camoufox + Discord — a hot
+        # retry loop would just burn proxy sessions faster.
+        if is_oom:
+            now = time.time()
+            self._oom_crash_times = [t for t in self._oom_crash_times if now - t < 300]
+            self._oom_crash_times.append(now)
+            if len(self._oom_crash_times) >= 3:
+                self._log(
+                    f"[Mem] {len(self._oom_crash_times)} cgroup OOM kills of the browser in the "
+                    f"last 5 minutes — the container memory limit is too small for Camoufox + "
+                    f"Discord (cgroup oom_kill={oom_now}). Reclaiming, then backing off 60s. "
+                    "Raise the container memory limit (2 GB recommended) to stop this.",
+                    level="error")
+                gc.collect()
+                await asyncio.sleep(60)
+
+        self._log(
+            f'[Nav] {reason} - restarting browser process'
+            + (f' (cgroup OOM kills since launch: {oom_since_launch} — memory pressure, '
+               'not a dead proxy; reclaiming before each retry)' if is_oom
+               else ' once'),
+            level='warn')
+        attempts = 3 if is_oom else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    # Let the OOM killer's work settle: kernel reclaim first,
+                    # then the Python heap (screenshot ring, logs) — only
+                    # then spend another browser on the same memory cap.
+                    gc.collect()
+                    await asyncio.sleep(4.0 * attempt)
+                await self._relaunch_browser()
+                if self._page is None:
+                    raise RuntimeError('browser restart produced no page')
+                self._page_crashed = False
+                await asyncio.wait_for(
+                    self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
+                    timeout=33.0,
+                )
+                await asyncio.sleep(0.5)
+                self._log('[Nav] Browser restart after renderer crash completed', level='info')
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._page_crashed = True
+                if attempt < attempts:
+                    self._log(
+                        f'[Nav] Restart attempt {attempt}/{attempts} failed ({type(e).__name__}) '
+                        f'- memory reclaim pause, retrying same transport', level='warn')
+                    continue
+                await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
+                self._log(
+                    f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})'
+                    + (' — caused by the container memory cap; rotating the circuit will not '
+                       'fix it, the memory limit must be raised' if is_oom else ''),
+                    level='error',
+                )
+                return False
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
@@ -2574,8 +2673,12 @@ class DiscordAutomation:
             return ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
         self._screenshots.append(b64)
-        if len(self._screenshots) > 100:
-            self._screenshots = self._screenshots[-50:]
+        # Tiny ring on purpose: each frame is a full-viewport PNG in base64
+        # (~150-400 KB) and this list lives in the Python heap next to the
+        # browser inside a 1 GB container — 100 frames was a 30-40 MB
+        # constant tax. The dashboard only ever needs the latest frame.
+        if len(self._screenshots) > 10:
+            self._screenshots = self._screenshots[-8:]
         return b64
 
     async def start_discord_signup(self) -> bool:
