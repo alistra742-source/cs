@@ -7,9 +7,10 @@ NO browser, NO network, NO model server. Covers:
   * challenge-family routing from the /getcaptcha payload, from DOM facts
     and from prompt wording (incl. the staged live rounds: the affordance
     reference grid, the relational point round, the drag round, the
-    counting round — "How many X are in this image?" — and the
+    counting round — "How many X are in this image?" — the
     pattern-completion drag round — "put one of the animals into the
-    empty spot to complete the pattern");
+    empty spot to complete the pattern" — and the wooden-block tower
+    drag — "move the missing block segment onto the incomplete tower");
   * vision-answer parsing for every answer shape, including the sloppy
     JSON small models emit (.8 decimals, trailing commas, fenced markdown)
     and integer count answers;
@@ -26,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 73 collected (65 passed + 8 skipped when the models are not trained yet).
+Expected: 81 collected (73 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -126,6 +127,38 @@ class TestRoutePayload(unittest.TestCase):
         self.assertEqual(hct.classify(p, dom_area, "Please click on the car"),
                          hct.AREA_POINT)
 
+    def test_payload_area_select_tower_is_drag(self):
+        # Live: served as image_label_area_select even though the answer
+        # is a Move-badge drag. Must NOT commit to a point click.
+        p = {"request_type": "image_label_area_select",
+             "requester_question": {
+                 "en": "Move the correct missing block segment onto "
+                       "the incomplete tower"}}
+        self.assertEqual(hct.classify_from_payload(p), hct.DRAG_DROP)
+        self.assertEqual(hct.classify(p, None, hct.question_text(p)),
+                         hct.DRAG_DROP)
+
+    def test_payload_mixed_metal_then_tower_defers(self):
+        # Combined payload question mentions the grid AND the tower —
+        # do not lock the whole challenge to drag (stage 1 is still tiles).
+        p = {"request_type": "image_label_area_select",
+             "requester_question": {
+                 "en": "Select items that are primarily metal, then "
+                       "move the missing block onto the incomplete tower"}}
+        self.assertEqual(hct.classify_from_payload(p), hct.UNKNOWN)
+        dom_grid = {"tiles": 9, "images": 9, "choices": 0, "inputs": 0,
+                    "canvases": 0, "draggables": 0, "move_badge": False}
+        self.assertEqual(
+            hct.classify(p, dom_grid, "Select items that are primarily metal"),
+            hct.BINARY)
+        self.assertEqual(
+            hct.classify(p, {"tiles": 0, "images": 1, "canvases": 1,
+                             "choices": 0, "inputs": 0, "draggables": 0,
+                             "move_badge": False},
+                         "Move the correct missing block segment onto "
+                         "the incomplete tower"),
+            hct.DRAG_DROP)
+
     def test_payload_drag(self):
         p = {"request_type": "image_drag_drop",
              "requester_question": {"en": "Drag the element to the place "
@@ -209,6 +242,18 @@ class TestRouteDOM(unittest.TestCase):
         self.assertEqual(hct.classify_from_dom(
             f, "Please click on the frog"), hct.AREA_POINT)
 
+    def test_dom_tower_without_move_badge(self):
+        # Real badge is "+ Move" / an icon child — the old leaf /^move$/
+        # probe missed it and the single canvas fell through to a point click.
+        f = {"tiles": 0, "choices": 0, "inputs": 0, "canvases": 1,
+             "images": 1, "draggables": 0, "move_badge": False}
+        self.assertEqual(hct.classify_from_dom(
+            f, "Move the correct missing block segment onto the "
+               "incomplete tower"), hct.DRAG_DROP)
+        # same DOM without tower wording stays a point round
+        self.assertEqual(hct.classify_from_dom(
+            f, "Please click on the frog"), hct.AREA_POINT)
+
     def test_dom_bbox_wording(self):
         f = {"tiles": 1, "choices": 0, "inputs": 0, "canvases": 1,
              "images": 0, "draggables": 0, "move_badge": False}
@@ -281,6 +326,26 @@ class TestRoutePrompt(unittest.TestCase):
         # ...but the plain binary grid is NOT a pattern round
         self.assertFalse(hct.is_pattern_prompt(
             "Please click each image containing a bus"))
+
+    def test_prompt_tower_drag(self):
+        live = "Move the correct missing block segment onto the incomplete tower"
+        self.assertTrue(hct.is_tower_prompt(live))
+        self.assertEqual(hct.classify_from_prompt(live), hct.DRAG_DROP)
+        self.assertFalse(hct.is_pattern_prompt(live))
+        for prompt in (
+                "Move the missing block onto the incomplete tower",
+                "Drag the correct block segment onto the tower",
+                "Complete the tower with the missing segment",
+                "Place the missing segment onto the stack",
+        ):
+            self.assertTrue(hct.is_tower_prompt(prompt), prompt)
+            self.assertEqual(hct.classify_from_prompt(prompt), hct.DRAG_DROP, prompt)
+        self.assertFalse(hct.is_tower_prompt(
+            "Please click on the animal who jumps the highest"))
+        self.assertFalse(hct.is_tower_prompt(
+            "Select items that are primarily metal"))
+        self.assertFalse(hct.is_tower_prompt(
+            "Put one of the animals into the empty spot to complete the pattern"))
 
     def test_prompt_select_all_variants(self):
         for prompt in (
@@ -436,6 +501,13 @@ class TestParseGeometry(unittest.TestCase):
         self.assertEqual(got, {"type": "drag", "from": (0.3, 0.8),
                                "to": (0.5, 0.2)})
 
+    def test_parse_tower_drag(self):
+        # tower rounds share the drag answer shape (piece -> incomplete stack)
+        got = GEO('{"drag": {"from": [0.88, 0.42], "to": [0.41, 0.61]}}',
+                  "drag")
+        self.assertEqual(got, {"type": "drag", "from": (0.88, 0.42),
+                               "to": (0.41, 0.61)})
+
     def test_parse_drag(self):
         got = GEO('{"drag": {"from": [0.25, 0.5], "to": [0.75, 0.5]}}',
                   "drag")
@@ -483,6 +555,77 @@ class TestDenorm(unittest.TestCase):
         box = {"x": 100.0, "y": 200.0, "width": 400.0, "height": 80.0}
         self.assertEqual(hct.denorm((1.4, -0.2), box), (500.0, 200.0))
         self.assertEqual(hct.denorm((-9.0, 7.77), box), (100.0, 280.0))
+
+
+# ── wooden-block tower locator ────────────────────────────────────────────
+
+
+def _blank_rgb(w, h, color=(236, 226, 208)):
+    return [[color] * w for _ in range(h)]
+
+
+def _fill_rect(grid, x0, y0, x1, y1, color):
+    h = len(grid)
+    w = len(grid[0])
+    for y in range(max(0, y0), min(h, y1)):
+        row = list(grid[y])
+        for x in range(max(0, x0), min(w, x1)):
+            row[x] = color
+        grid[y] = row
+
+
+def _stack_blocks(grid, cx, n, bottom, bw=28, bh=16, gap=3,
+                  colors=((186, 128, 62), (158, 102, 48))):
+    """Paint ``n`` wooden blocks stacked upward from ``bottom``."""
+    for i in range(n):
+        y1 = bottom - i * (bh + gap)
+        y0 = y1 - bh
+        _fill_rect(grid, cx - bw // 2, y0, cx + bw // 2, y1, colors[i % 2])
+
+
+class TestLocateTowerDrag(unittest.TestCase):
+
+    def test_shortest_middle_tower(self):
+        # 3 towers (4 / 2 / 4) + a 2-block Move piece on the right.
+        w, h = 240, 150
+        grid = _blank_rgb(w, h)
+        _stack_blocks(grid, 42, 4, bottom=132)
+        _stack_blocks(grid, 100, 2, bottom=132)   # incomplete
+        _stack_blocks(grid, 158, 4, bottom=132)
+        _stack_blocks(grid, 214, 2, bottom=88)    # floating piece
+        got = hct.locate_tower_drag(grid)
+        self.assertIsNotNone(got)
+        fx, fy = got["from"]
+        tx, ty = got["to"]
+        self.assertGreater(fx, 0.78)             # piece is on the right
+        self.assertGreater(tx, 0.30)
+        self.assertLess(tx, 0.55)                # middle tower
+        self.assertGreater(ty, 0.45)             # onto the short stack, not sky
+
+    def test_gapped_tower(self):
+        # Middle tower is 4-high with the 3rd block missing — drop in the gap.
+        w, h = 240, 150
+        grid = _blank_rgb(w, h)
+        _stack_blocks(grid, 42, 4, bottom=132)
+        _stack_blocks(grid, 158, 4, bottom=132)
+        # bottom two + top one of a 4-stack, skip the 3rd
+        _stack_blocks(grid, 100, 2, bottom=132)
+        _stack_blocks(grid, 100, 1, bottom=132 - 3 * (16 + 3))
+        _stack_blocks(grid, 214, 2, bottom=88)
+        got = hct.locate_tower_drag(grid)
+        self.assertIsNotNone(got)
+        tx, ty = got["to"]
+        self.assertGreater(tx, 0.30)
+        self.assertLess(tx, 0.55)
+        # gap sits between the 2nd and 4th blocks
+        self.assertGreater(ty, 0.35)
+        self.assertLess(ty, 0.75)
+
+    def test_no_wood_returns_none(self):
+        grid = _blank_rgb(80, 60, (240, 240, 240))
+        self.assertIsNone(hct.locate_tower_drag(grid))
+        self.assertIsNone(hct.locate_tower_drag(None))
+        self.assertIsNone(hct.locate_tower_drag([]))
 
 
 # ── knowledge base ────────────────────────────────────────────────────────

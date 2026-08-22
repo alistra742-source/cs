@@ -1092,6 +1092,9 @@ _ESSENTIAL_PREFIXES = (
     "[Captcha] Clicked Verify",
     "[Captcha] Offline",
     "[Captcha] Next challenge",
+    "[Captcha] Offline tower",
+    "[Captcha] Vision tower",
+    "[Captcha] Tower wording",
 )
 
 
@@ -4124,6 +4127,13 @@ class DiscordAutomation:
                         await asyncio.sleep(2)
                         continue
                     family = hct.classify(self._challenge_payload, dom, prompt)
+                    # Live tower wording is a Move-badge drag even when
+                    # /getcaptcha labelled the round image_label_area_select.
+                    if hct.is_tower_prompt(prompt) and family != hct.DRAG_DROP:
+                        self._log(
+                            f"[Captcha] Tower wording — forcing drag-drop "
+                            f"(was {family})")
+                        family = hct.DRAG_DROP
                     sig = (prompt, family, int((dom or {}).get("tiles") or 0))
                     # Same prompt + same layout: we already answered this
                     # grid. Re-clicking tiles TOGGLES them off. Just hit
@@ -4138,7 +4148,9 @@ class DiscordAutomation:
                         f"[Captcha] Challenge round {round_i + 1} "
                         f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
                     if family == hct.DRAG_DROP:
-                        if hct.is_pattern_prompt(prompt):
+                        if hct.is_tower_prompt(prompt):
+                            ok = await self._solve_tower_round(frame, prompt)
+                        elif hct.is_pattern_prompt(prompt):
                             ok = await self._solve_pattern_round(frame, prompt)
                         else:
                             ok = await self._solve_drag_round(frame, prompt)
@@ -4551,6 +4563,44 @@ class DiscordAutomation:
         fx, fy = self._denorm(answer["from"], box)
         tx, ty = self._denorm(answer["to"], box)
         self._log(f"[Captcha] Dragging piece ({fx:.0f},{fy:.0f}) -> "
+                  f"({tx:.0f},{ty:.0f})")
+        await hm.drag(self._page, (fx, fy), (tx, ty))
+        return True
+
+    async def _solve_tower_round(self, frame, prompt) -> bool:
+        """Wooden-block tower: drag the Move piece onto the incomplete stack.
+
+        Live prompt: "Move the correct missing block segment onto the
+        incomplete tower". hCaptcha serves this under area_select, but
+        the answer is a real press/move/release drag — a point click
+        never picks up the piece. NEVER uses DragLocator (punched-slot
+        geometry is the wrong puzzle). Offline wood-mask heuristic
+        first; vision ``shape="tower"`` as fallback.
+        """
+        shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            return False
+        got = None
+        try:
+            got = hct.locate_tower_drag(shot)
+        except Exception as e:
+            self._log(f"[Captcha] Offline tower error: {e}", level="debug")
+            got = None
+        if got and got.get("from") and got.get("to"):
+            fx, fy = self._denorm(got["from"], box)
+            tx, ty = self._denorm(got["to"], box)
+            self._log(
+                f"[Captcha] Offline tower drag "
+                f"({got['from'][0]:.2f},{got['from'][1]:.2f}) -> "
+                f"({got['to'][0]:.2f},{got['to'][1]:.2f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        answer = await self._vision.solve(prompt, [shot], shape="tower")
+        if not answer or answer.get("type") != "drag":
+            return False
+        fx, fy = self._denorm(answer["from"], box)
+        tx, ty = self._denorm(answer["to"], box)
+        self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
                   f"({tx:.0f},{ty:.0f})")
         await hm.drag(self._page, (fx, fy), (tx, ty))
         return True

@@ -179,12 +179,29 @@ _SYSTEM_PATTERN = (
     "(origin top-left)."
 )
 
+_SYSTEM_TOWER = (
+    "You are a precise drag-and-drop solver for an hCaptcha wooden-block "
+    "tower challenge. You are given ONE image showing several vertical "
+    "wooden-block towers and a loose block SEGMENT (usually on the right, "
+    "often with a Move badge). The instruction is to move the missing "
+    "segment onto the INCOMPLETE tower — the stack that is shorter than "
+    "the others, or that has a gap / missing block. Answer with ONLY a "
+    "JSON object: "
+    '{"drag": {"from": [x1, y1], "to": [x2, y2]}} where "from" is the '
+    "CENTRE of the loose/Move piece and \"to\" is the drop point ON the "
+    "incomplete tower (the gap, or the top of the shortest stack). "
+    "Coordinates are NORMALISED 0.0-1.0 fractions of the image size "
+    "(origin top-left). Do NOT click a finished tower. Do NOT treat this "
+    "as a point-click — the piece must be dragged."
+)
+
 _SYSTEM_BY_SHAPE = {
     "tiles": _SYSTEM_PROMPT,
     "points": _SYSTEM_POINT,
     "bbox": _SYSTEM_BBOX,
     "drag": _SYSTEM_DRAG,
     "pattern": _SYSTEM_PATTERN,
+    "tower": _SYSTEM_TOWER,
     "stack": _SYSTEM_STACK,
     "choice": _SYSTEM_CHOICE,
     "count": _SYSTEM_COUNT,
@@ -406,7 +423,7 @@ class OllamaVisionClient:
                 self._log("[Ollama] Empty response from model", level="warn")
                 self.stats["failed"] += 1
                 return None
-            parse_shape = "drag" if shape == "pattern" else shape
+            parse_shape = "drag" if shape in ("pattern", "tower") else shape
             parsed = self._parse_geometry(content, parse_shape, len(images))
             if parsed is None and shape in ("tiles", "text", "count", "stack"):
                 parsed = self._parse_answer(content, len(images), shape)

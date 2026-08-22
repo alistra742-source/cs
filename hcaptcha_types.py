@@ -11,6 +11,7 @@ hCaptcha serves five challenge families, not one:
   area_select (point)           "click on the animal who jumps highest"
   area_select (bbox)            "draw a box around the cat's head"
   image_drag_drop               "drag the element to the place it fits"
+  wooden-block tower (drag)     "move the missing block onto the incomplete tower"
   multiple_choice               "select the most accurate description"
   ============================  =======================================
 
@@ -166,6 +167,23 @@ def is_pattern_prompt(prompt: str) -> bool:
     return bool(_PATTERN_PHRASE_RE.search(prompt or ""))
 
 
+# Wooden-block tower drag: "Move the correct missing block segment onto
+# the incomplete tower". hCaptcha serves this under image_label_area_select
+# (so the payload tier used to commit to a POINT click) even though the
+# answer is a Move-badge drag onto the shortest / gapped stack.
+_TOWER_PHRASE_RE = re.compile(
+    r"missing block|block segment|incomplete tower|"
+    r"complete the tower|onto the (incomplete )?tower|"
+    r"move the .{0,50}(block|segment|tower)|"
+    r"missing segment|onto the stack",
+    re.I)
+
+
+def is_tower_prompt(prompt: str) -> bool:
+    """True for the wooden-block 'missing segment onto the tower' drag."""
+    return bool(_TOWER_PHRASE_RE.search(prompt or ""))
+
+
 def _bbox_config(payload: dict) -> bool:
     cfg = payload.get("request_config")
     if not isinstance(cfg, dict):
@@ -189,11 +207,15 @@ def classify_from_payload(payload: dict) -> str:
     if "count" in rt or "number" in rt:
         return COUNT
     if "area_select" in rt or ("area" in rt and "select" in rt):
-        # MIXED rounds (binary grid stage, then an area stage) share this
-        # request_type; the payload question describes stage 1. When it is
-        # binary-grid wording, defer to the live DOM/prompt tiers so each
-        # stage classifies correctly as it renders.
-        if _BINARY_GRID_Q_RE.search(q):
+        # MIXED rounds (binary grid stage, then an area/drag stage) share
+        # this request_type and may mention BOTH stages in one question.
+        # Defer those so the live DOM/prompt classify each stage. A payload
+        # that is ONLY a tower/pattern drag must NOT commit to a point
+        # click — that never grabs the Move piece.
+        mixed = bool(_BINARY_GRID_Q_RE.search(q))
+        if not mixed and (is_tower_prompt(q) or is_pattern_prompt(q)):
+            return DRAG_DROP
+        if mixed:
             return UNKNOWN
         if _BBOX_WORD_RE.search(q) or _bbox_config(payload):
             return AREA_BBOX
@@ -224,9 +246,11 @@ DOM_PROBE_JS = r"""() => {
             (el.clientWidth >= 180 || el.naturalWidth >= 180)).length;
     const draggables = count('[draggable="true"], [class*="drag" i]');
     let moveBadge = false;
-    for (const el of q('div, span, p')) {
-        const t = (el.textContent || '').trim();
-        if (vis(el) && el.children.length === 0 && /^move$/i.test(t)) {
+    for (const el of q('div, span, p, button, [role="button"]')) {
+        const t = ((el.textContent || '') + ' '
+            + (el.getAttribute('aria-label') || '')).trim();
+        if (!vis(el)) continue;
+        if (/^\+?\s*move\s*$/i.test(t) || /\bmove\b/i.test(t) && t.length <= 12) {
             moveBadge = true; break;
         }
     }
@@ -263,6 +287,11 @@ def classify_from_dom(facts: dict, prompt: str = "") -> str:
     if _PATTERN_PHRASE_RE.search(prompt or "") and (
             n("draggables") > 0 or facts.get("move_badge") or tiles >= 6):
         return DRAG_DROP
+    # Wooden-block tower: one canvas, often without a leaf "Move" text
+    # node (the badge is "+ Move" / an icon child). Live wording is the
+    # signal — do NOT fall through to AREA_POINT.
+    if is_tower_prompt(prompt):
+        return DRAG_DROP
     # A genuine tile grid is the binary family (hCaptcha grids are 9+ tiles;
     # 4 tolerated for odd layouts).
     if tiles >= 4:
@@ -291,7 +320,9 @@ _PROMPT_RULES = (
     (DRAG_DROP, re.compile(
         r"\bdrag\b|where it fits|place where it belongs|puzzle piece|"
         r"complete the puzzle|missing piece|empty space|matching slot|"
-        r"matching outline|move the (piece|element|shape|tile)|"
+        r"matching outline|move the (piece|element|shape|tile|correct)|"
+        r"missing block|block segment|incomplete tower|complete the tower|"
+        r"onto the (incomplete )?tower|missing segment|"
         r"complete the pattern|empty (spot|cell)|into the empty "
         r"(spot|space|cell)|fill the (empty|missing|blank) "
         r"(spot|space|cell)", re.I)),
@@ -339,7 +370,14 @@ def classify_from_prompt(prompt: str) -> str:
 
 
 def classify(payload: dict = None, dom: dict = None, prompt: str = "") -> str:
-    """All three tiers in order; first non-UNKNOWN wins."""
+    """All three tiers in order; first non-UNKNOWN wins.
+
+    The live prompt wins for the wooden-block tower: hCaptcha wraps that
+    Move-badge drag in ``image_label_area_select``, so a stale mixed
+    payload + a single canvas would otherwise commit to a point click.
+    """
+    if is_tower_prompt(prompt):
+        return DRAG_DROP
     for result in (classify_from_payload(payload),
                    classify_from_dom(dom, prompt),
                    classify_from_prompt(prompt)):
@@ -860,3 +898,206 @@ def denorm(point, box):
     x = max(0.0, min(1.0, x))
     y = max(0.0, min(1.0, y))
     return (left + x * w, top + y * h)
+
+
+# ── wooden-block tower drag (offline heuristic) ──────────────────────────
+
+def _is_wood_rgb(r, g, b) -> bool:
+    """True for warm brown/tan wooden-block pixels, not cream backgrounds."""
+    try:
+        r, g, b = int(r), int(g), int(b)
+    except (TypeError, ValueError):
+        return False
+    if r < 80 or r > 235:
+        return False
+    if g < 40 or g > 200:
+        return False
+    if b > 155:
+        return False
+    if r < g + 6:
+        return False
+    if (r - b) < 28:
+        return False
+    mx, mn = max(r, g, b), min(r, g, b)
+    # cream / beige challenge backdrop (high luma, low chroma)
+    if mx > 215 and (mx - mn) < 50:
+        return False
+    if r > 220 and g > 205:
+        return False
+    return True
+
+
+def _rgb_grid(image):
+    """Normalise an image to ``(width, height, rows)`` of RGB triples.
+
+    Accepts a list-of-rows (stdlib, used by tests), a PIL Image, or
+    PNG/JPEG bytes (production screenshots). Returns None when the
+    surface is unreadable or tiny.
+    """
+    if image is None:
+        return None
+    if isinstance(image, list) and image and isinstance(image[0], (list, tuple)):
+        h = len(image)
+        w = len(image[0]) if h else 0
+        if w < 8 or h < 8:
+            return None
+        return w, h, image
+    try:
+        from PIL import Image as _Im
+        import io as _io
+        if hasattr(image, "convert") and hasattr(image, "size"):
+            im = image.convert("RGB")
+        elif isinstance(image, (bytes, bytearray)):
+            im = _Im.open(_io.BytesIO(bytes(image))).convert("RGB")
+        else:
+            return None
+        w, h = im.size
+        if w < 8 or h < 8:
+            return None
+        pix = list(im.getdata())
+        rows = [pix[y * w:(y + 1) * w] for y in range(h)]
+        return w, h, rows
+    except Exception:
+        return None
+
+
+def locate_tower_drag(image):
+    """Locate the Move piece and the incomplete wooden tower.
+
+    Live layout: three (sometimes more) vertical wood stacks across the
+    left/centre of the canvas and a 1–2 block ``Move`` segment on the
+    right. The answer is a drag of that piece onto the shortest stack,
+    or into a missing-block gap.
+
+    ``image`` is PNG/JPEG bytes, a PIL Image, or a list-of-rows of
+    ``(r, g, b)``. Returns ``{"from": (x, y), "to": (x, y)}`` in
+    normalised 0..1 coordinates, or ``None`` when the layout is not
+    a confident tower puzzle (caller falls back to the vision model).
+
+    Does NOT use the punched-slot DragLocator — that geometry is the
+    wrong puzzle.
+    """
+    parsed = _rgb_grid(image)
+    if parsed is None:
+        return None
+    w, h, rows = parsed
+
+    wood = []
+    total = 0
+    for y in range(h):
+        row = rows[y]
+        mask = []
+        for x in range(w):
+            pix = row[x]
+            hit = _is_wood_rgb(pix[0], pix[1], pix[2])
+            mask.append(hit)
+            if hit:
+                total += 1
+        wood.append(mask)
+    if total < max(30, (w * h) // 80):
+        return None
+
+    split = max(int(w * 0.72), w // 2)
+    # ── piece: wood centroid in the right strip ────────────────────────
+    pc = psx = psy = 0
+    for y in range(h):
+        for x in range(split, w):
+            if wood[y][x]:
+                pc += 1
+                psx += x
+                psy += y
+    if pc < max(12, ((w - split) * h) // 220):
+        return None
+    piece = (psx / float(pc) / w, psy / float(pc) / h)
+
+    # ── towers: x-clusters of wood in the left/centre ──────────────────
+    xcount = [0] * w
+    for y in range(h):
+        for x in range(split):
+            if wood[y][x]:
+                xcount[x] += 1
+    minc = max(3, h // 25)
+    clusters = []
+    i = 0
+    while i < split:
+        if xcount[i] >= minc:
+            j = i
+            sx = 0
+            n = 0
+            while j < split and xcount[j] >= minc:
+                sx += j * xcount[j]
+                n += xcount[j]
+                j += 1
+            if n >= max(20, total // 40):
+                clusters.append((i, j - 1, sx / float(max(1, n)), n))
+            i = j
+        else:
+            i += 1
+    if not clusters:
+        return None
+    clusters.sort(key=lambda c: c[3], reverse=True)
+    clusters = sorted(clusters[:3], key=lambda c: c[0])
+
+    towers = []
+    for x0, x1, cx, n in clusters:
+        ycount = [0] * h
+        width = x1 - x0 + 1
+        for y in range(h):
+            c = 0
+            row = wood[y]
+            for x in range(x0, x1 + 1):
+                if row[x]:
+                    c += 1
+            ycount[y] = c
+        ythresh = max(2, width // 6)
+        ys = [y for y in range(h) if ycount[y] >= ythresh]
+        if not ys:
+            continue
+        top, bot = ys[0], ys[-1]
+        best_gap = 0
+        gap_a = gap_b = None
+        y = top
+        while y <= bot:
+            if ycount[y] < ythresh:
+                a = y
+                while y <= bot and ycount[y] < ythresh:
+                    y += 1
+                b = y - 1
+                glen = b - a + 1
+                if glen > best_gap:
+                    best_gap, gap_a, gap_b = glen, a, b
+            else:
+                y += 1
+        towers.append({
+            "cx": cx / w,
+            "top": top / float(h),
+            "bot": bot / float(h),
+            "wood_rows": len(ys),
+            "span": bot - top + 1,
+            "gap": best_gap,
+            "gap_mid": (((gap_a + gap_b) / 2.0) / h
+                        if gap_a is not None else None),
+        })
+    if not towers:
+        return None
+
+    min_block = max(4, int(0.05 * h))
+    gapped = [t for t in towers
+              if t["gap"] >= min_block and t["gap_mid"] is not None
+              and t["top"] < t["gap_mid"] < t["bot"]]
+    if gapped:
+        target = max(gapped, key=lambda t: t["gap"])
+        to = (target["cx"], target["gap_mid"])
+    else:
+        woods = [t["wood_rows"] for t in towers]
+        if len(towers) > 1 and (max(woods) - min(woods)) < max(3, int(0.04 * h)):
+            # no clearly shorter stack — do not guess
+            return None
+        target = min(towers, key=lambda t: (t["wood_rows"], t["span"]))
+        # land on the top of the short stack (slightly into the top block)
+        to = (target["cx"], min(0.92, target["top"] + 0.04))
+
+    if abs(piece[0] - to[0]) < 0.04 and abs(piece[1] - to[1]) < 0.04:
+        return None
+    return {"from": (float(piece[0]), float(piece[1])),
+            "to": (float(to[0]), float(to[1]))}

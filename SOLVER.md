@@ -21,6 +21,7 @@ the vision model as fallback.
 | `counting` | "how many X are in this image?" | one number | **unhandled** — a photo + numeric options was misread as multiple choice |
 | **pattern completion** | "put one of the animals into the empty spot to complete the pattern" | drag candidate → empty cell | **misrouted** — prompt regex missed it and the tile-rich DOM fell through to binary |
 | **mixed binary + point** | "click each image containing X, then click on Y" | tiles then (x, y) | **misrouted** — payload tier saw `area_select` and treated the grid stage as a point round |
+| **wooden-block tower** | "move the correct missing block segment onto the incomplete tower" | drag piece → short/gapped stack | **misrouted** — payload `image_label_area_select` committed to a point click; the Move badge (`+ Move`) was missed; DragLocator punched-slot geometry is the wrong puzzle |
 
 The mixed round shares the `image_label_area_select` request type: hCaptcha
 serves a binary tile-grid stage followed by an area stage under one payload.
@@ -47,6 +48,18 @@ the surface screenshot, finds the empty cell as the brightest one
 classifier, and runs the Latin-square resolver — confidence-gated, with
 the vision model as fallback (which answers as a candidate→hole drag and
 can also handle multi-candidate variants the offline logic refuses).
+
+Wooden-block tower rounds ("Move the correct missing block segment onto
+the incomplete tower") are also served under `image_label_area_select`
+even though the answer is a Move-badge drag: three wood stacks plus a
+1–2 block piece on the right. The live prompt forces `DRAG_DROP` (the
+payload tier only commits when the question is *only* the tower, so a
+mixed "select items, then move the block…" payload still defers). The
+DOM "Move" probe accepts `+ Move` / short labels with an icon child.
+The round loop dispatches to `_solve_tower_round` — **not**
+`DragLocator` — which finds the piece as the wood centroid in the right
+strip and drops onto the shortest stack or the largest internal gap;
+the vision model (`shape="tower"`) answers when the layout is ambiguous.
 
 The prompt tier also understands the **select-all** wording variants
 ("select/choose/pick/check/mark all the images/tiles with…"), the
@@ -83,7 +96,9 @@ toggle them off).
         │  TEXT_ENTRY → _solve_text_round                    │
         │  COUNT      → _solve_count_round (number options)  │
         │  PATTERN*   → _solve_pattern_round (Latin square)  │
-        │   (* DRAG_DROP flagged by is_pattern_prompt)       │
+        │  TOWER*     → _solve_tower_round (wood-mask drag)  │
+        │   (* DRAG_DROP flagged by is_pattern_prompt /      │
+        │      is_tower_prompt; tower never uses DragLocator)│
         └───────────────────────────────────────────────────┘
                        │
         ┌──────────────┴───────────────┐
@@ -105,7 +120,8 @@ toggle them off).
 
 1. **payload** — `classify_from_payload` reads `request_type` from the
    `/getcaptcha` JSON (captured by the page's response hook); `area_select`
-   is split point/bbox by question wording or `request_config`, and **mixed
+   is split point/bbox by question wording or `request_config`; **tower /
+   pattern-only** area_select payloads route to drag; and **mixed
    binary+point rounds defer to the DOM tier** when the payload question is
    binary-grid wording. Helpers: `question_text()`, `example_urls()` (the
    `requester_question_example` reference images), `task_urls()`
@@ -405,6 +421,11 @@ path keeps the confidence gate and falls back to the vision model below
   of candidate vs grid elements) is conservative — any doubt and the
   vision model answers the drag instead. Icon styles outside the 60
   painted classes are vision territory.
+* Tower rounds are a geometric heuristic on wood-coloured pixels: unusual
+  palettes (grey stone, neon plastic), four-plus equal-height stacks, or
+  a piece that is not in the right strip fall through to the vision
+  model (`shape="tower"`). The locator never guesses when every stack is
+  the same height and there is no gap.
 * The alias table is deliberately conservative: nouns that are NOT
   visually defensible at tile scale are left unmapped so the vision model
   (which reads arbitrary prompt text) answers them. The offline models
