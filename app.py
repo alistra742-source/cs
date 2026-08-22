@@ -52,6 +52,9 @@ _start_time = 0.0
 
 # worker_id -> worker state
 _workers: Dict[str, dict] = {}
+# Active worker tasks are retained so Stop can cancel in-flight browser work
+# immediately instead of waiting for the current navigation or retry to end.
+_worker_tasks: Dict[str, asyncio.Task] = {}
 WORKER_COUNT = 1
 WORKER_IDS = [f"B{i+1}" for i in range(WORKER_COUNT)]
 
@@ -188,6 +191,7 @@ def _init_worker(wid: str) -> dict:
         "screenshots": 0,
         "last_shot_b64": "",
         "launching": False,
+        "capture_task": None,
     }
 
 async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
@@ -418,9 +422,20 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
         try:
             state["status"] = "running"
             stagger = int(wid[1:]) - 1
-            cam_task = asyncio.create_task(_worker_capture_loop(wid, cfg, stagger * int(cfg.get("camera_interval", 3))))
-            ok = await bot.start_discord_signup()
-            cam_task.cancel()
+            cam_task = asyncio.create_task(
+                _worker_capture_loop(wid, cfg, stagger * int(cfg.get("camera_interval", 3))),
+                name=f"capture-{wid}",
+            )
+            state["capture_task"] = cam_task
+            try:
+                ok = await bot.start_discord_signup()
+            finally:
+                # A cancelled worker does not implicitly cancel child tasks.
+                # Stop must therefore end this screenshot loop explicitly.
+                cam_task.cancel()
+                await asyncio.gather(cam_task, return_exceptions=True)
+                if state.get("capture_task") is cam_task:
+                    state["capture_task"] = None
 
             # ── Capture final screenshot for the LIVE BROWSER view ──
             try:
@@ -643,7 +658,8 @@ async def _start_all_async(cfg: dict) -> None:
         # browser, so dead sessions are caught in ~3s not 10s.
         for i, wid in enumerate(WORKER_IDS):
             _log(f"[{wid}] Starting worker...")
-            asyncio.create_task(_run_worker(wid, cfg, None))
+            task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")
+            _worker_tasks[wid] = task
 
         # ── Background sweep: test against discord.com (real, not ipify) ──
         # This runs concurrently with workers. Results only improve
@@ -675,26 +691,48 @@ async def _start_all_async(cfg: dict) -> None:
         # No proxy sessions — start workers directly (TOR fallback)
         for i, wid in enumerate(WORKER_IDS):
             _log(f"[{wid}] Starting worker...")
-            asyncio.create_task(_run_worker(wid, cfg, None))
+            task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")
+            _worker_tasks[wid] = task
 
 async def _stop_all_async() -> None:
     global _running
     _running = False
     _APP_LOGS.clear()
+    to_cancel = []
+
     for wid, state in list(_workers.items()):
+        # Signal cooperative cancellation first so browser waits that honour
+        # _stopped can finish cleanly.
         bot = state.get("bot")
         if bot is not None:
-            # Signal an in-flight navigation/signup to abort immediately.
             try:
                 bot._stopped.set()
             except Exception:
                 pass
-            # Browsers stay ALIVE and parked on Discord so the next Start
-            # reuses them instantly (is_alive() gates the reuse; dead ones
-            # relaunch). No close() here.
-        if state["status"] in ("starting", "running"):
+
+        # A page navigation or network wait may not observe _stopped promptly.
+        # Cancelling the retained worker task makes Stop immediate and reliable.
+        worker_task = _worker_tasks.get(wid)
+        if worker_task is not None and not worker_task.done():
+            worker_task.cancel()
+            to_cancel.append(worker_task)
+
+        capture_task = state.get("capture_task")
+        if capture_task is not None and not capture_task.done():
+            capture_task.cancel()
+            to_cancel.append(capture_task)
+        state["capture_task"] = None
+
+        if state.get("status") in ("starting", "running"):
             state["status"] = "stopped"
-    _log("[App] All workers stopped (browser parked on Discord - reused on next Start)")
+
+    if to_cancel:
+        await asyncio.gather(*to_cancel, return_exceptions=True)
+
+    for wid, task in list(_worker_tasks.items()):
+        if task.done():
+            _worker_tasks.pop(wid, None)
+    _log("[App] All workers stopped")
 
 def _run_in_loop(coro) -> Optional[object]:
     if not _loop:
@@ -915,7 +953,7 @@ def handle_start():
 @app.route('/stop', methods=['POST'])
 def handle_stop():
     _run_in_loop(_stop_all_async())
-    return "Stopped"
+    return jsonify({"ok": True, "message": "Stopped"})
 
 @app.route('/proxies/refresh', methods=['POST'])
 def handle_proxy_refresh():
@@ -1395,13 +1433,9 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <div class="flex">
 <button class="primary" id="btnStart" onclick="startBot()">START</button>
 <button class="danger" id="btnStop" onclick="stopBot()">STOP</button>
+<button id="btnLive" onclick="openLive()">LIVE</button>
 <button onclick="refreshProxies()">Refresh Proxies</button>
 </div>
-</div>
-
-<div class="card">
-<h3>Live View</h3>
-<img id="screenshot" src="" alt="No screenshot yet">
 </div>
 
 <div class="card">
@@ -1472,9 +1506,19 @@ function startBot(){
   }).catch(function(e){toast('Error: '+e.message)});
 }
 function stopBot(){
-  api('/stop').then(function(r){return r.text()}).then(function(t){
-    toast(t||'Stopped');
-  }).catch(function(e){toast('Error: '+e.message)});
+  var btn=$('btnStop');
+  if(btn)btn.disabled=true;
+  api('/stop').then(function(r){
+    if(!r.ok)throw new Error('Stop request failed');
+    return r.json();
+  }).then(function(d){
+    toast(d.message||'Stopped');
+    refreshStatus();
+  }).catch(function(e){
+    toast('Error: '+e.message);
+  }).finally(function(){
+    if(btn)btn.disabled=false;
+  });
 }
 window.startBot=startBot;
 window.stopBot=stopBot;
