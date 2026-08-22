@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 81 collected (73 passed + 8 skipped when the models are not trained yet).
+Expected: 82 collected (74 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -626,6 +626,23 @@ class TestLocateTowerDrag(unittest.TestCase):
         self.assertIsNone(hct.locate_tower_drag(grid))
         self.assertIsNone(hct.locate_tower_drag(None))
         self.assertIsNone(hct.locate_tower_drag([]))
+
+    def test_photo_highlights_and_piece_hint(self):
+        # Live towers are photographs: near-white highlights used to fail
+        # the strict wood mask and the piece often sits OUTSIDE the photo.
+        w, h = 240, 150
+        grid = _blank_rgb(w, h, (245, 238, 220))
+        lights = ((228, 186, 118), (242, 214, 158), (92, 58, 32))
+        _stack_blocks(grid, 42, 4, bottom=132, colors=lights)
+        _stack_blocks(grid, 100, 2, bottom=132, colors=lights)
+        _stack_blocks(grid, 158, 4, bottom=132, colors=lights)
+        dbg = {}
+        got = hct.locate_tower_drag(grid, piece_hint=(0.88, 0.48), debug=dbg)
+        self.assertIsNotNone(got, dbg)
+        self.assertGreater(got["from"][0], 0.75)
+        self.assertGreater(got["to"][0], 0.30)
+        self.assertLess(got["to"][0], 0.55)
+        self.assertEqual(dbg.get("reason"), "ok")
 
 
 # ── knowledge base ────────────────────────────────────────────────────────

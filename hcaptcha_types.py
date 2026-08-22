@@ -903,28 +903,40 @@ def denorm(point, box):
 # ── wooden-block tower drag (offline heuristic) ──────────────────────────
 
 def _is_wood_rgb(r, g, b) -> bool:
-    """True for warm brown/tan wooden-block pixels, not cream backgrounds."""
+    """True for warm brown/tan wooden-block pixels, not cream backgrounds.
+
+    Broad on purpose: live hCaptcha towers are *photographs* of pine
+    blocks, so highlights go almost white-yellow and shadows go dark.
+    """
     try:
         r, g, b = int(r), int(g), int(b)
     except (TypeError, ValueError):
         return False
-    if r < 80 or r > 235:
+    if r < 50 or r > 252:
         return False
-    if g < 40 or g > 200:
+    if g < 22 or g > 235:
         return False
-    if b > 155:
+    if b > 185:
         return False
-    if r < g + 6:
+    if r < g - 8:
         return False
-    if (r - b) < 28:
+    if (r - b) < 16:
         return False
     mx, mn = max(r, g, b), min(r, g, b)
-    # cream / beige challenge backdrop (high luma, low chroma)
-    if mx > 215 and (mx - mn) < 50:
+    if mx > 228 and (mx - mn) < 32:
         return False
-    if r > 220 and g > 205:
+    if r > 232 and g > 218 and b > 195:
         return False
     return True
+
+
+def _is_teal_rgb(r, g, b) -> bool:
+    """Cyan / teal Move-badge pixels."""
+    try:
+        r, g, b = int(r), int(g), int(b)
+    except (TypeError, ValueError):
+        return False
+    return g > 70 and b > 70 and g > r + 16 and b > r + 6
 
 
 def _rgb_grid(image):
@@ -961,143 +973,267 @@ def _rgb_grid(image):
         return None
 
 
-def locate_tower_drag(image):
-    """Locate the Move piece and the incomplete wooden tower.
-
-    Live layout: three (sometimes more) vertical wood stacks across the
-    left/centre of the canvas and a 1–2 block ``Move`` segment on the
-    right. The answer is a drag of that piece onto the shortest stack,
-    or into a missing-block gap.
-
-    ``image`` is PNG/JPEG bytes, a PIL Image, or a list-of-rows of
-    ``(r, g, b)``. Returns ``{"from": (x, y), "to": (x, y)}`` in
-    normalised 0..1 coordinates, or ``None`` when the layout is not
-    a confident tower puzzle (caller falls back to the vision model).
-
-    Does NOT use the punched-slot DragLocator — that geometry is the
-    wrong puzzle.
-    """
-    parsed = _rgb_grid(image)
-    if parsed is None:
-        return None
-    w, h, rows = parsed
-
-    wood = []
-    total = 0
-    for y in range(h):
-        row = rows[y]
-        mask = []
-        for x in range(w):
-            pix = row[x]
-            hit = _is_wood_rgb(pix[0], pix[1], pix[2])
-            mask.append(hit)
-            if hit:
-                total += 1
-        wood.append(mask)
-    if total < max(30, (w * h) // 80):
-        return None
-
-    split = max(int(w * 0.72), w // 2)
-    # ── piece: wood centroid in the right strip ────────────────────────
-    pc = psx = psy = 0
-    for y in range(h):
-        for x in range(split, w):
-            if wood[y][x]:
-                pc += 1
-                psx += x
-                psy += y
-    if pc < max(12, ((w - split) * h) // 220):
-        return None
-    piece = (psx / float(pc) / w, psy / float(pc) / h)
-
-    # ── towers: x-clusters of wood in the left/centre ──────────────────
+def _x_clusters(mask, w, h, minc, min_n):
+    """Horizontal runs of columns that have enough mask pixels."""
     xcount = [0] * w
     for y in range(h):
-        for x in range(split):
-            if wood[y][x]:
+        row = mask[y]
+        for x in range(w):
+            if row[x]:
                 xcount[x] += 1
-    minc = max(3, h // 25)
     clusters = []
     i = 0
-    while i < split:
+    while i < w:
         if xcount[i] >= minc:
             j = i
-            sx = 0
-            n = 0
-            while j < split and xcount[j] >= minc:
+            sx = n = 0
+            while j < w and xcount[j] >= minc:
                 sx += j * xcount[j]
                 n += xcount[j]
                 j += 1
-            if n >= max(20, total // 40):
+            if n >= min_n:
                 clusters.append((i, j - 1, sx / float(max(1, n)), n))
             i = j
         else:
             i += 1
-    if not clusters:
-        return None
-    clusters.sort(key=lambda c: c[3], reverse=True)
-    clusters = sorted(clusters[:3], key=lambda c: c[0])
+    return clusters
 
-    towers = []
-    for x0, x1, cx, n in clusters:
-        ycount = [0] * h
-        width = x1 - x0 + 1
-        for y in range(h):
-            c = 0
-            row = wood[y]
-            for x in range(x0, x1 + 1):
-                if row[x]:
-                    c += 1
-            ycount[y] = c
-        ythresh = max(2, width // 6)
-        ys = [y for y in range(h) if ycount[y] >= ythresh]
-        if not ys:
-            continue
-        top, bot = ys[0], ys[-1]
-        best_gap = 0
-        gap_a = gap_b = None
-        y = top
-        while y <= bot:
-            if ycount[y] < ythresh:
-                a = y
-                while y <= bot and ycount[y] < ythresh:
-                    y += 1
-                b = y - 1
-                glen = b - a + 1
-                if glen > best_gap:
-                    best_gap, gap_a, gap_b = glen, a, b
-            else:
+
+def _measure_stack(mask, x0, x1, cx, n, w, h):
+    """Vertical occupancy of one x-cluster → tower / piece metrics."""
+    width = x1 - x0 + 1
+    ycount = [0] * h
+    for y in range(h):
+        row = mask[y]
+        c = 0
+        for x in range(x0, x1 + 1):
+            if row[x]:
+                c += 1
+        ycount[y] = c
+    ythresh = max(2, width // 6)
+    ys = [y for y in range(h) if ycount[y] >= ythresh]
+    if not ys:
+        return None
+    top, bot = ys[0], ys[-1]
+    best_gap = 0
+    gap_a = gap_b = None
+    y = top
+    while y <= bot:
+        if ycount[y] < ythresh:
+            a = y
+            while y <= bot and ycount[y] < ythresh:
                 y += 1
-        towers.append({
-            "cx": cx / w,
-            "top": top / float(h),
-            "bot": bot / float(h),
-            "wood_rows": len(ys),
-            "span": bot - top + 1,
-            "gap": best_gap,
-            "gap_mid": (((gap_a + gap_b) / 2.0) / h
-                        if gap_a is not None else None),
-        })
-    if not towers:
+            b = y - 1
+            glen = b - a + 1
+            if glen > best_gap:
+                best_gap, gap_a, gap_b = glen, a, b
+        else:
+            y += 1
+    return {
+        "cx": cx / float(w),
+        "top": top / float(h),
+        "bot": bot / float(h),
+        "wood_rows": len(ys),
+        "span": bot - top + 1,
+        "n": n,
+        "gap": best_gap,
+        "gap_mid": (((gap_a + gap_b) / 2.0) / h
+                    if gap_a is not None else None),
+    }
+
+
+def locate_tower_drag(image, piece_hint=None, debug=None):
+    """Locate the Move piece and the incomplete wooden tower.
+
+    Live layout: three (sometimes more) vertical wood stacks across the
+    left/centre and a 1–2 block ``Move`` segment on the right — often a
+    *separate* DOM node outside the photo, so the caller should pass the
+    whole challenge iframe (not just the largest canvas) and optionally
+    ``piece_hint`` (normalised centre of the Move / draggable control).
+
+    The answer is a drag of that piece onto the shortest stack, or into
+    a missing-block gap.
+
+    ``image`` is PNG/JPEG bytes, a PIL Image, or a list-of-rows of
+    ``(r, g, b)``. Returns ``{"from": (x, y), "to": (x, y)}`` in
+    normalised 0..1 coordinates, or ``None`` when nothing tower-like is
+    visible. If ``debug`` is a dict it is filled with counters.
+
+    Does NOT use the punched-slot DragLocator — that geometry is the
+    wrong puzzle.
+    """
+    dbg = debug if isinstance(debug, dict) else {}
+    parsed = _rgb_grid(image)
+    if parsed is None:
+        dbg["reason"] = "unreadable"
+        return None
+    w, h, rows = parsed
+    dbg["size"] = (w, h)
+
+    # Border median ≈ studio backdrop (cream / grey chrome).
+    border = []
+    step = max(1, w // 40)
+    for x in range(0, w, step):
+        border.append(rows[0][x][:3])
+        border.append(rows[h - 1][x][:3])
+    for y in range(0, h, max(1, h // 40)):
+        border.append(rows[y][0][:3])
+        border.append(rows[y][w - 1][:3])
+    br = sorted(p[0] for p in border)[len(border) // 2]
+    bg = sorted(p[1] for p in border)[len(border) // 2]
+    bb = sorted(p[2] for p in border)[len(border) // 2]
+    bg_luma = 0.299 * br + 0.587 * bg + 0.114 * bb
+
+    wood, fg, teal = [], [], []
+    wood_n = fg_n = teal_n = 0
+    tsx = tsy = 0
+    # Ignore the prompt bar / Next button chrome.
+    y0 = int(h * 0.10)
+    y1 = int(h * 0.92)
+    for y in range(h):
+        wrow, frow, trow = [], [], []
+        in_band = y0 <= y < y1
+        for x in range(w):
+            pix = rows[y][x]
+            r, g, b = pix[0], pix[1], pix[2]
+            is_teal = in_band and _is_teal_rgb(r, g, b)
+            is_wood = in_band and _is_wood_rgb(r, g, b)
+            is_fg = False
+            if in_band and not is_teal:
+                dist = abs(r - br) + abs(g - bg) + abs(b - bb)
+                luma = 0.299 * r + 0.587 * g + 0.114 * b
+                if not (r < 40 and g < 40 and b < 40) \
+                        and not (b > r + 40 and b > g + 20) \
+                        and (is_wood or dist >= 40 or luma < bg_luma - 22):
+                    is_fg = True
+            wrow.append(is_wood)
+            frow.append(is_fg or is_wood)
+            trow.append(is_teal)
+            if is_wood:
+                wood_n += 1
+            if is_fg or is_wood:
+                fg_n += 1
+            if is_teal:
+                teal_n += 1
+                tsx += x
+                tsy += y
+        wood.append(wrow)
+        fg.append(frow)
+        teal.append(trow)
+    dbg["wood"] = wood_n
+    dbg["fg"] = fg_n
+    dbg["teal"] = teal_n
+
+    mask = wood if wood_n >= max(24, (w * h) // 120) else fg
+    total = wood_n if mask is wood else fg_n
+    dbg["mask"] = "wood" if mask is wood else "fg"
+    if total < max(20, (w * h) // 140):
+        dbg["reason"] = "too-few-pixels"
         return None
 
-    min_block = max(4, int(0.05 * h))
+    minc = max(2, h // 30)
+    clusters = _x_clusters(mask, w, h, minc, max(12, total // 50))
+    dbg["clusters"] = len(clusters)
+    if not clusters:
+        dbg["reason"] = "no-columns"
+        return None
+
+    stacks = []
+    for x0, x1, cx, n in clusters:
+        st = _measure_stack(mask, x0, x1, cx, n, w, h)
+        if st:
+            stacks.append(st)
+    if not stacks:
+        dbg["reason"] = "no-stacks"
+        return None
+
+    hint = None
+    if piece_hint is not None:
+        try:
+            hint = (float(piece_hint[0]), float(piece_hint[1]))
+        except Exception:
+            hint = None
+    teal_pt = None
+    if teal_n >= 8:
+        teal_pt = (tsx / float(teal_n) / w, tsy / float(teal_n) / h)
+
+    stacks.sort(key=lambda s: s["cx"])
+    piece = None
+    towers = list(stacks)
+
+    # 4+ columns: the rightmost small/short one is the Move piece.
+    if len(stacks) >= 4:
+        right = stacks[-1]
+        others = stacks[:-1]
+        tall = max(s["span"] for s in others) or 1
+        if right["cx"] >= 0.62 or right["span"] < tall * 0.78:
+            piece = (right["cx"], (right["top"] + right["bot"]) / 2.0)
+            towers = others
+    elif len(stacks) == 3:
+        right = stacks[-1]
+        others = stacks[:-1]
+        tall = max(s["span"] for s in others) or 1
+        if right["cx"] >= 0.70 or right["span"] < tall * 0.70:
+            piece = (right["cx"], (right["top"] + right["bot"]) / 2.0)
+            towers = others
+
+    if piece is None and teal_pt is not None:
+        # Badge sits on/above the piece — grab just below it.
+        piece = (teal_pt[0], min(0.90, teal_pt[1] + 0.06))
+        # Drop the stack that *is* the badge/piece from the tower list.
+        towers = [s for s in towers if abs(s["cx"] - teal_pt[0]) > 0.08]
+
+    if piece is None and hint is not None:
+        piece = hint
+        towers = [s for s in towers if abs(s["cx"] - hint[0]) > 0.08]
+
+    if piece is None:
+        # Right-strip leftover (piece painted into the photo).
+        split = max(int(w * 0.72), w // 2)
+        pc = psx = psy = 0
+        for y in range(y0, y1):
+            row = mask[y]
+            for x in range(split, w):
+                if row[x]:
+                    pc += 1
+                    psx += x
+                    psy += y
+        if pc >= max(8, ((w - split) * (y1 - y0)) // 240):
+            piece = (psx / float(pc) / w, psy / float(pc) / h)
+            towers = [s for s in towers if s["cx"] < 0.70]
+
+    if not towers:
+        towers = [s for s in stacks if piece is None
+                  or abs(s["cx"] - piece[0]) > 0.08]
+    if not towers:
+        dbg["reason"] = "no-towers"
+        return None
+
+    # Prefer a gapped stack; else the one whose peak sits lowest (same
+    # baseline → the incomplete tower is the shortest).
+    min_block = max(4, int(0.045 * h))
     gapped = [t for t in towers
               if t["gap"] >= min_block and t["gap_mid"] is not None
               and t["top"] < t["gap_mid"] < t["bot"]]
     if gapped:
         target = max(gapped, key=lambda t: t["gap"])
         to = (target["cx"], target["gap_mid"])
+        dbg["target"] = "gap"
     else:
-        woods = [t["wood_rows"] for t in towers]
-        if len(towers) > 1 and (max(woods) - min(woods)) < max(3, int(0.04 * h)):
-            # no clearly shorter stack — do not guess
-            return None
-        target = min(towers, key=lambda t: (t["wood_rows"], t["span"]))
-        # land on the top of the short stack (slightly into the top block)
-        to = (target["cx"], min(0.92, target["top"] + 0.04))
+        # shortest by peak-y (larger top = shorter stack), then wood_rows
+        target = max(towers, key=lambda t: (t["top"], -t["wood_rows"]))
+        to = (target["cx"], min(0.92, target["top"] + 0.045))
+        dbg["target"] = "shortest"
 
-    if abs(piece[0] - to[0]) < 0.04 and abs(piece[1] - to[1]) < 0.04:
+    if piece is None:
+        dbg["reason"] = "no-piece"
+        dbg["best"] = {"to": (float(to[0]), float(to[1]))}
         return None
+    if abs(piece[0] - to[0]) < 0.04 and abs(piece[1] - to[1]) < 0.04:
+        dbg["reason"] = "from-equals-to"
+        return None
+    dbg["reason"] = "ok"
+    dbg["from"] = (round(piece[0], 3), round(piece[1], 3))
+    dbg["to"] = (round(to[0], 3), round(to[1], 3))
     return {"from": (float(piece[0]), float(piece[1])),
             "to": (float(to[0]), float(to[1]))}

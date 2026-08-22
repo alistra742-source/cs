@@ -1095,6 +1095,8 @@ _ESSENTIAL_PREFIXES = (
     "[Captcha] Offline tower",
     "[Captcha] Vision tower",
     "[Captcha] Tower wording",
+    "[Captcha] Tower heuristic",
+    "[Captcha] Tower last-resort",
 )
 
 
@@ -4567,6 +4569,83 @@ class DiscordAutomation:
         await hm.drag(self._page, (fx, fy), (tx, ty))
         return True
 
+    _TOWER_PIECE_JS = r"""() => {
+        const vis = (el) => !!(el) &&
+            (el.offsetParent !== null || el.getClientRects().length > 0);
+        const cands = [];
+        for (const el of document.querySelectorAll(
+                '[draggable="true"], [class*="drag" i], [class*="move" i], '
+                + 'button, [role="button"], span, div')) {
+            if (!vis(el)) continue;
+            const t = ((el.textContent || '') + ' '
+                + (el.getAttribute('aria-label') || '')).trim();
+            const r = el.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) continue;
+            const isMove = /^\+?\s*move\s*$/i.test(t)
+                || (/\bmove\b/i.test(t) && t.length <= 14);
+            const cls = (el.className || '').toString();
+            const isDrag = el.getAttribute('draggable') === 'true'
+                || /drag/i.test(cls);
+            if (!isMove && !isDrag) continue;
+            cands.push({
+                x: r.left, y: r.top, w: r.width, h: r.height,
+                move: isMove ? 1 : 0,
+            });
+        }
+        if (!cands.length) return null;
+        cands.sort((a, b) => b.move - a.move || (b.x - a.x));
+        return cands[0];
+    }"""
+
+    async def _tower_frame_shot(self, frame):
+        """Full challenge-iframe screenshot + page-space box.
+
+        The Move piece is often a *separate* DOM node to the right of
+        the tower photo, so cropping the largest canvas misses it.
+        """
+        try:
+            raw = await frame.screenshot()
+        except Exception as e:
+            self._log(f"[Captcha] Tower frame screenshot failed: {e}",
+                      level="debug")
+            raw = None
+        if not raw:
+            return None, None
+        box = None
+        try:
+            el = await frame.frame_element()
+            box = await el.bounding_box()
+        except Exception:
+            box = None
+        if not box or not box.get("width"):
+            ox, oy = await self._frame_origin(frame)
+            try:
+                wh = await frame.evaluate(
+                    "() => ({w: window.innerWidth, h: window.innerHeight})")
+                box = {"x": ox, "y": oy,
+                       "width": float(wh.get("w") or 0),
+                       "height": float(wh.get("h") or 0)}
+            except Exception:
+                box = None
+        if not box or float(box.get("width") or 0) < 40:
+            return None, None
+        return raw, box
+
+    async def _tower_piece_hint(self, frame, box):
+        """Normalised centre of the Move / draggable control, if visible."""
+        try:
+            info = await frame.evaluate(self._TOWER_PIECE_JS)
+        except Exception:
+            info = None
+        if not info or not info.get("w"):
+            return None
+        bw = float(box.get("width") or 0) or 1.0
+        bh = float(box.get("height") or 0) or 1.0
+        # Badge sits on/above the wood piece — grab slightly below centre.
+        cx = (float(info["x"]) + float(info["w"]) / 2.0) / bw
+        cy = (float(info["y"]) + float(info["h"]) / 2.0) / bh + 0.05
+        return (max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)))
+
     async def _solve_tower_round(self, frame, prompt) -> bool:
         """Wooden-block tower: drag the Move piece onto the incomplete stack.
 
@@ -4575,17 +4654,25 @@ class DiscordAutomation:
         the answer is a real press/move/release drag — a point click
         never picks up the piece. NEVER uses DragLocator (punched-slot
         geometry is the wrong puzzle). Offline wood-mask heuristic
-        first; vision ``shape="tower"`` as fallback.
+        first; a SHORT vision ``shape="tower"`` call is last resort
+        (the hosted model 504s if we wait the default 180s).
         """
-        shot, box = await self._challenge_surface(frame)
+        shot, box = await self._tower_frame_shot(frame)
         if not shot or not box:
+            shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            self._log("[Captcha] Tower: no screenshot", level="warn")
             return False
+        hint = await self._tower_piece_hint(frame, box)
+        debug = {}
         got = None
         try:
-            got = hct.locate_tower_drag(shot)
+            got = hct.locate_tower_drag(shot, piece_hint=hint, debug=debug)
         except Exception as e:
+            debug["reason"] = "error:%s" % type(e).__name__
             self._log(f"[Captcha] Offline tower error: {e}", level="debug")
             got = None
+        self._log(f"[Captcha] Tower heuristic: {debug}")
         if got and got.get("from") and got.get("to"):
             fx, fy = self._denorm(got["from"], box)
             tx, ty = self._denorm(got["to"], box)
@@ -4595,15 +4682,28 @@ class DiscordAutomation:
                 f"({got['to'][0]:.2f},{got['to'][1]:.2f})")
             await hm.drag(self._page, (fx, fy), (tx, ty))
             return True
-        answer = await self._vision.solve(prompt, [shot], shape="tower")
-        if not answer or answer.get("type") != "drag":
-            return False
-        fx, fy = self._denorm(answer["from"], box)
-        tx, ty = self._denorm(answer["to"], box)
-        self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
-                  f"({tx:.0f},{ty:.0f})")
-        await hm.drag(self._page, (fx, fy), (tx, ty))
-        return True
+        # Do not sit on a 180s 504 — that expires the challenge.
+        answer = await self._vision.solve(
+            prompt, [shot], shape="tower", timeout=18.0)
+        if answer and answer.get("type") == "drag":
+            fx, fy = self._denorm(answer["from"], box)
+            tx, ty = self._denorm(answer["to"], box)
+            self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
+                      f"({tx:.0f},{ty:.0f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        # Last resort: DOM piece + heuristic drop (even if `from` was missing).
+        best = debug.get("best") if isinstance(debug, dict) else None
+        if hint and isinstance(best, dict) and best.get("to"):
+            fx, fy = self._denorm(hint, box)
+            tx, ty = self._denorm(best["to"], box)
+            self._log(
+                f"[Captcha] Tower last-resort drag "
+                f"({hint[0]:.2f},{hint[1]:.2f}) -> "
+                f"({best['to'][0]:.2f},{best['to'][1]:.2f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        return False
 
     async def _solve_pattern_round(self, frame, prompt) -> bool:
         """Pattern completion ("put one of the animals into the empty spot
