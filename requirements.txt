@@ -4,20 +4,21 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Browser engine: Camoufox (https://github.com/daijro/camoufox) — a
-# debloated Firefox fork with C++-level fingerprint spoofing, TLS/network
-# randomization, protocol-level WebRTC IP spoofing and per-context real
-# fingerprints. Fully Playwright-compatible. Incognito is ALWAYS on.
-#
-# After pip install, fetch the browser binary once:
-#   python -m camoufox fetch
-# The [geoip] extra enables geo-matching the fingerprint to the proxy's
-# real exit region (geolocation/timezone/locale + WebRTC IP spoofing);
-# without it the engine falls back to plain randomized fingerprints.
-camoufox[geoip]>=0.5.0
+# Browser engine: truedriver — an async-first, undetectable Chrome driver
+# built directly on Chrome DevTools Protocol (no Selenium/WebDriver layer to
+# flag). Requires a Chrome/Chromium binary on PATH (installed in the Dockerfile).
+truedriver>=0.1.5
 
 # Web app (dashboard)
 flask>=3.0.0
 
 # Email checker (MX record lookups; optional - falls back to plain DNS)
 dnspython>=2.6.0
+
+# Offline captcha solver models (optional; server falls back to the vision
+# model when these are absent). Training/tools: make_dataset.py,
+# make_challenges.py, train_models.py, tile_classifier.py.
+Pillow>=10.0.0
+numpy>=1.26.0
+# torch (CPU build is plenty): pip install torch --index-url \
+#     https://download.pytorch.org/whl/cpu

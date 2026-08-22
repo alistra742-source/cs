@@ -13,13 +13,7 @@ import requests as _requests
 
 from flask import Flask, jsonify, request, Response
 
-try:
-    import db
-    _db_available = True
-except ImportError:
-    db = None
-    _db_available = False
-    print("[app] db.py not found - token saving disabled", flush=True)
+# Database removed - no token persistence
 
 try:
     from proxies import (pool as proxy_pool, configured as _proxies_configured,
@@ -48,6 +42,7 @@ TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0
 
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
+import live_ui
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -57,7 +52,18 @@ _start_time = 0.0
 
 # worker_id -> worker state
 _workers: Dict[str, dict] = {}
+# Active worker tasks are retained so Stop can cancel in-flight browser work
+# immediately instead of waiting for the current navigation or retry to end.
+_worker_tasks: Dict[str, asyncio.Task] = {}
 WORKER_COUNT = 1
+
+# Railway's 1 GB container can OOM when a browser renderer and a large proxy
+# TLS sweep start together. Low-memory mode is on by default; a single worker
+# continues to probe each selected proxy, while bulk validation waits until the
+# browser is idle.
+LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
+LOW_MEMORY_SWEEP_DELAY_S = max(15.0, float(os.environ.get("LOW_MEMORY_SWEEP_DELAY_S", "60")))
+LOW_MEMORY_SWEEP_CONCURRENCY = max(1, min(8, int(os.environ.get("LOW_MEMORY_SWEEP_CONCURRENCY", "4"))))
 WORKER_IDS = [f"B{i+1}" for i in range(WORKER_COUNT)]
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -77,7 +83,6 @@ DEFAULT_CONFIG = {
     "custom_email": "",
 }
 
-
 def load_config(path: str = _config_path) -> dict:
     config = dict(DEFAULT_CONFIG)
     if os.path.exists(path):
@@ -89,9 +94,11 @@ def load_config(path: str = _config_path) -> dict:
                         config[key] = saved[key]
         except Exception:
             pass
+    # This deployment is intentionally single-worker. Ignore any legacy
+    # value saved in config.json so status and runtime always agree.
+    config["worker_count"] = WORKER_COUNT
     config["web_port"] = int(os.environ.get("PORT", config.get("web_port", 8080)))
     return config
-
 
 def save_config(config: dict, path: str = _config_path) -> None:
     try:
@@ -99,7 +106,6 @@ def save_config(config: dict, path: str = _config_path) -> None:
             json.dump(config, f, indent=2)
     except Exception:
         pass
-
 
 # Shared ring buffer so app-level lines (proxy stats, worker outcomes) reach
 # the web terminal, not just stdout.
@@ -113,7 +119,6 @@ _BURNED_DOMAINS: set = {
     "mikerossy.com", "blobers.it.com", "vibify.cc", "vibeify.cc",
 }
 
-
 def _load_burned() -> None:
     global _BURNED_DOMAINS
     _BURNED_DOMAINS = {"mikerossy.com", "blobers.it.com", "vibify.cc", "vibeify.cc"}
@@ -123,7 +128,6 @@ def _load_burned() -> None:
             str(d).strip().lower() for d in (cfg.get("burned_domains") or []))
     except Exception:
         pass
-
 
 def _burn_domain(domain: str) -> None:
     """Permanently remove a domain from the pool after a phone-verification hit."""
@@ -145,7 +149,6 @@ def _burn_domain(domain: str) -> None:
     except Exception:
         pass
 
-
 def _pick_domain(cfg: dict) -> str:
     """Pick a fresh, non-burned inbox domain from the configured list (falls
     back to duckmail's default @glasswhitehub.com)."""
@@ -159,12 +162,10 @@ def _pick_domain(cfg: dict) -> str:
             return random.choice(fresh)
     return DEFAULT_MAIL_DOMAIN
 
-
 # App-level logs: proxy sweeps, AI warm-up, worker chatter etc. only appear
 # in the ALL logs (LOG_LEVEL=all). Warnings / errors always print.
 _APP_LOG_ALL = os.environ.get("LOG_LEVEL", "").strip().lower() \
     in ("all", "debug", "verbose")
-
 
 def _log(msg: str, level: str = "info"):
     # Store EVERYTHING so the dashboard's ALL LOGS toggle can show it; only
@@ -182,7 +183,6 @@ def _log(msg: str, level: str = "info"):
         _APP_LOGS[:] = _APP_LOGS[-400:]
     if _APP_LOG_ALL or essential:
         print(f"[{level.upper()}] {msg}", flush=True)
-
 
 # ── Worker management (runs in the asyncio thread) ──
 
@@ -202,8 +202,8 @@ def _init_worker(wid: str) -> dict:
         "screenshots": 0,
         "last_shot_b64": "",
         "launching": False,
+        "capture_task": None,
     }
-
 
 async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
     """Capture screenshots for this worker, staggered so browsers don't all
@@ -215,6 +215,13 @@ async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
     interval = base * len(WORKER_IDS)
     await asyncio.sleep(stagger)
     while _running and bot is not None and bot._page is not None:
+        # Screenshot encoding can briefly allocate a full viewport buffer. Do
+        # not compete with the most memory-sensitive stage: initial React
+        # navigation and hydration. The Live modal resumes 3-second frames as
+        # soon as the register page has rendered.
+        if LOW_MEMORY_MODE and not bool(getattr(bot, "_nav_ok", False)):
+            await asyncio.sleep(interval)
+            continue
         try:
             shot = await asyncio.wait_for(bot.capture_screenshot(), timeout=25)
             if shot:
@@ -223,7 +230,6 @@ async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
         except Exception:
             pass
         await asyncio.sleep(interval)
-
 
 async def _next_proxy(force: bool = False):
     """Grab the least-recently-used proxy session, or None (auto mode only —
@@ -239,7 +245,6 @@ async def _next_proxy(force: bool = False):
     if proxy_pool.count > 0:
         return proxy_pool.take()
     return None
-
 
 async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
     """Draw the next session and only accept it if it probes live against
@@ -270,7 +275,6 @@ async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
             pass
     return None
 
-
 def _proxy_stats_line(wid: str) -> None:
     """Log live proxy usage counters (used / working / failed) for the terminal."""
     try:
@@ -281,7 +285,6 @@ def _proxy_stats_line(wid: str) -> None:
         f"[{wid}] [Proxy] Used {s.get('used', 0)} sessions, "
         f"Working {s.get('working', 0)}, Failed {s.get('failed', 0)}"
     )
-
 
 async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
     """Worker loop: one proxy session per signup attempt, rotating on failure.
@@ -386,10 +389,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
         if bot is None:
             bot = DiscordAutomation(
                 headless=cfg.get("headless", True),
-                proxy=proxy,  # dict = sticky session; None = TOR in _build_context
-                worker_id=wid,
                 domain=domain,
-                email=cfg.get("custom_email") or "",
             )
             state["bot"] = bot
             try:
@@ -440,9 +440,20 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
         try:
             state["status"] = "running"
             stagger = int(wid[1:]) - 1
-            cam_task = asyncio.create_task(_worker_capture_loop(wid, cfg, stagger * int(cfg.get("camera_interval", 3))))
-            ok = await bot.start_discord_signup()
-            cam_task.cancel()
+            cam_task = asyncio.create_task(
+                _worker_capture_loop(wid, cfg, stagger * int(cfg.get("camera_interval", 3))),
+                name=f"capture-{wid}",
+            )
+            state["capture_task"] = cam_task
+            try:
+                ok = await bot.start_discord_signup()
+            finally:
+                # A cancelled worker does not implicitly cancel child tasks.
+                # Stop must therefore end this screenshot loop explicitly.
+                cam_task.cancel()
+                await asyncio.gather(cam_task, return_exceptions=True)
+                if state.get("capture_task") is cam_task:
+                    state["capture_task"] = None
 
             # ── Capture final screenshot for the LIVE BROWSER view ──
             try:
@@ -476,16 +487,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
             state["token"] = acc["token"]
             if ok and acc["token"]:
                 state["status"] = "done"
-                if _db_available and db is not None:
-                    await db.save_account(
-                        email=acc["email"], username=acc["username"],
-                        password=acc["password"], token=acc["token"],
-                        proxy=label, worker_id=wid,
-                        user_id=acc.get("user_id", ""),
-                        avatar=acc.get("avatar", ""),
-                        bio=acc.get("bio", ""),
-                        humanized=bool(acc.get("humanized")),
-                    )
+
                 _log(f"[{wid}] Done - token {len(acc['token'])} chars ({label})")
                 if proxy:
                     proxy_pool.release(proxy, ok=True)
@@ -511,18 +513,6 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 # custom email the user must verify manually). Persist it as
                 # pending so it is never lost — the user clicks the verify
                 # link in their own inbox and the account is theirs.
-                if (_db_available and db is not None
-                        and acc.get("email") and acc.get("username")
-                        and acc.get("password")):
-                    await db.save_account(
-                        email=acc["email"], username=acc["username"],
-                        password=acc["password"], token=acc.get("token", ""),
-                        proxy=label, worker_id=wid,
-                        user_id=acc.get("user_id", ""),
-                        avatar=acc.get("avatar", ""), bio=acc.get("bio", ""),
-                        humanized=bool(acc.get("humanized")),
-                    )
-                    _log(f"[{wid}] Pending account saved (email verification required to unlock token)")
                 # Park the browser on Discord for reuse on the next Start.
                 return
 
@@ -585,6 +575,52 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
     if bot:
         state["bot"] = bot
 
+def _browser_busy() -> bool:
+    return any((state or {}).get("status") in ("starting", "running")
+               for state in _workers.values())
+
+
+async def _deferred_proxy_sweep(n_sessions: int) -> None:
+    """Validate a large proxy pool only while the renderer is idle.
+
+    Workers retain their one-at-a-time live probe, so deferring this optional
+    dashboard-wide sweep does not weaken the connection gate for an attempt.
+    """
+    if proxy_pool is None or not n_sessions:
+        return
+    if LOW_MEMORY_MODE:
+        _log(
+            f"[Proxy] Low-memory mode: deferred {n_sessions}-session sweep; "
+            "workers still probe their selected session individually"
+        )
+        await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
+        while _running and _browser_busy():
+            _log("[Proxy] Low-memory mode: browser active, delaying bulk validation")
+            await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
+        if not _running:
+            return
+        concurrency = LOW_MEMORY_SWEEP_CONCURRENCY
+        window = max(20.0, LOW_MEMORY_SWEEP_DELAY_S)
+    else:
+        concurrency = None
+        window = 10.0
+
+    try:
+        kwargs = {"window": window, "log": _log}
+        if concurrency is not None:
+            kwargs["concurrency"] = concurrency
+        _log(f"[Proxy] Background sweep of {n_sessions} sessions against discord.com "
+             f"(window={int(window)}s, concurrency={concurrency or 'default'})...")
+        sw = await proxy_pool.sweep(**kwargs)
+        _log(f"[Proxy] Sweep done: {sw['reachable']} Discord-reachable, "
+             f"{sw['unproven']} unproven (available, re-checked on use), "
+             f"{sw['untested']} untested of {n_sessions}")
+        if sw.get("tested") and not sw.get("reachable"):
+            _log("[Proxy] Bulk validation found no reachable sessions; workers will continue individual probe-gating", level="warn")
+    except Exception as e:
+        _log(f"[Proxy] Sweep error: {e}", level="warn")
+
+
 async def _proxy_validate_loop() -> None:
     """Background: re-confirm which proxies can reach Discord, using the
     worker's single-shot HTTPS probe. Dead sessions get blacklisted so
@@ -604,7 +640,6 @@ async def _proxy_validate_loop() -> None:
         except Exception as e:
             _log(f"[Proxy] validation error: {e}", level="warn")
         await asyncio.sleep(180)
-
 
 async def _proxy_file_watcher(interval: float = 15.0) -> None:
     """Reload the proxy pool the moment proxies.txt / vaultproxies.txt changes.
@@ -630,14 +665,16 @@ async def _proxy_file_watcher(interval: float = 15.0) -> None:
                     src = ", ".join(p.name for p in proxy_files()) or "env"
                     _log(f"[Proxy] proxies file changed — reloaded {n} sessions from {src}", level="warn")
                     if n:
-                        try:
-                            sw = await proxy_pool.sweep(window=10.0, log=_log)
-                            _log(f"[Proxy] Re-sweep: {sw['reachable']} Discord-reachable of {n} reloaded")
-                        except Exception:
-                            pass
+                        if LOW_MEMORY_MODE:
+                            _log("[Proxy] Low-memory mode: re-sweep deferred until browser is idle")
+                        else:
+                            try:
+                                sw = await proxy_pool.sweep(window=10.0, log=_log)
+                                _log(f"[Proxy] Re-sweep: {sw['reachable']} Discord-reachable of {n} reloaded")
+                            except Exception:
+                                pass
         except Exception as e:
             _log(f"[Proxy] file watcher error: {e}", level="warn")
-
 
 async def _start_all_async(cfg: dict) -> None:
     global _running, _start_time
@@ -688,60 +725,62 @@ async def _start_all_async(cfg: dict) -> None:
         # browser, so dead sessions are caught in ~3s not 10s.
         for i, wid in enumerate(WORKER_IDS):
             _log(f"[{wid}] Starting worker...")
-            asyncio.create_task(_run_worker(wid, cfg, None))
+            task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")
+            _worker_tasks[wid] = task
 
-        # ── Background sweep: test against discord.com (real, not ipify) ──
-        # This runs concurrently with workers. Results only improve
-        # future proxy picks; workers don't wait for it.
-        _log(f"[Proxy] Background sweep of {n_sessions} sessions against discord.com (10s window)...")
-        try:
-            sw = await proxy_pool.sweep(window=10.0, log=_log)
-            _log(f"[Proxy] Sweep done: {sw['reachable']} Discord-reachable, "
-                 f"{sw['unproven']} unproven (available, re-checked on use), "
-                 f"{sw['untested']} untested of {n_sessions} — "
-                 f"workers probe-gate every session before launching a browser")
-            if sw.get("tested") and not sw.get("reachable"):
-                _log(
-                    "[Proxy] 0 of the loaded sessions can reach Discord. "
-                    "vaultproxies sessions expire (ttl-600 = 10 min) and cannot "
-                    "be revived — re-saving the SAME session IDs under a new "
-                    "filename changes nothing (it's the identical expired list). "
-                    "Generate a FRESH session list in the vaultproxies dashboard "
-                    "and save it as proxies.txt — the session IDs (the part after "
-                    "'-s-') must be NEW. The bot auto-reloads proxies.txt when it "
-                    "changes, so save the fresh list and the next sweep picks it up.",
-                    level="info",
-                )
-        except Exception as e:
-            _log(f"[Proxy] Sweep error: {e}", level="warn")
-        asyncio.create_task(_proxy_validate_loop())
+        # A 530-session TLS sweep at the default 250-way concurrency can use
+        # most of the 1 GB container while Camoufox is also hydrating React.
+        # Run optional pool-wide validation only after browser work is idle;
+        # the active worker still probes its chosen session before every use.
+        asyncio.create_task(_deferred_proxy_sweep(n_sessions), name="deferred-proxy-sweep")
+        asyncio.create_task(_proxy_validate_loop(), name="proxy-validation-summary")
 
     if not n_sessions:
         # No proxy sessions — start workers directly (TOR fallback)
         for i, wid in enumerate(WORKER_IDS):
             _log(f"[{wid}] Starting worker...")
-            asyncio.create_task(_run_worker(wid, cfg, None))
-
+            task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")
+            _worker_tasks[wid] = task
 
 async def _stop_all_async() -> None:
     global _running
     _running = False
     _APP_LOGS.clear()
+    to_cancel = []
+
     for wid, state in list(_workers.items()):
+        # Signal cooperative cancellation first so browser waits that honour
+        # _stopped can finish cleanly.
         bot = state.get("bot")
         if bot is not None:
-            # Signal an in-flight navigation/signup to abort immediately.
             try:
                 bot._stopped.set()
             except Exception:
                 pass
-            # Browsers stay ALIVE and parked on Discord so the next Start
-            # reuses them instantly (is_alive() gates the reuse; dead ones
-            # relaunch). No close() here.
-        if state["status"] in ("starting", "running"):
-            state["status"] = "stopped"
-    _log("[App] All workers stopped (browser parked on Discord - reused on next Start)")
 
+        # A page navigation or network wait may not observe _stopped promptly.
+        # Cancelling the retained worker task makes Stop immediate and reliable.
+        worker_task = _worker_tasks.get(wid)
+        if worker_task is not None and not worker_task.done():
+            worker_task.cancel()
+            to_cancel.append(worker_task)
+
+        capture_task = state.get("capture_task")
+        if capture_task is not None and not capture_task.done():
+            capture_task.cancel()
+            to_cancel.append(capture_task)
+        state["capture_task"] = None
+
+        if state.get("status") in ("starting", "running"):
+            state["status"] = "stopped"
+
+    if to_cancel:
+        await asyncio.gather(*to_cancel, return_exceptions=True)
+
+    for wid, task in list(_worker_tasks.items()):
+        if task.done():
+            _worker_tasks.pop(wid, None)
+    _log("[App] All workers stopped")
 
 def _run_in_loop(coro) -> Optional[object]:
     if not _loop:
@@ -755,7 +794,6 @@ def _run_in_loop(coro) -> Optional[object]:
         import traceback
         traceback.print_exc()
         return None
-
 
 async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     """Navigate the live tab and self-heal a dead proxy tunnel.
@@ -821,7 +859,6 @@ async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     st["error"] = f"site unreachable after retries ({first_err})"
     return st
 
-
 async def _start_live_browser(wid: str, url: str = "",
                               force: bool = False) -> dict:
     """Attach (or cold-launch) the worker's real browser for the LIVE tab.
@@ -866,10 +903,7 @@ async def _start_live_browser(wid: str, url: str = "",
         if bot is None:
             bot = DiscordAutomation(
                 headless=bool(cfg.get("headless", True)),
-                proxy=None,
-                worker_id=wid,
                 domain=_pick_domain(cfg),
-                email=cfg.get("custom_email") or "",
             )
             state["bot"] = bot
         try:
@@ -920,7 +954,6 @@ async def _start_live_browser(wid: str, url: str = "",
     finally:
         state["launching"] = False
 
-
 async def _close_live_browser(wid: str) -> bool:
     state = _workers.get(wid)
     bot = state.get("bot") if state else None
@@ -938,16 +971,17 @@ async def _close_live_browser(wid: str) -> bool:
     state["last_shot_b64"] = ""
     return True
 
-
 # ── Flask app ─────────────────────────────────────────────
 
 app = Flask(__name__)
 
-
 @app.route('/')
 def handle_root():
-    return Response(DASHBOARD_HTML, content_type='text/html')
-
+    html = DASHBOARD_HTML
+    idx = html.rfind("</body>")
+    if idx != -1:
+        html = html[:idx] + live_ui.LIVE_INJECTION + html[idx:]
+    return Response(html, content_type='text/html')
 
 @app.route('/start', methods=['POST'])
 def handle_start():
@@ -964,12 +998,10 @@ def handle_start():
     except Exception as e:
         return jsonify({"ok": False, "msg": f"Start error: {e}"})
 
-
 @app.route('/stop', methods=['POST'])
 def handle_stop():
     _run_in_loop(_stop_all_async())
-    return "Stopped"
-
+    return jsonify({"ok": True, "message": "Stopped"})
 
 @app.route('/proxies/refresh', methods=['POST'])
 def handle_proxy_refresh():
@@ -977,7 +1009,6 @@ def handle_proxy_refresh():
         _run_in_loop(proxy_pool.refresh())
         return jsonify(proxy_pool.stats())
     return jsonify({"error": "proxies module not loaded"})
-
 
 def _mask_proxy_key(key: str) -> str:
     """Display-safe form of a proxy key (user:pass@host:port) — never leak
@@ -989,7 +1020,6 @@ def _mask_proxy_key(key: str) -> str:
         sid = "s-" + m.group(1)[:10]
     return f"{sid} @ {host}" if sid else host
 
-
 @app.route('/proxies')
 def handle_proxies():
     """Proxy dashboard data: valid / used / invalid / unproven sessions.
@@ -998,8 +1028,6 @@ def handle_proxies():
     tab still shows history (and the pool skips already-used sticky IPs)
     after a redeploy."""
     rows = []
-    if _db_available and db is not None:
-        rows = _run_in_loop(db.list_proxies()) or []
     db_map = {r.get("key"): r for r in rows}
 
     def _mk(key, rec, live_flag=False):
@@ -1078,18 +1106,19 @@ def handle_status():
         })
     try:
         cfg_now = load_config()
-        _mail_domains = cfg_now.get("mail_domains", []) or []
     except Exception:
-        _mail_domains = []
+        cfg_now = dict(DEFAULT_CONFIG)
+    _mail_domains = cfg_now.get("mail_domains", []) or []
     return jsonify({
         "running": _running,
         "uptime": int(time.time() - _start_time) if _start_time else 0,
         "workers": workers,
+        "headless": bool(cfg_now.get("headless", True)),
+        "workerCount": int(cfg_now.get("worker_count", WORKER_COUNT)),
         "mail_domains": _mail_domains,
         "custom_email": cfg_now.get("custom_email", ""),
         "proxies": proxy_pool.stats() if (_proxies_available and proxy_pool is not None) else {},
     })
-
 
 @app.route('/latest')
 def handle_latest_screenshot():
@@ -1113,7 +1142,6 @@ def handle_latest_screenshot():
             except Exception:
                 pass
     return Response(status=404)
-
 
 # ── LIVE CONTROL routes ──────────────────────────────────
 
@@ -1143,7 +1171,6 @@ def handle_browser_state():
     st["status"] = s.get("status", "")
     return jsonify(st)
 
-
 @app.route('/browser/navigate', methods=['POST'])
 def handle_browser_navigate():
     wid = request.args.get("worker", "B1")
@@ -1164,7 +1191,6 @@ def handle_browser_navigate():
         s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
-
 @app.route('/browser/action', methods=['POST'])
 def handle_browser_action():
     wid = request.args.get("worker", "B1")
@@ -1180,7 +1206,6 @@ def handle_browser_action():
                         "error": "event loop unavailable"}), 503
     return jsonify(st)
 
-
 @app.route('/browser/start', methods=['POST'])
 def handle_browser_start():
     wid = request.args.get("worker", "B1")
@@ -1193,13 +1218,11 @@ def handle_browser_start():
                         "error": "event loop unavailable"}), 503
     return jsonify(st)
 
-
 @app.route('/browser/close', methods=['POST'])
 def handle_browser_close():
     wid = request.args.get("worker", "B1")
     closed = _run_in_loop(_close_live_browser(wid))
     return jsonify({"closed": bool(closed)})
-
 
 @app.route('/worker/<wid>/logs')
 def handle_worker_logs(wid):
@@ -1229,14 +1252,12 @@ def handle_worker_logs(wid):
         "logs": merged,  # store caps (500 bot / 400 app) bound the size
     })
 
-
 @app.route('/tokens')
 def handle_tokens():
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"count": 0, "valid": 0, "expired": 0, "pending": 0,
                         "accounts": [], "stats": {"total": 0, "valid": 0,
                         "expired": 0, "pending": 0}, "error": "DB not available"})
-    accounts = _run_in_loop(db.list_accounts(limit=500)) or []
     expired = sum(1 for a in accounts if a.get("status") == "invalid")
     valid = sum(1 for a in accounts if a.get("status") == "valid")
     pending = len(accounts) - expired - valid
@@ -1250,24 +1271,19 @@ def handle_tokens():
                    "expired": expired, "pending": pending},
     })
 
-
 @app.route('/validate', methods=['POST'])
 def handle_validate():
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     # Cap at 200 so the synchronous validate stays inside the 120s loop budget
-    accounts = _run_in_loop(db.list_accounts(limit=200)) or []
-    valid = _run_in_loop(db.validate_all_tokens(accounts)) if accounts else 0
-    accounts = _run_in_loop(db.list_accounts(limit=200)) or []
     expired = sum(1 for a in accounts if a.get("status") == "invalid")
     return jsonify({"count": len(accounts), "valid": valid, "expired": expired,
                     "accounts": accounts})
 
-
 @app.route('/export', methods=['POST'])
 def handle_export():
     """Preview the next N accounts for export (does NOT delete)."""
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     data = request.get_json(silent=True) or {}
     try:
@@ -1275,7 +1291,6 @@ def handle_export():
     except Exception:
         count = 5
     mode = 'full' if data.get('mode') == 'full' else 'tokens'
-    accounts = _run_in_loop(db.list_accounts(limit=500)) or []
     chosen = [a for a in accounts if a.get('token')][:count]
     out = []
     for a in chosen:
@@ -1297,11 +1312,10 @@ def handle_export():
         })
     return jsonify({"count": len(out), "accounts": out})
 
-
 @app.route('/export/delete', methods=['POST'])
 def handle_export_delete():
     """Delete exported accounts after the user confirms the copy."""
-    if not _db_available or db is None:
+    if not False or db is None:
         return jsonify({"error": "DB not available"})
     data = request.get_json(silent=True) or {}
     ids = []
@@ -1312,9 +1326,7 @@ def handle_export_delete():
             pass
     if not ids:
         return jsonify({"ok": False, "msg": "no ids"})
-    deleted = _run_in_loop(db.delete_accounts(ids)) or 0
     return jsonify({"ok": True, "deleted": deleted})
-
 
 @app.route('/config', methods=['GET', 'POST'])
 def handle_config():
@@ -1323,8 +1335,6 @@ def handle_config():
         cfg = load_config()
         if 'headless' in data:
             cfg['headless'] = bool(data['headless'])
-        if 'worker_count' in data:
-            cfg['worker_count'] = int(data['worker_count'])
         if 'mail_domains' in data:
             domains = [str(d).strip().lower() for d in data['mail_domains'] if str(d).strip()]
             cfg['mail_domains'] = domains or ["glasswhitehub.com"]
@@ -1342,13 +1352,11 @@ def handle_config():
                     "burned_domains": sorted(_BURNED_DOMAINS),
                     "available_domains": avail})
 
-
 # ── Background event loop ─────────────────────────────────
 
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
-
 
 def main() -> None:
     global _loop
@@ -1364,8 +1372,6 @@ def main() -> None:
     t.start()
 
     # Auto-migrate DB (DATABASE_URL from env)
-    if _db_available and db is not None:
-        _run_in_loop(db.init_db())
 
     print("=" * 56, flush=True)
     print("  EYES GEN - multi-browser Discord token generator", flush=True)
@@ -1376,621 +1382,310 @@ def main() -> None:
     app.run(host='0.0.0.0', port=web_port, debug=False,
             use_reloader=False, threaded=True)
 
-
 # ═══════════════════════════════════════════════════════════
 # EYES GEN DASHBOARD — mobile-first
 # ═══════════════════════════════════════════════════════════
 
-DASHBOARD_HTML = r"""<!doctype html><html><head>
+DASHBOARD_HTML = r'''
+<!doctype html><html lang="en"><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0a0a0b">
 <meta charset="utf-8">
 <title>EY3 - Token Forge</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap');
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-:root{
-  --bg:#0a0a0b;--panel:#131316;--panel2:#1a1a1e;--line:#26262b;--line2:#34343a;
-  --txt:#e7e7ea;--dim:#8a8a92;--dim2:#5c5c64;
-  --ok:#34d399;--bad:#f87171;--warn:#fbbf24;
-}
-html{background:var(--bg)}
-body{font-family:'Space Grotesk',-apple-system,'Segoe UI',Roboto,sans-serif;
-  background:
-    radial-gradient(900px 400px at 85% -10%, rgba(255,255,255,.045), transparent 60%),
-    radial-gradient(700px 380px at -10% 0%, rgba(255,255,255,.03), transparent 55%),
-    var(--bg);
-  color:var(--txt);min-height:100vh;max-width:980px;margin:0 auto;padding:18px 16px 90px}
-h1{font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;letter-spacing:2px;
-  display:flex;align-items:center;gap:12px}
-h1 .tag{font-size:11px;font-weight:500;letter-spacing:2px;color:var(--dim2);
-  border:1px solid var(--line);border-radius:99px;padding:4px 10px;background:var(--panel)}
-.sub{color:var(--dim);font-size:12px;margin:4px 0 16px}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--dim2);display:inline-block;
-  box-shadow:0 0 10px currentColor}
-.dot.on{background:var(--ok);color:var(--ok)}
-.dot.err{background:var(--bad);color:var(--bad)}
-nav{display:flex;gap:6px;margin-bottom:18px;position:sticky;top:0;z-index:40;
-  background:rgba(10,10,11,.92);backdrop-filter:blur(10px);padding:10px 0;border-bottom:1px solid var(--line)}
-nav button{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;letter-spacing:2px;
-  padding:10px 22px;border-radius:10px;border:1px solid var(--line);background:var(--panel);
-  color:var(--dim);cursor:pointer;transition:all .15s}
-nav button.on{background:#e7e7ea;color:#0a0a0b;border-color:#e7e7ea}
-nav button:not(.on):hover{border-color:var(--line2);color:var(--txt)}
-.tab{display:none}.tab.on{display:block}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px}
-.card h3{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2px;color:var(--dim);
-  text-transform:uppercase;margin-bottom:12px}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
-.stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 12px;text-align:center}
-.stat .num{font-family:'JetBrains Mono',monospace;font-size:26px;font-weight:700}
-.stat .lbl{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);margin-top:4px}
-.num.g{color:var(--ok)}.num.r{color:var(--bad)}.num.a{color:var(--txt)}
-button{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;letter-spacing:1.5px;
-  padding:11px 18px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);
-  color:var(--txt);cursor:pointer;transition:all .15s}
-button:active{transform:scale(.97)}
-button.primary{background:#e7e7ea;color:#0a0a0b;border-color:#e7e7ea}
-button.danger{background:#2a1212;color:#fca5a5;border-color:#5a2323}
-button.ok{background:#0f2e24;color:#6ee7b7;border-color:#1d4a3a}
-button:disabled{opacity:.45;cursor:not-allowed}
-.btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.btnrow .grow{flex:1;min-width:120px}
-.badge{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:3px 9px;border-radius:99px;letter-spacing:.5px;white-space:nowrap}
-.b-pending{background:#3a2c12;color:var(--warn)}
-.b-valid{background:#0f2e24;color:var(--ok)}
-.b-invalid{background:#3a1212;color:var(--bad)}
-.b-dim{background:#1e1e22;color:var(--dim)}
-.dom{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.dom input{flex:1;font-family:'JetBrains Mono',monospace;font-size:13px;background:var(--panel2);
-  border:1px solid var(--line);border-radius:9px;color:var(--txt);padding:10px 12px;outline:none}
-.dom input:focus{border-color:var(--dim)}
-.dom .x{background:none;border:none;color:var(--dim);font-size:16px;padding:4px 8px;cursor:pointer}
-.dom .x:hover{color:var(--bad)}
-.pick{display:flex;flex-wrap:wrap;gap:8px}
-.chip{font-size:11px;letter-spacing:.5px;padding:8px 13px;border-radius:99px;background:var(--panel2);color:var(--dim);border:1px solid var(--line2);cursor:pointer}
-.chip.on{background:#e7e7ea;color:#0a0a0b;border-color:#e7e7ea}
-.hint{color:var(--dim2);font-size:11px;margin-top:8px}
-.tog{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--dim)}
-.sw{width:44px;height:24px;border-radius:99px;background:var(--line2);position:relative;cursor:pointer;transition:.2s}
-.sw::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.2s}
-.sw.on{background:var(--dim)}.sw.on::after{left:23px}
-.term{background:#050506;border:1px solid var(--line);border-radius:14px;overflow:hidden;
-  font-family:'JetBrains Mono',monospace;box-shadow:0 18px 50px rgba(0,0,0,.5)}
-.term-head{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--panel2);
-  border-bottom:1px solid var(--line);font-size:11px;letter-spacing:1px;color:var(--dim)}
-.term-head .cd{width:10px;height:10px;border-radius:50%;background:#3a3a40;display:inline-block}
-.term-head .cd.r{background:var(--bad)}.term-head .cd.y{background:var(--warn)}.term-head .cd.g{background:var(--ok)}
-.term-head .t{flex:1;text-align:center;letter-spacing:3px;color:var(--dim2)}
-.pxline{padding:7px 14px;background:#0a0a0c;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.5px;color:var(--dim2)}
-.chk{display:inline-flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;color:var(--dim2);cursor:pointer;user-select:none}
-.chk input{accent-color:var(--ok)}
-.term-body{height:430px;overflow-y:auto;padding:14px;font-size:12px;line-height:1.65}
-.tl{display:flex;gap:10px;white-space:pre-wrap;word-break:break-word;padding:2px 0;border-bottom:1px solid rgba(38,38,43,.25)}
-.tl .tt{color:var(--dim2);min-width:58px}
-.tl.info .tm{color:#c9c9cf}
-.tl.ok .tm{color:#6ee7b7}
-.tl.warn .tm{color:var(--warn)}
-.tl.error .tm{color:var(--bad)}
-.acc{display:flex;align-items:center;gap:12px;background:var(--panel2);border:1px solid var(--line);
-  border-radius:12px;padding:11px 12px;margin-bottom:8px}
-.av{width:42px;height:42px;border-radius:50%;object-fit:cover;background:#222;flex:none;
-  border:1px solid var(--line2)}
-.av.ph{display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;
-  font-weight:700;color:var(--dim);font-size:14px}
-.meta{flex:1;min-width:0}
-.meta .u{font-weight:700;font-size:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.meta .u .id{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim2)}
-.meta .e{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);margin-top:2px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.meta .b{font-size:10px;color:var(--dim2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tok{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#9fb0c8;word-break:break-all;
-  background:#07080b;border:1px solid var(--line);border-radius:8px;padding:7px 9px;margin-top:6px}
-.acc .acts{display:flex;gap:6px;flex:none}
-.acc .acts button{font-size:9.5px;padding:7px 9px;letter-spacing:1px}
-.empty{color:var(--dim2);text-align:center;padding:34px 0;font-size:13px;font-family:'JetBrains Mono',monospace}
-.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:90;
-  justify-content:center;align-items:center;padding:16px}
-.overlay.on{display:flex}
-.modal{background:var(--panel);border:1px solid var(--line2);border-radius:16px;width:94vw;max-width:560px;
-  max-height:86vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,.6)}
-.modal-head{display:flex;justify-content:space-between;align-items:center;padding:15px 18px;
-  border-bottom:1px solid var(--line)}
-.modal-head h2{font-family:'JetBrains Mono',monospace;font-size:15px;letter-spacing:2px}
-.modal-close{background:none;border:none;color:var(--dim);font-size:22px;cursor:pointer;padding:0 4px}
-.modal-body{padding:16px 18px;overflow-y:auto;flex:1}
-label{display:block;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;
-  color:var(--dim);margin-bottom:6px}
-input[type=number],input[type=text]{font-family:'JetBrains Mono',monospace;font-size:15px;
-  background:var(--panel2);border:1px solid var(--line2);border-radius:9px;color:var(--txt);
-  padding:11px 12px;outline:none;width:100%}
-input:focus{border-color:var(--dim)}
-.rad{display:flex;gap:16px;margin:14px 0}
-.rad label{display:flex;align-items:center;gap:8px;color:var(--txt);font-size:13px;cursor:pointer;margin:0}
-.exp{background:#050506;border:1px solid var(--line);border-radius:10px;padding:12px;margin:12px 0;
-  font-size:11px;line-height:1.6;max-height:240px;overflow-y:auto;color:#9fb0c8;white-space:pre-wrap;
-  word-break:break-all;display:none}
-#viewImg{width:100%;border-radius:10px;border:1px solid var(--line);background:#000;min-height:240px;object-fit:contain}
-.vph{display:flex;align-items:center;justify-content:center;min-height:240px;color:var(--dim2);
-  font-family:'JetBrains Mono',monospace;font-size:12px;border:1px dashed var(--line);border-radius:10px}
-.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:120;
-  background:#e7e7ea;color:#0a0a0b;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;
-  padding:10px 18px;border-radius:99px;opacity:0;pointer-events:none;transition:opacity .25s}
-.toast.on{opacity:1}
-.footer{color:#3a3a40;font-size:10px;text-align:center;margin-top:20px;font-family:'JetBrains Mono',monospace;letter-spacing:1px}
-.px-cols{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-@media(max-width:900px){.px-cols{grid-template-columns:1fr}}
-.px-col{min-width:0}
-.px-head{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2px;
-  padding:8px 10px;border:1px solid var(--line);border-radius:9px 9px 0 0;background:var(--panel2)}
-.px-head.g{color:#63d9a8;border-color:#1c4a38}
-.px-head.b{color:#8fb4ff;border-color:#22335c}
-.px-head.r{color:#ff7a7a;border-color:#5c2222}
-.px-list{max-height:420px;overflow-y:auto;border:1px solid var(--line);border-top:none;
-  border-radius:0 0 9px 9px;background:#050506}
-.px-item{display:flex;justify-content:space-between;gap:8px;align-items:center;
-  padding:7px 10px;font-family:'JetBrains Mono',monospace;font-size:10.5px;
-  border-bottom:1px solid var(--line);color:var(--dim)}
-.px-item:last-child{border-bottom:none}
-.px-item .ip{color:#9fb0c8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.px-item .st{flex:none;font-size:9px;letter-spacing:1px}
-.px-item .st.used{color:#8fb4ff}
-.px-item .st.invalid{color:#ff7a7a}
-.px-item .st.valid{color:#63d9a8}
-.px-empty{color:var(--dim2);text-align:center;padding:18px 0;font-size:11px;
-  font-family:'JetBrains Mono',monospace}
-@media(max-width:600px){.stats{gap:6px}.stat{padding:10px 6px}.stat .num{font-size:20px}
-  .acc{flex-wrap:wrap}.acc .acts{width:100%;justify-content:flex-end}}
+html{background:#0a0a0b}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:radial-gradient(900px 400px at 85% -10%,rgba(255,255,255,.045),transparent 60%),
+    radial-gradient(700px 380px at -10% 0%,rgba(255,255,255,.03),transparent 55%),#0a0a0b;
+  color:#e7e7ea;min-height:100vh;max-width:980px;margin:0 auto;padding:16px 16px 90px}
+h1{font-family:'JetBrains Mono','Courier New',monospace;font-size:28px;font-weight:700;
+  letter-spacing:2px;display:flex;align-items:center;gap:10px}
+.sub{color:#8a8a92;font-size:12px;margin:6px 0 16px;display:flex;align-items:center;gap:8px}
+.dot{width:8px;height:8px;border-radius:50%;background:#5c5c64;display:inline-block}
+.dot.on{background:#34d399;box-shadow:0 0 12px #34d399}
+nav{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;border-bottom:1px solid #26262b;padding-bottom:12px}
+nav button{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;letter-spacing:1px;
+  padding:9px 18px;border-radius:10px;border:1px solid #26262b;background:#131316;
+  color:#e7e7ea;cursor:pointer;transition:.15s ease}
+nav button:hover{background:#1a1a1e;border-color:#34343a}
+nav button.act{background:#34d399;color:#0a0a0b;border-color:#34d399}
+.card{background:#131316;border:1px solid #26262b;border-radius:14px;padding:18px 20px;margin-bottom:12px}
+.card h3{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  letter-spacing:1px;margin-bottom:10px;color:#8a8a92;text-transform:uppercase}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.col{flex:1;min-width:110px}
+.stat{background:#1a1a1e;border:1px solid #26262b;border-radius:10px;padding:14px;text-align:center}
+.stat .n{font-size:28px;font-weight:700;font-family:'JetBrains Mono','Courier New',monospace}
+.stat .l{font-size:10px;color:#8a8a92;letter-spacing:1px;margin-top:4px;text-transform:uppercase}
+button{padding:9px 22px;border-radius:10px;border:1px solid #26262b;background:#131316;
+  color:#e7e7ea;cursor:pointer;font-size:13px;font-weight:600}
+button:hover{background:#1a1a1e;border-color:#34343a}
+button.primary{background:#34d399;color:#0a0a0b;border-color:#34d399}
+button.danger{background:#f87171;color:#0a0a0b;border-color:#f87171}
+input,select{padding:9px 12px;border-radius:10px;border:1px solid #26262b;background:#1a1a1e;
+  color:#e7e7ea;width:100%;font-size:13px}
+label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacing:1px;
+  text-transform:uppercase}
+.log-box,.all-logs-box{background:#060608;border:1px solid #26262b;border-radius:10px;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px;font-weight:400;
+  line-height:1.55;padding:12px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;color:#fff}
+.log-box{max-height:340px}
+#logOverlay{display:none;position:fixed;inset:0;z-index:300;padding:18px;background:rgba(0,0,0,.72);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+#logOverlay.on{display:flex}
+.logs-modal{width:min(980px,100%);height:min(720px,calc(100vh - 36px));display:flex;flex-direction:column;gap:12px;padding:16px;background:#131316;border:1px solid #34343a;border-radius:16px;box-shadow:0 26px 80px rgba(0,0,0,.62)}
+.logs-head{display:flex;align-items:center;gap:12px}
+.logs-head h2{font-size:15px;font-weight:700;color:#fff;letter-spacing:.2px}
+.logs-close{margin-left:auto;padding:7px 12px;border-radius:9px;border:1px solid #5a2323;background:#2a1212;color:#fff;cursor:pointer;font-size:13px;font-weight:700;line-height:1}
+.all-logs-box{flex:1;min-height:0;max-height:none}
+@media(max-width:640px){#logOverlay{padding:10px}.logs-modal{height:calc(100vh - 20px);padding:12px;border-radius:13px}.log-box,.all-logs-box{font-size:13px}}
+.badge{display:inline-block;font-size:10px;padding:3px 10px;border-radius:99px;
+  font-family:'JetBrains Mono','Courier New',monospace;letter-spacing:1px}
+.badge-ok{background:rgba(52,211,153,.15);color:#34d399}
+.badge-err{background:rgba(248,113,113,.15);color:#f87171}
+.flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.hide{display:none!important}
+.mt{margin-top:12px}.mb{margin-bottom:12px}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1e;
+  border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999}
 </style></head><body>
 
-<h1>EY3<span class="tag">TOKEN FORGE</span></h1>
-<div class="sub"><span class="dot" id="dDot"></span> <span id="stLine">idle</span> - discord token gen - duckmail <span id="domLine">@glasswhitehub.com</span></div>
+<h1>EY3 <span style="font-size:11px;color:#8a8a92;border:1px solid #26262b;border-radius:99px;padding:4px 10px;font-weight:500;letter-spacing:2px">TOKEN FORGE</span></h1>
 
-<nav>
-  <button id="nvMain" class="on" onclick="showTab('Main')">MAIN</button>
-  <button id="nvProxy" onclick="showTab('Proxy')">PROXIES</button>
-  <button id="nvTerm" onclick="showTab('Term')">TERMINAL</button>
-  <button id="nvMan" onclick="showTab('Manage')">MANAGE</button>
+<div class="sub"><span class="dot" id="statusDot"></span> <span id="statusText">loading...</span></div>
+
+<nav id="tabNav">
+<button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
+<button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
 </nav>
 
-<div id="tabMain" class="tab on">
-  <div class="stats">
-    <div class="stat"><div class="num a" id="stTotal">0</div><div class="lbl">Generated</div></div>
-    <div class="stat"><div class="num g" id="stValid">0</div><div class="lbl">Valid</div></div>
-    <div class="stat"><div class="num r" id="stExpired">0</div><div class="lbl">Expired</div></div>
-  </div>
-
-  <div class="card">
-    <h3>Settings</h3>
-    <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px">
-      <span class="tog">Headless browsers
-        <span class="sw" id="swHeadless" onclick="toggleHeadless()"></span>
-      </span>
-      <span class="badge b-dim" id="stPending2">0 pending</span>
-    </div>
-    <div style="margin-bottom:6px">
-      <label style="display:block;font-size:12px;opacity:.7;margin-bottom:4px">Custom email (optional - leave empty to auto-generate)</label>
-      <input type="text" id="inpEmail" placeholder="your@email.com">
-      <button style="margin-top:6px" onclick="saveCustomEmail()">Save email</button>
-    </div>
-    <h3 style="margin-top:14px">Mail domains (discord-friendly on duckmail)</h3>
-    <div id="domPick" class="pick"></div>
-    <div class="dom" style="margin-top:10px">
-      <input type="text" id="domCustom" placeholder="custom domain e.g. mysite.cc">
-      <button onclick="addCustomDomain()">Add custom</button>
-    </div>
-    <div class="btnrow" style="margin-top:12px">
-      <button class="primary" onclick="saveDomains()">Save domains</button>
-    </div>
-    <div class="hint">Pick ONE discord-friendly domain - choosing one replaces the current and saves immediately. Domains that trigger phone verification get burned automatically.</div>
-  </div>
+<div id="tabmain">
+<div class="row mb">
+<div class="col stat"><div class="n" id="statGenerated">0</div><div class="l">Generated</div></div>
+<div class="col stat"><div class="n" id="statValid">0</div><div class="l">Valid</div></div>
+<div class="col stat"><div class="n" id="statExpired">0</div><div class="l">Expired</div></div>
 </div>
 
-<div id="tabProxy" class="tab">
-  <div class="stats">
-    <div class="stat"><div class="num a" id="pxTotal">0</div><div class="lbl">Total</div></div>
-    <div class="stat"><div class="num g" id="pxValid">0</div><div class="lbl">Valid</div></div>
-    <div class="stat"><div class="num b" id="pxUsed">0</div><div class="lbl">Used</div></div>
-    <div class="stat"><div class="num r" id="pxInvalid">0</div><div class="lbl">Invalid</div></div>
-  </div>
-  <div class="card">
-    <h3>Proxy Sessions <span class="badge b-dim" id="pxDbBadge">DB off</span></h3>
-    <div class="px-cols">
-      <div class="px-col"><div class="px-head g">VALID</div><div id="pxValidList" class="px-list"></div></div>
-      <div class="px-col"><div class="px-head b">USED</div><div id="pxUsedList" class="px-list"></div></div>
-      <div class="px-col"><div class="px-head r">INVALID</div><div id="pxInvalidList" class="px-list"></div></div>
+<div class="card">
+<div class="flex mb">
+<h3 style="margin:0">Proxies</h3>
+<span id="proxyStats" class="badge badge-ok">--</span>
+</div>
+<div class="row">
+<div class="col stat"><div class="n" id="proxyTotal">0</div><div class="l">Total</div></div>
+<div class="col stat"><div class="n" id="proxyValid">0</div><div class="l">Valid</div></div>
+<div class="col stat"><div class="n" id="proxyUsed">0</div><div class="l">Used</div></div>
+<div class="col stat"><div class="n" id="proxyInvalid">0</div><div class="l">Invalid</div></div>
+</div>
+</div>
+
+<div class="card">
+<h3>Control</h3>
+<div class="flex">
+<button class="primary" id="btnStart" onclick="startBot()">START</button>
+<button class="danger" id="btnStop" onclick="stopBot()">STOP</button>
+<button id="btnLive" onclick="openLive()">LIVE</button>
+<button onclick="refreshProxies()">Refresh Proxies</button>
+</div>
+</div>
+
+<div class="card">
+<h3>Logs</h3>
+<div class="log-box" id="logBox">Waiting for logs...</div>
+<div class="flex mt">
+<button onclick="viewAllLogs()">ALL LOGS</button>
+</div>
+</div>
+</div>
+
+<div id="tabtokens" class="hide">
+<div class="card">
+<h3>Tokens</h3>
+<div class="flex mb"><button onclick="refreshTokens()">Refresh</button></div>
+<div id="tokenList"><p style="color:#8a8a92">No tokens yet.</p></div>
+</div>
+</div>
+
+<div id="logOverlay" role="dialog" aria-modal="true" aria-labelledby="allLogsTitle">
+  <div class="logs-modal">
+    <div class="logs-head">
+      <h2 id="allLogsTitle">ALL LOGS</h2>
+      <button class="logs-close" type="button" onclick="closeAllLogs()" aria-label="Close all logs">X</button>
     </div>
+    <div id="allLogsBox" class="all-logs-box">Loading logs...</div>
   </div>
 </div>
-
-<div id="tabTerm" class="tab">
-  <div class="btnrow">
-    <button class="ok grow" id="btnStart" onclick="start()">START</button>
-    <button class="danger grow" onclick="stop()">STOP</button>
-    <button onclick="openView()">VIEW</button>
-    <label class="chk"><input type="checkbox" id="showAllChk" onchange="showAll=this.checked;refreshLogs()"> ALL LOGS</label>
-  </div>
-  <div class="term">
-    <div class="term-head">
-      <span class="cd" id="cd1"></span><span class="cd" id="cd2"></span><span class="cd" id="cd3"></span>
-      <span class="t">EY3 - WORKER B1</span><span class="badge b-dim" id="termState">idle</span>
-    </div>
-    <div class="pxline" id="pxLine">proxies: checking...</div>
-    <div class="term-body" id="termBody"><div class="empty">No activity yet - hit START.</div></div>
-  </div>
-</div>
-
-<div id="tabManage" class="tab">
-  <div class="btnrow">
-    <button class="primary" id="btnMode" onclick="toggleMode()">SHOW TOKENS</button>
-    <button onclick="doValidate()">VALIDATE</button>
-    <button class="ok" onclick="openExport()">EXPORT</button>
-    <span class="badge b-dim" style="align-self:center">Total: <span id="manCount">0</span></span>
-  </div>
-  <div id="accList"><div class="empty">No accounts yet - run the generator first.</div></div>
-</div>
-
-
-<div class="overlay" id="viewOverlay" onclick="if(event.target===this)closeView()">
-  <div class="modal">
-    <div class="modal-head"><h2>LIVE BROWSER</h2>
-      <button class="modal-close" onclick="closeView()">X</button></div>
-    <div class="modal-body">
-      <div id="viewWrap"><div class="vph">connecting...</div></div>
-    </div>
-  </div>
-</div>
-
-<div class="overlay" id="expOverlay" onclick="if(event.target===this)closeExp()">
-  <div class="modal">
-    <div class="modal-head"><h2>EXPORT TOKENS</h2>
-      <button class="modal-close" onclick="closeExp()">X</button></div>
-    <div class="modal-body">
-      <label>How many tokens you need?</label>
-      <input type="number" id="expCount" value="5" min="1" max="100">
-      <div class="rad">
-        <label><input type="radio" name="expMode" value="tokens" checked> Tokens alone</label>
-        <label><input type="radio" name="expMode" value="full"> Full tokens</label>
-      </div>
-      <div class="btnrow">
-        <button class="primary" onclick="exportGen()">Generate</button>
-        <button onclick="exportCopyAll()">Copy all</button>
-        <button class="danger" onclick="exportConfirm()">Confirm and delete</button>
-      </div>
-      <div class="exp" id="expList"></div>
-      <div class="hint">Confirm and delete copies the tokens to your clipboard, then removes them from Manage permanently.</div>
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-<div class="footer">EY3 - grey iron build</div>
 
 <script>
-var ACCOUNTS=[], MODE='accounts', EXPORT=[], VIEWINT=null, HEADLESS=true, VALIDATED_ONCE=false;
-var NL2 = String.fromCharCode(10,10);
-function $(id){return document.getElementById(id);}
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast._t);toast._t=setTimeout(function(){t.classList.remove('on');},2200);}
-function api(p,o){return fetch(p,o);}
+function $(id){return document.getElementById(id)}
+function api(path,opts){
+  opts=opts||{};
+  var f=Object.assign({method:'POST',headers:{'Content-Type':'application/json'}},opts);
+  if(opts.body)f.body=JSON.stringify(opts.body);
+  return fetch(path,f);
+}
+function toast(m){
+  var t=document.createElement('div');
+  t.className='toast';
+  t.textContent=m;
+  document.body.appendChild(t);
+  setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
+}
+function showTab(name){
+  var ids=['main','tokens'];
+  ids.forEach(function(t){
+    var el=$('tab'+t);
+    if(el)el.classList.toggle('hide',t!==name);
+  });
+  document.querySelectorAll('#tabNav button').forEach(function(b){
+    b.classList.toggle('act',b.getAttribute('data-tab')===name);
+  });
+}
+window.showTab=showTab;
 
-function showTab(n){
-  var tabs=['Main','Proxy','Term','Manage'];
-  for(var i=0;i<tabs.length;i++){
-    $('tab'+tabs[i]).classList.toggle('on',tabs[i]===n);
-    $('nv'+tabs[i]).classList.toggle('on',tabs[i]===n);
-  }
-  if(n==='Manage') refreshTokens();
-  if(n==='Term') refreshLogs();
-  if(n==='Proxy') refreshProxies();
+function startBot(){
+  api('/start').then(function(r){return r.json()}).then(function(d){
+    toast(d.message||'Started');
+  }).catch(function(e){toast('Error: '+e.message)});
 }
-function refreshProxies(){
-  api('/proxies').then(function(r){return r.json();}).then(function(x){
-    $('pxTotal').textContent = x.total||0;
-    $('pxValid').textContent = (x.valid||[]).length;
-    $('pxUsed').textContent = (x.used||[]).length;
-    $('pxInvalid').textContent = (x.invalid||[]).length;
-    $('pxDbBadge').textContent = x.db ? 'DB ON — used IPs skipped' : 'DB off — in-session only';
-    renderPxList('pxValidList', x.valid||[], 'valid');
-    renderPxList('pxUsedList', x.used||[], 'used');
-    renderPxList('pxInvalidList', x.invalid||[], 'invalid');
-  }).catch(function(){});
+function stopBot(){
+  var btn=$('btnStop');
+  if(btn)btn.disabled=true;
+  api('/stop').then(function(r){
+    if(!r.ok)throw new Error('Stop request failed');
+    return r.json();
+  }).then(function(d){
+    toast(d.message||'Stopped');
+    refreshStatus();
+  }).catch(function(e){
+    toast('Error: '+e.message);
+  }).finally(function(){
+    if(btn)btn.disabled=false;
+  });
 }
-function renderPxList(id, items, cls){
-  var el=$(id), html='';
-  var shown = items.slice(0,150);
-  for(var i=0;i<shown.length;i++){
-    var it=shown[i];
-    html+='<div class="px-item"><span class="ip" title="'+esc(it.label)+'">'+esc(it.label)+'</span>'
-       +'<span class="ip">'+(it.ip?esc(it.ip):'')+'</span>'
-       +'<span class="st '+cls+'">'+cls.toUpperCase()+'</span></div>';
-  }
-  if(!shown.length) html='<div class="px-empty">none yet</div>';
-  if(items.length>shown.length) html+='<div class="px-empty">+'+(items.length-shown.length)+' more</div>';
-  el.innerHTML=html;
-}
+window.startBot=startBot;
+window.stopBot=stopBot;
 
 function refreshStatus(){
-  api('/status').then(function(r){return r.json();}).then(function(x){
-    var st = x.running ? 'on' : ((x.workers||[]).some(function(w){return w.status==='error';}) ? 'err' : '');
-    var d=$('dDot');d.className='dot'+(st?' '+st:'');
-    var running=(x.workers||[]).filter(function(w){return w.status==='running'||w.status==='starting';}).length;
-    $('stLine').textContent = x.running ? ('running - '+running+'/'+(x.workers||[]).length+' browsers - '+Math.floor(x.uptime/60)+'m') : 'idle';
-    // Show the email actually in use: the configured custom email wins;
-    // otherwise fall back to the auto-generated @domain so the header never
-    // lies about "I set my own email but it shows a different domain".
-    var dom=$('domLine');
-    if(dom){
-      if(x.custom_email){dom.textContent=x.custom_email;}
-      else if(x.mail_domains&&x.mail_domains.length){dom.textContent='@'+x.mail_domains[0];}
-    }
-    var px=x.proxies;
-    if(px&&$('pxLine')){
-      $('pxLine').textContent='proxies: '+px.available+' loaded | '+px.valid+' valid | '+px.used+' used | '+px.working+' working | '+px.failed+' failed';
-    }
-  }).catch(function(){});
-}
-
-var showAll=false;
-var OKWORDS=['[ok]','confirmed','solved','ready','rendered','humanized','verification link found'];
-function refreshLogs(){
-  api('/worker/B1/logs').then(function(r){return r.json();}).then(function(x){
-    $('termState').textContent = x.status||'idle';
-    var lines=(x.logs||[]).filter(function(l){
-      if(showAll) return true;
-      // ALL LOGS off: only essential events + warnings/errors (the server
-      // tags each entry with an `essential` flag - same rules as the console).
-      // ALL LOGS on shows everything.
-      var lv=(l.level||'').toLowerCase();
-      if(lv==='warn'||lv==='error') return true;
-      return !!l.essential;
-    }).slice(-150);
-    if(!lines.length) return;
-    var html='';
-    for(var i=0;i<lines.length;i++){
-      var l=lines[i];
-      var m=l.message||'';
-      if(m.indexOf('[B1]')===0)m=m.substring(4);
-      var cls='info', lv=(l.level||'').toLowerCase();
-      if(lv==='error')cls='error'; else if(lv==='warn')cls='warn';
-      else{
-        var low=m.toLowerCase();
-        for(var k=0;k<OKWORDS.length;k++){ if(low.indexOf(OKWORDS[k])!==-1){cls='ok';break;} }
+  fetch('/status').then(function(r){return r.json()}).then(function(s){
+    try{
+      $('statusDot').className='dot'+(s&&s.running?' on':'');
+      $('statusText').textContent=s&&s.running?'running ('+((s.workers&&s.workers.length)||0)+' workers)':'idle';
+      $('statGenerated').textContent=(s&&s.generated)||0;
+      $('statValid').textContent=(s&&s.valid)||0;
+      $('statExpired').textContent=(s&&s.expired)||0;
+      if(s&&s.proxies){
+        $('proxyTotal').textContent=s.proxies.total||0;
+        $('proxyValid').textContent=s.proxies.valid||0;
+        $('proxyUsed').textContent=s.proxies.used||0;
+        $('proxyInvalid').textContent=s.proxies.invalid||0;
       }
-      html+='<div class="tl '+cls+'"><span class="tt">'+(l.time||'')+'</span><span class="tm">'+esc(m)+'</span></div>';
-    }
-    var tb=$('termBody');
-    var atBottom = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 80;
-    tb.innerHTML=html;
-    if(atBottom) tb.scrollTop=tb.scrollHeight;
+    }catch(e){}
   }).catch(function(){});
 }
+window.refreshStatus=refreshStatus;
 
-function start(){
-  var b=$('btnStart');b.disabled=true;b.textContent='LAUNCHING...';
-  api('/start',{method:'POST'}).then(function(r){return r.json();}).then(function(x){
-    toast(x.msg||'Started');
-  }).catch(function(e){toast('Start error: '+e.message);})
-    .finally(function(){b.disabled=false;b.textContent='START';});
+function logText(logs){
+  return logs.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');}).join('\n');
 }
-function stop(){
-  api('/stop',{method:'POST'}).then(function(r){return r.text();}).then(function(t){toast(t);})
-    .catch(function(e){toast('Stop error: '+e.message);});
+function compactLogLine(entry){
+  var message=String(entry.message||entry.m||'');
+  var level=String(entry.level||'').toLowerCase();
+  var time=entry.time||'';
+  var browserFailure=/page crashed|targetclosed|target page.*closed|browser restart.*failed|page closed before/i.test(message);
+  if(browserFailure)return time+' Browser page failed — see ALL LOGS for diagnostics.';
+  var important=/\[FAIL\]|\[OK\]|\[ERROR\]|browser launch failed|retries exhausted|all workers stopped|stopped by user|\[diag\]/i.test(message)||level==='error';
+  return important?(time+' '+message):'';
 }
-
-function openView(){
-  $('viewOverlay').classList.add('on');
-  $('viewWrap').innerHTML='<div class="vph">connecting...</div>';
-  var snap=function(){
-    api('/latest?worker=B1&t='+Date.now()).then(function(r){
-      if(!r.ok){ $('viewWrap').innerHTML='<div class="vph">no feed yet - browser not started</div>'; return; }
-      return r.blob().then(function(b){
-        var u=URL.createObjectURL(b);
-        $('viewWrap').innerHTML='<img id="viewImg" src="'+u+'">';
-        setTimeout(function(){URL.revokeObjectURL(u);},3000);
-      });
-    }).catch(function(){});
-  };
-  snap();
-  VIEWINT=setInterval(snap,2000);
-}
-function closeView(){if(VIEWINT)clearInterval(VIEWINT);VIEWINT=null;$('viewOverlay').classList.remove('on');}
-
-function toggleMode(){
-  MODE = MODE==='accounts' ? 'creds' : 'accounts';
-  $('btnMode').textContent = MODE==='accounts' ? 'SHOW TOKENS' : 'SHOW ACCOUNTS';
-  render();
-}
-function badge(st){
-  var c = st==='valid' ? 'valid' : (st==='invalid' ? 'invalid' : 'pending');
-  return '<span class="badge b-'+c+'">'+(st||'pending')+'</span>';
-}
-function render(){
-  var el=$('accList');
-  if(!ACCOUNTS.length){el.innerHTML='<div class="empty">No accounts yet - run the generator first.</div>';return;}
-  var html='';
-  if(MODE==='accounts'){
-    for(var i=0;i<ACCOUNTS.length;i++){
-      var a=ACCOUNTS[i];
-      var user=a.username||'?';
-      var av = a.avatar ? '<img class="av" src="'+esc(a.avatar)+'">'
-        : '<div class="av ph">'+esc((user||'?').charAt(0).toUpperCase())+'</div>';
-      html+='<div class="acc">'+av+
-        '<div class="meta"><div class="u">@'+esc(user)+(a.user_id?'<span class="id">ID '+esc(a.user_id)+'</span>':'')+'</div>'+
-        '<div class="e">'+esc(a.email||'')+'</div>'+
-        '<div class="b">'+((a.bio?'bio: '+esc(a.bio):'')+(a.humanized?' - humanized':''))+'</div></div>'+
-        badge(a.status)+
-        '<div class="acts">'+
-        '<button data-copy="'+esc(user)+'" data-label="USER" onclick="copyBtn(this)">USER</button>'+
-        '<button data-copy="'+esc(a.user_id||'')+'" data-label="ID" onclick="copyBtn(this)">ID</button></div></div>';
-    }
+function renderLogs(box,logs,compact){
+  if(!box)return;
+  var items=logs||[];
+  var rendered;
+  if(compact){
+    var cutoff=Date.now()/1000-300;
+    rendered=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;})
+      .map(compactLogLine).filter(Boolean);
+    // Collapse repeated browser-crash summaries while full detail remains in ALL LOGS.
+    rendered=rendered.filter(function(line,index,all){return index===0||line!==all[index-1];}).slice(-30);
   }else{
-    for(var j=0;j<ACCOUNTS.length;j++){
-      var b=ACCOUNTS[j];
-      var tok=b.token||'';
-      html+='<div class="acc"><div class="meta" style="flex:1;min-width:0">'+
-        '<div class="u">@'+esc(b.username||'?')+'</div>'+
-        '<div class="tok">'+esc(tok)+'</div>'+
-        '<div class="e" style="margin-top:4px">'+esc((b.email||'')+' : '+(b.password||''))+'</div></div>'+
-        badge(b.status)+
-        '<div class="acts">'+
-        '<button data-copy="'+esc(tok)+'" data-label="TOKEN" onclick="copyBtn(this)">TOKEN</button>'+
-        '<button data-copy="'+esc((b.email||'')+' : '+(b.password||''))+'" data-label="CREDS" onclick="copyBtn(this)">CREDS</button></div></div>';
-    }
+    rendered=items.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');});
   }
-  el.innerHTML=html;
+  box.textContent=rendered.length?rendered.join('\n'):(compact?'No recent activity.':'No logs yet.');
+  box.scrollTop=box.scrollHeight;
 }
+function refreshLogs(){
+  fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
+    var logs=(d&&d.all_logs||d&&d.logs||[]);
+    renderLogs($('logBox'),logs,true);
+    var overlay=$('logOverlay');
+    if(overlay&&overlay.classList.contains('on'))renderLogs($('allLogsBox'),logs,false);
+  }).catch(function(){});
+}
+window.refreshLogs=refreshLogs;
+
 function refreshTokens(){
-  api('/tokens').then(function(r){return r.json();}).then(function(x){
-    ACCOUNTS=x.accounts||[];
-    $('stTotal').textContent=(x.stats&&x.stats.total)||0;
-    $('stValid').textContent=(x.stats&&x.stats.valid)||0;
-    $('stExpired').textContent=(x.stats&&x.stats.expired)||0;
-    $('stPending2').textContent=((x.stats&&x.stats.pending)||0)+' pending';
-    $('manCount').textContent=ACCOUNTS.length;
-    render();
-    if(!VALIDATED_ONCE && (x.stats&&x.stats.pending)>0){ VALIDATED_ONCE=true; doValidate(); }
+  fetch('/tokens').then(function(r){return r.json()}).then(function(d){
+    try{
+      var list=$('tokenList');
+      if(!d||!d.length){list.innerHTML='<p style="color:#8a8a92">No tokens yet.</p>';return;}
+      var html='<table style="width:100%;border-collapse:collapse;font-size:12px">';
+      d.forEach(function(a){
+        var st=a.valid===true?'<span class="badge badge-ok">Valid</span>':'<span class="badge badge-err">Invalid</span>';
+        html+='<tr style="border-bottom:1px solid #26262b">';
+        html+='<td style="padding:6px">'+(a.email||'?')+'</td>';
+        html+='<td style="padding:6px">'+st+'</td>';
+        html+='<td style="padding:6px;font-family:monospace;font-size:10px;color:#5c5c64;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(a.token||'').slice(0,40)+'...</td>';
+        html+='</tr>';
+      });
+      html+='</table>';
+      list.innerHTML=html;
+    }catch(e){}
   }).catch(function(){});
 }
-function doValidate(){
-  toast('Validating tokens...');
-  api('/validate',{method:'POST'}).then(function(r){return r.json();}).then(function(x){
-    ACCOUNTS=x.accounts||ACCOUNTS;
-    $('stValid').textContent=x.valid||0;
-    $('stExpired').textContent=x.expired||0;
-    render();
-    toast('Validation done - '+x.valid+' valid');
-  }).catch(function(e){toast('Validate error: '+e.message);});
-}
+window.refreshTokens=refreshTokens;
 
-function openExport(){EXPORT=[];$('expList').style.display='none';$('expOverlay').classList.add('on');}
-function closeExp(){$('expOverlay').classList.remove('on');}
-function exportGen(){
-  var count=parseInt($('expCount').value||'5',10);
-  var modeEl=document.querySelector('input[name="expMode"]:checked');
-  var mode=modeEl?modeEl.value:'tokens';
-  api('/export',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({count:count,mode:mode})}).then(function(r){return r.json();}).then(function(x){
-    EXPORT=x.accounts||[];
-    if(!EXPORT.length){$('expList').style.display='block';$('expList').textContent='nothing to export - no tokens in Manage';}
-    else{
-      var parts=[];
-      for(var i=0;i<EXPORT.length;i++)parts.push(EXPORT[i].text);
-      $('expList').style.display='block';
-      $('expList').textContent=parts.join(NL2);
-    }
-  }).catch(function(e){toast('Export error: '+e.message);});
+function refreshProxies(){
+  api('/proxies/refresh').then(function(r){return r.json()}).then(function(d){
+    toast(d.message||d.error||'Refreshed');
+  }).catch(function(e){toast('Error: '+e.message)});
 }
-function exportCopyAll(){
-  var parts=[];
-  for(var i=0;i<EXPORT.length;i++)parts.push(EXPORT[i].text);
-  var txt=parts.join(NL2);
-  if(!txt)return toast('nothing to copy yet');
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(txt).then(function(){toast('Copied '+EXPORT.length+' to clipboard');});
-  }else{
-    var ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();
-    try{document.execCommand('copy');}catch(e){}
-    document.body.removeChild(ta);
-    toast('Copied '+EXPORT.length+' to clipboard');
-  }
-}
-function exportConfirm(){
-  if(!EXPORT.length)return toast('Generate first');
-  exportCopyAll();
-  var ids=[];
-  for(var i=0;i<EXPORT.length;i++){ if(EXPORT[i].id!=null) ids.push(EXPORT[i].id); }
-  api('/export/delete',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ids:ids})}).then(function(r){return r.json();}).then(function(x){
-    toast('Copied and deleted '+ids.length+' from Manage');
-    EXPORT=[];$('expList').style.display='none';closeExp();refreshTokens();
-  }).catch(function(e){toast('Delete error: '+e.message);});
-}
-function copyBtn(btn){
-  var t=btn.getAttribute('data-copy')||'';
-  if(!t)return toast('nothing to copy');
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(t).then(function(){btn.textContent='COPIED';setTimeout(function(){btn.textContent=btn.getAttribute('data-label')||'COPY';},1200);});
-  }else{
-    var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();
-    try{document.execCommand('copy');}catch(e){}
-    document.body.removeChild(ta);
-    btn.textContent='COPIED';setTimeout(function(){btn.textContent=btn.getAttribute('data-label')||'COPY';},1200);
-  }
-}
+window.refreshProxies=refreshProxies;
 
-var DOMAINS=[], AVAIL=[];
-function loadConfig(){
-  api('/config').then(function(r){return r.json();}).then(function(x){
-    AVAIL=(x.available_domains&&x.available_domains.length)?x.available_domains:['glasswhitehub.com'];
-    DOMAINS=(x.mail_domains&&x.mail_domains.length)?x.mail_domains.slice():['glasswhitehub.com'];
-    HEADLESS=x.headless!==false;
-    $('swHeadless').classList.toggle('on',HEADLESS);
-    if(x.custom_email&&$('inpEmail'))$('inpEmail').value=x.custom_email;
-    renderDomains();
-  }).catch(function(){AVAIL=['glasswhitehub.com'];DOMAINS=['glasswhitehub.com'];renderDomains();});
+function viewAllLogs(){
+  var overlay=$('logOverlay');
+  if(!overlay)return;
+  overlay.classList.add('on');
+  $('allLogsBox').textContent='Loading logs...';
+  fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
+    renderLogs($('allLogsBox'),(d&&d.all_logs||d&&d.logs||[]),false);
+  }).catch(function(){
+    $('allLogsBox').textContent='Unable to load logs.';
+  });
 }
-function renderDomains(){
-  var html='';
-  for(var i=0;i<AVAIL.length;i++){
-    var d=AVAIL[i];
-    var sel=DOMAINS.indexOf(d)!==-1;
-    html+='<button type="button" class="chip'+(sel?' on':'')+'" data-d="'+esc(d)+'" onclick="pickDomain(this)">'+esc(d)+'</button>';
-  }
-  for(var j=0;j<DOMAINS.length;j++){
-    if(AVAIL.indexOf(DOMAINS[j])===-1){
-      html+='<button type="button" class="chip on" data-d="'+esc(DOMAINS[j])+'" onclick="pickDomain(this)">'+esc(DOMAINS[j])+'</button>';
-    }
-  }
-  $('domPick').innerHTML=html;
+function closeAllLogs(){
+  var overlay=$('logOverlay');
+  if(overlay)overlay.classList.remove('on');
 }
-function pickDomain(btn){
-  var d=btn.getAttribute('data-d')||'';
-  if(!d)return;
-  if(DOMAINS.length===1 && DOMAINS[0]===d)return;
-  DOMAINS=[d];
-  saveDomains();
-}
-function addCustomDomain(){
-  var v=$('domCustom').value.trim().toLowerCase();
-  $('domCustom').value='';
-  if(!v)return;
-  if(DOMAINS.indexOf(v)!==-1)return toast('already in the pool');
-  DOMAINS.push(v);renderDomains();
-}
-function toggleHeadless(){$('swHeadless').classList.toggle('on');}
-function saveCustomEmail(){
-  var v=$('inpEmail').value.trim().toLowerCase();
-  api('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({custom_email:v})})
-    .then(function(r){return r.json();}).then(function(x){
-      toast(x.ok?(v?('Custom email set: '+v):'Custom email cleared - auto-generate on'):'save failed');
-    }).catch(function(e){toast('Save error: '+e.message);});
-}
-function saveDomains(){
-  var cleaned=[];
-  for(var i=0;i<DOMAINS.length;i++){
-    var d=DOMAINS[i].trim().toLowerCase();
-    if(d && cleaned.indexOf(d)===-1) cleaned.push(d);
-  }
-  DOMAINS=cleaned;
-  renderDomains();
-  api('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mail_domains:DOMAINS,headless:$('swHeadless').classList.contains('on')})})
-    .then(function(r){return r.json();}).then(function(x){
-      toast(x.ok?('Domains saved - '+((x.config&&x.config.mail_domains)||[]).join(', ')):'save failed');
-    }).catch(function(e){toast('Save error: '+e.message);});
-}
+window.viewAllLogs=viewAllLogs;
+window.closeAllLogs=closeAllLogs;
+(function(){
+  var overlay=$('logOverlay');
+  if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAllLogs();});
+})();
 
-loadConfig();
+// Init
 refreshStatus();
-setInterval(refreshStatus,5000);
-setInterval(refreshLogs,2200);
-setInterval(function(){refreshTokens();},12000);
 refreshLogs();
 refreshTokens();
-</script></body></html>
-"""
+setInterval(refreshStatus,5000);
+setInterval(refreshLogs,2200);
+setInterval(refreshTokens,12000);
+</script>
+</body></html>
+
+'''
+
 
 if __name__ == "__main__":
     main()

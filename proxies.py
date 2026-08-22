@@ -213,9 +213,7 @@ class UsedProxyStore:
         redeploys)."""
         self._load()
         try:
-            import db
-            if db.db_ok():
-                rows = await db.list_proxies()
+                rows = []
                 for r in rows:
                     key = r.get("key") or ""
                     if not key:
@@ -249,12 +247,6 @@ class UsedProxyStore:
         if not changed:
             return
         self._save()
-        try:
-            import db
-            if db.db_ok():
-                await db.record_proxy(key=key, status=status, exit_ip=exit_ip)
-        except Exception:
-            pass
 
     async def record_many(self, items: List[tuple]) -> None:
         """Batch upsert — one file write + per-key DB upserts (sweep)."""
@@ -275,12 +267,6 @@ class UsedProxyStore:
         if not changed:
             return
         self._save()
-        try:
-            import db
-            if db.db_ok():
-                await db.record_proxies(changed)
-        except Exception:
-            pass
 
     async def all(self) -> List[dict]:
         await self.load()

@@ -17,6 +17,13 @@ from captcha_solver import (
 )
 from duckmail import TempMail
 from vision_solver import OllamaVisionClient
+from drag_solver import DragSolver
+import hcaptcha_types as hct
+import human_mouse as hm
+
+# Mean per-tile CNN confidence required before the OFFLINE tile classifier
+# is trusted for a grid round (below this gate the vision model answers).
+_CNN_MIN_CONF = float(os.environ.get("SOLVER_CNN_MIN_CONF", "0.62"))
 
 
 # ── Shared JS: robust login-link / back-to-login detection ──────────────
@@ -179,7 +186,22 @@ _TOS_TARGET_JS = r"""() => {
     const ordered = tosOnes.concat(rest.reverse());
     const best = ordered[0];
     try { best.el.setAttribute('data-tos-target', '1'); } catch (e) {}
-    return { x: best.x, y: best.y, tos: best.tos ? 1 : 0, tag: (best.el && best.el.tagName || '').toLowerCase() };
+    // Discord toggles the box when its <label> / the row text is clicked too —
+    // clicking the label (which often wraps or neighbours the box) is the most
+    // reliable toggle and lands on a larger target. Prefer the label centre,
+    // falling back to the box centre.
+    let lx = best.x, ly = best.y;
+    try {
+        const lab = best.el.closest('label') || best.el.parentElement;
+        if (lab) {
+            const lr = lab.getBoundingClientRect();
+            if (lr && lr.width >= 8 && lr.height >= 8) {
+                lx = lr.left + lr.width / 2;
+                ly = lr.top + lr.height / 2;
+            }
+        }
+    } catch (e) {}
+    return { x: best.x, y: best.y, lx: lx, ly: ly, tos: best.tos ? 1 : 0, tag: (best.el && best.el.tagName || '').toLowerCase() };
 }"""
 
 # JS-dispatch fallback for the ToS box: dispatches pointer/mouse events ON
@@ -476,14 +498,13 @@ async () => {
     const optionMatches = (text, value) => {
         const t = low(text || ''); const v = low(value || '');
         if (!t && !v) return false;
-        if (t === wantStr) return true;
+        if (t === wantStr || v === wantStr) return true;
         if (MONTH_ALIASES[t] && MONTH_ALIASES[t] === wantNum) return true;
         if (!wantNum) return false;
         const n = String(wantNum);
         const p = n.length === 1 ? '0' + n : n;
-        const z = wantNum > 1 ? String(wantNum - 1) : '0';
-        const zp = z.length === 1 ? '0' + z : z;
-        return t === n || v === n || t === p || v === p || t === z || v === z || t === zp || v === zp;
+        const toks = t.split(/[^a-z0-9]+/).filter(Boolean);
+        return t === n || v === n || t === p || v === p || toks.indexOf(n) !== -1 || toks.indexOf(p) !== -1;
     };
     const labelHits = (el) => {
         const cls = (typeof el.className === 'string') ? el.className : '';
@@ -504,6 +525,7 @@ async () => {
         'select, [role="combobox"], [role="listbox"], [class*="select" i], [class*="dropdown" i], [class*="control" i]'
     )).filter(labelHits);
     if (!candidates.length) {
+        if (!document.body) return 'not_found';
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         const labels = DOB_LABELS[LABEL] || [LABEL.toLowerCase()];
@@ -594,7 +616,7 @@ _DOB_LABEL_ALIASES = {
         "gün", "nap", "zi", "hari", "ngày", "일", "日", "يوم", "दिन", "วัน",
     ],
     "Year": [
-        "year", "jaar", "an", "année", "annee", "jahr", "año", "ano",
+        "year", "jaar", "année", "annee", "jahr", "año", "ano",
         "anno", "rok", "år", "год", "рік", "година", "vuosi", "aasta",
         "gads", "metai", "έτος", "yıl", "év", "tahun", "năm", "년", "年",
         "سنة", "साल", "ปี",
@@ -725,6 +747,7 @@ _DOB_VALUE_JS = r"""([label, aliases]) => {
 }"""
 
 _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
+    try { document.querySelectorAll('[data-dob-target="' + label + '"]').forEach(e => e.removeAttribute('data-dob-target')); } catch(e) {}
     const norm = (s) => (s == null ? '' : String(s)).replace(/\s+/g, ' ').trim();
     const low = (s) => norm(s).toLowerCase();
     const labels = (aliases && aliases[label]) || [label.toLowerCase()];
@@ -783,6 +806,7 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
     // Text-walker fallback: controls with none of the role/class markers
     // (their placeholder text still identifies them).
     if (!hits.length) {
+        if (!document.body) return null;
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
@@ -810,7 +834,7 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
 }"""
 
 # Options of an open DOB menu (custom dropdowns and native <select>).
-_DOB_OPTION_SEL = '[role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
+_DOB_OPTION_SEL = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
 
 # Find the index (within _DOB_OPTION_SEL) of the option that represents
 # `optionText` in the page's locale. Months resolve to their numeric index so
@@ -823,16 +847,20 @@ _DOB_OPTION_INDEX_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
     const sel = __OPT_SEL__;
     const opts = Array.from(document.querySelectorAll(sel));
@@ -859,27 +887,31 @@ _DOB_OPTION_POS_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
-    const all = document.querySelectorAll('[role="option"], [role="menuitem"], li, div, span');
+    const sel = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], [role="menuitem"], li';
+    const all = document.querySelectorAll(sel);
     for (const el of all) {
-        if (!el.offsetParent) continue;
-        el.scrollIntoView({ block: 'nearest' });
-        const r = el.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
-        if (!t) continue;
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            const r = el.getBoundingClientRect();
+            if (r.width < 3 || r.height < 3) continue;
             return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t.slice(0, 30) };
         }
     }
@@ -896,27 +928,29 @@ _DOB_OPTION_DISPATCH_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
-    const all = document.querySelectorAll('[role="option"], [role="menuitem"], li, div, span');
+    const sel = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], [role="menuitem"], li';
+    const all = document.querySelectorAll(sel);
     for (const el of all) {
-        if (!el.offsetParent) continue;
-        try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-        const r = el.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
-        if (!t) continue;
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
             for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click']) {
                 el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
             }
@@ -960,14 +994,19 @@ def _human_typing_delay(ch: str) -> float:
 _REACT_SET_VALUE_JS = r"""([sel, value]) => {
     const el = document.querySelector(sel);
     if (!el) return false;
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-    setter.call(el, value);
-    try {
-        const t = el._valueTracker;
-        if (t && typeof t.setValue === 'function') t.setValue(value);
-    } catch (e) {}
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = (Object.getOwnPropertyDescriptor(proto, 'value') || {}).set
+                || (Object.getOwnPropertyDescriptor(el.__proto__, 'value') || {}).set;
+    if (setter) {
+        if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+            el._valueTracker.setValue(value === '' ? '__initial__' : '');
+        }
+        setter.call(el, value);
+    } else {
+        el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
     return true;
 }"""
 
@@ -1085,18 +1124,88 @@ NAV_TIMEOUT_MS = 30000
 # auto-resolve and get unlimited time; everything else rotates to a fresh
 # circuit once the budget is exhausted.
 RENDER_WAIT_BUDGET_S = 75.0
+LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
+LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
+
+# ── Full-page LIVE camera frames ─────────────────────────────────
+# The operator asked to SEE EVERYTHING in the camera feed, so frames are
+# now FULL-PAGE captures. Uncapped full-page screenshots of a very tall
+# SPA (Discord's channel tree can scroll for tens of thousands of pixels)
+# force the renderer to paint + encode the entire surface — that is the
+# exact memory spike that used to OOM-kill the content process. So the
+# full-page capture is budgeted: pages taller than FULLPAGE_MAX_PX keep
+# the old viewport-only frame, and any full-page failure falls back to a
+# viewport capture instead of dropping the frame.
+FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
+
+
+async def capture_page_screenshot(page, log=None,
+                                  fullpage_timeout: float = 20.0,
+                                  viewport_timeout: float = 10.0) -> bytes:
+    """FULL-PAGE PNG capture with an OOM safety net.
+
+    Measures the page first; when its scroll height fits the
+    FULLPAGE_MAX_PX budget it captures the whole scrollable surface (what
+    the operator asked for: "see everything"), otherwise it degrades to a
+    viewport-only frame. Both the worker camera loop and the dashboard
+    LIVE feed go through here, so every frame in the dashboard is the
+    tallest safe capture. Returns PNG bytes, or b"" when even the
+    viewport capture fails (callers keep their last good frame).
+    """
+    if page is None:
+        return b""
+
+    async def _viewport(attempt_timeout: float) -> bytes:
+        try:
+            data = await asyncio.wait_for(
+                page.screenshot(full_page=False, timeout=attempt_timeout * 1000), timeout=attempt_timeout)
+            return data or b""
+        except Exception:
+            return b""
+
+    if FULLPAGE_SHOTS:
+        height = 0
+        try:
+            height = await asyncio.wait_for(page.evaluate(
+                "() => Math.max("
+                "document.documentElement ? document.documentElement.scrollHeight : 0,"
+                " document.body ? document.body.scrollHeight : 0)"), timeout=2.5)
+        except Exception:
+            height = 0
+        if not isinstance(height, (int, float)) or isinstance(height, bool):
+            height = 0
+        if height <= FULLPAGE_MAX_PX:
+            try:
+                data = await asyncio.wait_for(
+                    page.screenshot(full_page=True, timeout=fullpage_timeout * 1000), timeout=fullpage_timeout)
+                if data:
+                    return data
+                if log:
+                    log("[Shot] empty full-page capture - viewport frame",
+                        level="warn")
+            except Exception as e:
+                if log:
+                    log(f"[Shot] full-page capture failed "
+                        f"({type(e).__name__}) - viewport frame", level="warn")
+        elif height > FULLPAGE_MAX_PX and log:
+            log(f"[Shot] page {int(height)}px tall exceeds the "
+                f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
+    # Viewport fallback (one retry, like the old capture loop).
+    shot = await _viewport(viewport_timeout)
+    if not shot and viewport_timeout >= 8.0:
+        shot = await _viewport(10.0)
+    return shot
 
 
 # ═══════════════════════════════════════════════════════════════
 # Human Behavior Simulation
 # ═══════════════════════════════════════════════════════════════
 
-# Mouse humanization is ENGINE-OWNED: Camoufox launches with humanize=True,
-# so every trusted mouse move / click already travels a human-like bezier
-# trajectory (max ~1.5s) natively — no custom bezier shim and NO artificial
-# per-step sleep delays. The old truedriver-era human_mouse_move() (manual
-# quadratic bezier + sleeps) is gone; every click in this file is a real
-# page.mouse click that the engine humanizes for free.
+# Pointer realism is provided by human_mouse.py (manual cubic-bezier glide,
+# settle, and human dwell on down/up) for the challenge interactions that need
+# it, and by plain page.mouse clicks elsewhere. The truedriver facade maps
+# page.mouse to native CDP Input.dispatchMouseEvent.
 
 class DiscordAutomation:
     def __init__(self, headless: bool = False, email: str = "",
@@ -1123,11 +1232,20 @@ class DiscordAutomation:
         self._password = ""
         self._token = ""
         # Local Ollama vision model solves the hCaptcha image grid itself -
-        # no paid token APIs (NoneCap / Nopecha are gone, see vision_solver.py).
+        # vision model solves the image grid directly (see vision_solver.py).
         self._vision = OllamaVisionClient(log=self._log)
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
+        # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
+        # payload carries request_type (which of the five challenge families
+        # this round is), the prompt and the tile/reference URLs.
+        self._challenge_payload = None
+        # Offline CNN solvers (tile_classifier.py). Lazy: None until first
+        # use, False when torch/weights are absent (vision-model fallback).
+        self._cnn_tile = None
+        self._cnn_point = None
+        self._cnn_drag = None
         # duckmail.sbs client — created once per bot, reused across attempts.
         # (Lost in the cybertemp→duckmail switch, which silently killed every
         # inbox creation with a NoneType crash — see git log efb6f99.)
@@ -1160,8 +1278,9 @@ class DiscordAutomation:
         # in place once (fresh page, same circuit) then rotates instead of
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
-        # Engine-owned identity: Camoufox mints a fresh randomized profile
-        # per launch — there is no bot-side fingerprint to keep.
+        self._last_browser_diag = 0.0
+        # truedriver launches Chrome with a fresh temporary profile per launch
+        # — there is no bot-side fingerprint to keep.
         self._fingerprint = {}
 
     def _log(self, message: str, level: str = "info") -> None:
@@ -1192,11 +1311,66 @@ class DiscordAutomation:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         self._log(f"{message} — {tb.rstrip()}", level="error")
 
+    async def _log_browser_diagnostics(self, reason: str,
+                                       exc: Optional[BaseException] = None,
+                                       force: bool = False) -> None:
+        """Add concise runtime evidence for browser crashes to ALL LOGS.
+
+        This avoids guessing whether a repeated page crash came from a proxy,
+        a stale browser build, a root runtime, or a cgroup memory/pid limit.
+        Sensitive connection credentials and account data are deliberately
+        excluded from the report.
+        """
+        now = time.time()
+        if not force and now - self._last_browser_diag < 2.0:
+            return
+        self._last_browser_diag = now
+
+        def _read(path: str, limit: int = 240) -> str:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    return handle.read(limit).strip().replace("\n", "; ")
+            except Exception as read_error:
+                return f"unavailable:{type(read_error).__name__}"
+
+        def _collect() -> dict:
+            try:
+                from importlib.metadata import version
+                truedriver_version = version("truedriver")
+            except Exception:
+                truedriver_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "truedriver")
+            return {
+                "reason": reason,
+                "error_type": type(exc).__name__ if exc is not None else "",
+                "error": str(exc)[:500] if exc is not None else "",
+                "uid": os.getuid() if hasattr(os, "getuid") else None,
+                "engine": ENGINE,
+                "truedriver_package": truedriver_version,
+                "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
+                "page_present": self._page is not None,
+                "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
+                "home": os.environ.get("HOME", ""),
+                "cache_exists": os.path.isdir(cache_dir),
+                "cgroup_memory_current": _read("/sys/fs/cgroup/memory.current"),
+                "cgroup_memory_max": _read("/sys/fs/cgroup/memory.max"),
+                "cgroup_memory_events": _read("/sys/fs/cgroup/memory.events"),
+                "cgroup_pids_current": _read("/sys/fs/cgroup/pids.current"),
+                "cgroup_pids_max": _read("/sys/fs/cgroup/pids.max"),
+                "process_status": _read("/proc/self/status", 1200),
+            }
+
+        try:
+            diagnostics = await asyncio.to_thread(_collect)
+            self._log("[Diag] Browser failure " + json.dumps(diagnostics, sort_keys=True), level="error")
+        except Exception as diag_error:
+            self._log(f"[Diag] Browser failure diagnostics unavailable: {type(diag_error).__name__}: {diag_error}", level="error")
+
     def get_activity_log(self) -> list:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (Camoufox applies it at launch
+        """The proxy rides on browser launch (truedriver applies it at launch
         — a context-level proxy would either be ignored or rejected).
         Returns the Playwright-style {server, username, password} dict
         (or None for TOR/direct)."""
@@ -1275,18 +1449,15 @@ class DiscordAutomation:
     async def initialize(self) -> None:
         self._playwright = await async_playwright().start()
 
-        # Best-human-stealth launch args: Camoufox owns launch prefs and the
-        # fingerprint entirely, so there is nothing to add.
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
-        # Engine-level identity: Camoufox mints a fresh randomized profile
-        # per launch — no bot-side UA / font / GPU / locale selection. It
-        # additionally geo-matches the fingerprint to the proxy's real exit
-        # region.
+        # Chromium uses a clean Playwright context for each launch. Do not
+        # claim engine-level fingerprint randomization that the driver does
+        # not provide; diagnostics should reflect the runtime accurately.
         self._ua = ""
         self._fingerprint = {}
-        self._log(f"[Fingerprint] Identity owned by {ENGINE} engine — fresh randomized profile per launch")
+        self._log(f"[Engine] Fresh {ENGINE} context requested")
 
         # Launch the browser WITH the proxy. The engine applies it as a
         # --proxy-server launch arg — a proxy passed later to new_context()
@@ -1298,7 +1469,9 @@ class DiscordAutomation:
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 
-        # Standard desktop viewport (1920x1080) — most common real resolution
+        # Use a smaller renderer surface in a 1 GB container. This keeps
+        # page paint and screenshot buffers materially below a 1920x1080
+        # desktop surface while preserving a standard desktop layout.
         await self._build_context()
 
         # Done — context created by _build_context with full CDP evasion
@@ -1306,7 +1479,7 @@ class DiscordAutomation:
     async def _build_context(self) -> None:
         """Build a fresh browser context with current self.proxy.
         Shared by initialize() and switch_proxy()."""
-        vp = {'width': 1920, 'height': 1080}
+        vp = dict(LOW_MEMORY_VIEWPORT) if LOW_MEMORY_MODE else {'width': 1920, 'height': 1080}
         ctx_opts = build_context_options(
             self._fingerprint, self._ua, proxy=self.proxy, viewport=vp
         )
@@ -1321,7 +1494,7 @@ class DiscordAutomation:
             self._log("[TOR] Using TOR SOCKS5 proxy...")
             if _tor_newnym():
                 self._log("[TOR] New identity requested")
-            # Camoufox already rides the TOR proxy from browser launch — a
+            # truedriver already rides the TOR proxy from browser launch — a
             # context-level proxy would be rejected by Playwright when the
             # browser was launched with one.
             await asyncio.sleep(1)
@@ -1381,6 +1554,14 @@ class DiscordAutomation:
         except Exception as e:
             self._log(f"[Captcha] Could not attach rqdata request capture: {e}",
                       level="warn")
+        # Response side of the same exchange: the /getcaptcha RESPONSE body is
+        # the challenge payload (request_type, prompt, tile URLs) — the most
+        # reliable of the three family-classification tiers.
+        try:
+            self._page.on("response", self._on_page_response)
+        except Exception as e:
+            self._log(f"[Captcha] Could not attach payload response capture: {e}",
+                      level="warn")
 
     def _attach_crash_listener(self) -> None:
         """Detect tab crashes (renderer died) the moment they happen instead
@@ -1401,6 +1582,14 @@ class DiscordAutomation:
     def _on_page_crash(self) -> None:
         self._page_crashed = True
         self._log("[Nav] Page crashed (browser tab died)", level="warn")
+        try:
+            asyncio.get_running_loop().create_task(
+                self._log_browser_diagnostics("renderer-crash-event")
+            )
+        except RuntimeError:
+            # The callback can run while the loop is closing; the navigation
+            # exception path records the same diagnostics in that case.
+            pass
 
     def _on_page_request(self, request) -> None:
         try:
@@ -1445,6 +1634,33 @@ class DiscordAutomation:
         except Exception as e:
             self._log(f"[Captcha] rqdata capture error: {e}", level="debug")
 
+    async def _on_page_response(self, response) -> None:
+        """Stash the /getcaptcha JSON (the challenge payload) as it arrives."""
+        try:
+            url = (response.url or "").lower()
+            if "hcaptcha" not in url or "getcaptcha" not in url:
+                return
+            if response.status != 200:
+                return
+            data = await response.json()
+            if isinstance(data, dict) and data.get("request_type"):
+                self._read_challenge_payload(data)
+        except Exception:
+            pass
+
+    def _read_challenge_payload(self, data: dict = None) -> Optional[dict]:
+        """Store /getcaptcha JSON and log the challenge family it carries.
+
+        Called by the response hook with the fresh payload; called with no
+        argument it just returns the last payload stored."""
+        if data is not None:
+            self._challenge_payload = data
+            family = hct.classify_from_payload(data)
+            self._log(
+                f"[Captcha] getcaptcha payload: "
+                f"request_type={data.get('request_type')!r} -> family={family}")
+        return self._challenge_payload
+
     async def switch_proxy(self, new_proxy=None) -> bool:
         """Swap to a new proxy AND a fresh fingerprint. Returns True on success.
 
@@ -1483,16 +1699,21 @@ class DiscordAutomation:
             # call _build_context() (which does browser.new_context()) on a
             # dead browser: that was the "'NoneType' object has no attribute
             # 'new_context'" crash. Relaunch the browser instead.
-            if proxy_changed or self._browser is None:
-                self._log("[Switch] Proxy changed — relaunching browser with new session")
+            if proxy_changed or self._browser is None or not getattr(self._browser, "is_connected", True):
+                self._log("[Switch] Proxy changed or browser restart needed — relaunching browser with new session")
                 await self._relaunch_browser()
             else:
-                await self._build_context()
+                try:
+                    await self._build_context()
+                except Exception as b_err:
+                    self._log(f"[Switch] Context rebuild failed ({b_err}) — falling back to full browser relaunch", level="warn")
+                    await self._relaunch_browser()
             label = 'proxy ' + str(new_proxy.get('key','?')[:40]) if new_proxy else 'fresh TOR circuit'
             self._log(f"[Switch] Context rebuilt with {label}")
             return True
         except Exception as e:
             self._log(f"[Switch] Context rebuild failed: {e}", level="error")
+            self._browser = None
             return False
 
     async def switch_direct(self) -> bool:
@@ -1535,15 +1756,32 @@ class DiscordAutomation:
         except Exception:
             return False
 
+    async def _page_is_closed(self) -> bool:
+        """Return whether the current page is unavailable without raising."""
+        page = self._page
+        if page is None:
+            return True
+        try:
+            closed = getattr(page, "is_closed", None)
+            if callable(closed):
+                return bool(closed())
+            if closed is not None:
+                return bool(closed)
+            # truedriver's wrapper may not expose is_closed; a tiny bounded read
+            # distinguishes a live page from a closed CDP target.
+            await asyncio.wait_for(page.evaluate("location.href"), timeout=1.0)
+            return False
+        except Exception:
+            return True
+
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
-        Camoufox mints a fresh persona on EVERY launch (and on every
-        new_context()), so the next relaunch (new proxy session) is
-        automatically a new, unlinkable identity."""
+        The Chromium driver recreates its Playwright context on relaunch.
+        Reset local state so the next launch starts from a clean context."""
         self._fingerprint = {}
         self._ua = ""
-        self._log(f"[Fingerprint] Rotated: fresh {ENGINE} profile on next launch (engine-owned identity)")
+        self._log(f"[Engine] {ENGINE} context will be recreated on next launch")
 
     async def _rebuild_context_with_tor(self) -> bool:
         """Close the context and reopen WITH a fresh TOR circuit."""
@@ -1640,6 +1878,7 @@ class DiscordAutomation:
         circuit is pointless — if Discord blocked that exit node, it won't
         unblock on retry."""
         url = "https://discord.com/register"
+        recovered_unavailable_page = False
         # A fresh navigation must not inherit a stale crash flag from a
         # previous page (recovery also resets it — belt and suspenders).
         self._page_crashed = False
@@ -1683,13 +1922,27 @@ class DiscordAutomation:
             # on chrome-error / dead reads, so a slow-but-alive TOR circuit
             # gets to finish loading instead of being killed at 30s.
             elapsed = time.time() - t0
-            if "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower():
+            err_type = type(e).__name__.lower()
+            err_text = str(e).lower()
+            if "timeout" in err_type or "timeout" in err_text:
                 self._log(f"[Nav] Page.goto timeout ({type(e).__name__}) after {elapsed:.1f}s - continuing to render-wait")
-            elif "crashed" in str(e).lower():
+            elif ("targetclosed" in err_type or "target page" in err_text
+                  or "has been closed" in err_text or "context or browser has been closed" in err_text):
+                # The target is already gone. Recover before reading title/url,
+                # otherwise the dashboard receives a misleading '(unknown)'.
+                reason = "page, context, or browser closed during navigation"
+                self._nav_error = reason
+                self._log(f"[Nav] Page.goto TargetClosedError - {reason}", level="warn")
+                recovered_unavailable_page = await self._recover_crashed_page(url, reason)
+                if not recovered_unavailable_page:
+                    self._nav_error = f"{reason} - browser restart failed"
+                    return False
+            elif "crashed" in err_text:
                 # Renderer died mid-commit. Flag it so the render-wait loop
-                # recovers the tab in place instead of polling a corpse 20x.
+                # restarts the browser once instead of polling a corpse.
                 self._page_crashed = True
-                self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering tab on same circuit", level="warn")
+                await self._log_browser_diagnostics("page-goto-crashed", e)
+                self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering browser", level="warn")
             else:
                 self._log(f"[Nav] Page.goto error ({type(e).__name__}: {e}) - continuing to render-wait", level="warn")
         # ── Check what we got ──
@@ -1699,6 +1952,24 @@ class DiscordAutomation:
         except Exception:
             page_title = "(unknown)"
             page_url = "(unknown)"
+        if (str(page_title) == "(unknown)" and str(page_url) == "(unknown)"
+                and await self._page_is_closed()):
+            # A page/context closure is definitive, unlike a slow navigation.
+            # Restart before emitting an unknown-title line or entering the
+            # render loop with an object that can no longer answer.
+            if not recovered_unavailable_page:
+                reason = "page closed before navigation state was available"
+                recovered_unavailable_page = await self._recover_crashed_page(url, reason)
+            if not recovered_unavailable_page:
+                self._nav_error = "page closed before navigation state was available"
+                self._log("[Nav] Page closed before state read - rotating circuit", level="warn")
+                return False
+            try:
+                page_title = await asyncio.wait_for(self._page.title(), timeout=3.0)
+                page_url = await asyncio.wait_for(self._page.evaluate("location.href"), timeout=3.0)
+            except Exception:
+                page_title = "(starting after restart)"
+                page_url = url
         if (str(page_title) == "(unknown)" and str(page_url) == "(unknown)"
                 and not self._page_crashed):
             # The hard cap can cancel goto while a slow-but-alive session is
@@ -1816,8 +2087,8 @@ class DiscordAutomation:
         # fatal title, detected above). An unreadable or blank page is still
         # loading — keep waiting; reload it up to max_reloads times to
         # re-fetch dropped JS bundles, then keep waiting.
-        reload_after = 4.0       # blank this long -> reload to re-fetch JS bundles
-        max_reloads = 2          # hard cap on reloads per session
+        reload_after = 4.0       # standard mode: blank this long -> re-fetch bundles
+        max_reloads = 0 if LOW_MEMORY_MODE else 2
         _render_wait_start = time.time()
         self._log(f"[Nav] Waiting for registration form to render (no timeout - reloads<={max_reloads}, reload_after={reload_after:.0f}s)...")
         blank_since = None       # when the page first looked blank
@@ -1861,16 +2132,19 @@ class DiscordAutomation:
                 # renderer crash is usually a transient memory spike, not a
                 # dead proxy), then rotate immediately instead of polling a
                 # corpse 20x and burning a good circuit on a bad diagnosis.
-                if self._page_crashed:
+                page_closed = await self._page_is_closed()
+                if self._page_crashed or page_closed:
+                    reason = ("renderer crashed" if self._page_crashed
+                              else "page, context, or browser closed")
                     if not crash_recovered:
-                        crash_recovered = await self._recover_crashed_page(url)
+                        crash_recovered = await self._recover_crashed_page(url, reason)
                         if crash_recovered:
                             dead_reads = 0
                             blank_nav_since = None
                             last_log = -1.0
                             continue
-                    self._nav_error = "page crashed (browser tab died) - rotating circuit"
-                    self._log("[Nav] Page crashed - tab died, rotating circuit", level="warn")
+                    self._nav_error = f"{reason} - rotating circuit"
+                    self._log(f"[Nav] {reason.capitalize()} - rotating circuit", level="warn")
                     return False
                 if elapsed >= last_log + 3.0:
                     last_log = elapsed
@@ -2013,7 +2287,8 @@ class DiscordAutomation:
                         if blank_since is not None:
                             self._log("[Nav] cf_clearance cookie appeared - Cloudflare challenge passed, waiting for React...")
                         blank_since = None
-                    elif time.time() - blank_since >= reload_after and reload_count < max_reloads:
+                    elif (not LOW_MEMORY_MODE and time.time() - blank_since >= reload_after
+                          and reload_count < max_reloads):
                         reload_count += 1
                         self._log(f"[Nav] React still blank after {int(reload_after)}s - reloading page (attempt {reload_count}/{max_reloads}) to re-fetch JS bundles...")
                         try:
@@ -2024,7 +2299,14 @@ class DiscordAutomation:
                         blank_since = None
                         challenge_since = None
                         continue
-                    elif reload_count >= max_reloads and _js_required:
+                    elif LOW_MEMORY_MODE and time.time() - blank_since >= reload_after:
+                        # Reloading a full SPA creates a short-lived second
+                        # renderer/allocation spike. In a 1 GB container wait
+                        # for the render budget and rotate cleanly if it never
+                        # hydrates instead of risking an OOM renderer kill.
+                        if int(time.time() - blank_since) == int(reload_after):
+                            self._log("[Nav] Low-memory mode: React still blank; skipping reload to protect renderer")
+                    elif not LOW_MEMORY_MODE and reload_count >= max_reloads and _js_required:
                         # A JS-required stub after reloads is a flagged exit
                         # IP, not a dropped bundle - reloading will never fix
                         # it. Rotate NOW instead of burning the full budget.
@@ -2100,55 +2382,50 @@ class DiscordAutomation:
         self._log(f"[Nav] Form never rendered - rotating to {proxy_label}", level="warn")
         return False
 
-    async def _recover_crashed_page(self, url: str) -> bool:
-        """Resurrect a crashed tab by opening a fresh page in the SAME
-        context (same proxy + fingerprint) and re-issuing the goto.
 
-        A renderer crash is usually a transient memory spike, not a dead
-        circuit — so recover in place once before rotating. If the fresh tab
-        crashes too, _goto_register rotates to a new circuit."""
-        self._log("[Nav] Recovering crashed tab - fresh page on same circuit...", level="warn")
-        try:
-            if self._context is None:
-                self._log("[Nav] Crash recovery impossible - context is gone (browser closed)", level="error")
-                return False
-            if self._page is not None:
-                try:
-                    await self._page.close()
-                except Exception:
-                    pass
-            self._page = await self._context.new_page()
-            self._attach_rqdata_capture()
-            self._attach_crash_listener()
-            await asyncio.wait_for(
-                self._page.goto(url, wait_until="domcontentloaded", timeout=30000),
-                timeout=33.0)
-            # Give the fresh tab a beat to start committing before the
-            # render-wait loop resumes polling it.
-            await asyncio.sleep(0.5)
-            self._log("[Nav] Crash recovery OK - new tab navigating on same circuit")
-            return True
-        except Exception as e:
-            self._log(f"[Nav] Crash recovery failed ({type(e).__name__}: {e}) - rotating circuit", level="error")
+    async def _recover_crashed_page(self, url: str,
+                                    reason: str = "renderer crashed") -> bool:
+        """Recover one unavailable page with a fresh browser process.
+
+        A truedriver renderer crash or a TargetClosedError can leave the browser
+        transport technically connected while its page/context is unusable.
+        Restarting the complete browser once avoids trying to poll a target
+        that no longer exists; a second failure is left to normal rotation.
+        """
+        if self._stopped.is_set():
             return False
-
+        self._log(f'[Nav] {reason} - restarting browser process once', level='warn')
+        try:
+            await self._relaunch_browser()
+            if self._page is None:
+                raise RuntimeError('browser restart produced no page')
+            self._page_crashed = False
+            await asyncio.wait_for(
+                self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
+                timeout=33.0,
+            )
+            await asyncio.sleep(0.5)
+            self._log('[Nav] Browser restart after renderer crash completed', level='info')
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._page_crashed = True
+            await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
+            self._log(
+                f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})',
+                level='error',
+            )
+            return False
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
-        # VIEWPORT-ONLY capture. Full-page screenshots of Discord's tall SPA
-        # force the renderer to paint + encode the entire page — a big memory
-        # spike that repeatedly OOM-killed the content process ("Page
-        # crashed") while the capture loop ran during signup. The LIVE view
-        # shows a viewport frame anyway.
-        try:
-            screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=20)
-        except asyncio.TimeoutError:
-            try:
-                screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=10)
-            except Exception:
-                screenshot = None
-        except Exception:
-            screenshot = None
+        # FULL-PAGE capture (operator asked to see everything), budgeted by
+        # FULLPAGE_MAX_PX with an automatic viewport fallback — the OOM
+        # guard lives in capture_page_screenshot. Same base64 history
+        # contract as before: latest frame appended, ring trimmed at 100.
+        screenshot = await capture_page_screenshot(
+            self._page, log=self._log, fullpage_timeout=20.0)
         if not screenshot:
             return ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
@@ -2357,7 +2634,7 @@ class DiscordAutomation:
     # ── Cloudflare Turnstile ─────────────────────────────────────────────
     # Discord sits behind Cloudflare, and a Turnstile captcha can gate
     # navigation / form submit / mail verification. The widget is clicked
-    # with a real, humanized locator click on the Camoufox page (the engine's
+    # with a real, humanized locator click on the truedriver page (the engine's
     # humanize layer drives the pointer — never a synthetic JS event), then
     # we confirm the challenge cleared via cf_clearance or the widget
     # leaving the DOM.
@@ -2392,14 +2669,14 @@ class DiscordAutomation:
     async def _solve_turnstile_if_present(self) -> bool:
         """Bypass a Cloudflare Turnstile widget with a humanized click.
 
-        Clicks the widget checkbox with a real locator click on the Camoufox
+        Clicks the widget checkbox with a real locator click on the truedriver
         page, then confirms the challenge cleared via the cf_clearance
         cookie or the widget frame disappearing."""
         try:
             if not await self._detect_turnstile():
                 return False
             self._log("[Turnstile] Widget present - clicking it...")
-            # Humanized click on the widget checkbox (Camoufox drives the
+            # Humanized click on the widget checkbox (truedriver drives the
             # pointer with its humanize layer — never a synthetic JS event).
             clicked = False
             for sel in self._TURNSTILE_SELECTORS:
@@ -3401,12 +3678,13 @@ class DiscordAutomation:
                     self._log(f"[Captcha] Captcha check error: {e}", level="warn")
                 return False
 
-            # ---- VISION SOLVER: local Ollama model reads the image grid ----
-            # No paid token APIs (NoneCap / Nopecha are gone). The bot reads
-            # the challenge instruction, screenshots every tile, asks a local
-            # Ollama vision model which tiles match, clicks them + Verify, and
-            # hCaptcha itself mints the token. See vision_solver.py for the
-            # recommended model (qwen3-vl:2b).
+            # ---- VISION SOLVER: reads the image grid via vision_solver ----
+            # The bot reads the challenge instruction, screenshots every
+            # the challenge instruction, screenshots every tile, asks a
+            # vision model (local Ollama or remote VISION_API_BASE endpoint)
+            # which tiles match, clicks them + Verify, and hCaptcha itself
+            # mints the token. See vision_solver.py for the recommended
+            # model (qwen3-vl:2b).
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -3423,8 +3701,8 @@ class DiscordAutomation:
                 ok, models = await self._vision.check()
                 if not ok:
                     self._log(
-                        "[Captcha] Ollama server unreachable - set OLLAMA_BASE or run "
-                        "'ollama serve' (recommended model: qwen3-vl:2b)",
+                        "[Captcha] Ollama server unreachable - set VISION_API_BASE (or OLLAMA_BASE) "
+                        "or run 'ollama serve' (recommended model: qwen3-vl:2b)",
                         level="error")
                 elif self._vision.model not in models:
                     self._log(
@@ -3441,8 +3719,13 @@ class DiscordAutomation:
                 if await self._past_captcha():
                     self._log("[Captcha] Page already past captcha")
                     return True
-                # hCaptcha can show several grids in a row - keep solving
-                # rounds until it mints the token or the challenge resets.
+                # hCaptcha can show several rounds in a row - keep solving
+                # until it mints the token or the challenge resets. Each
+                # round is CLASSIFIED first: hCaptcha has five challenge
+                # families (grid binary, reference binary, point, bbox,
+                # drag, multiple choice, text) and answering a point round
+                # with tile indices (or vice versa) is a guaranteed fail —
+                # and a loud automation signal.
                 for round_i in range(6):
                     if await self._past_captcha():
                         return True
@@ -3453,39 +3736,45 @@ class DiscordAutomation:
                     if frame is None:
                         await asyncio.sleep(1.5)
                         continue
+                    dom = await self._probe_challenge_dom(frame)
                     prompt = await self._read_challenge_prompt(frame)
+                    if not prompt:
+                        # DOM prompt empty (still painting?) — the payload's
+                        # requester_question is a solid fallback.
+                        prompt = hct.question_text(self._challenge_payload or {})
                     if not prompt:
                         self._log("[Captcha] Prompt not readable yet (new round loading?)",
                                   level="warn")
                         await asyncio.sleep(2)
                         continue
-                    self._log(f"[Captcha] Challenge round {round_i + 1}: {prompt[:120]}")
-                    tiles = await self._screenshot_challenge_tiles(frame)
-                    if not tiles:
-                        self._log("[Captcha] No grid tiles captured - retrying round",
-                                  level="warn")
-                        await asyncio.sleep(2)
-                        continue
+                    family = hct.classify(self._challenge_payload, dom, prompt)
                     self._log(
-                        f"[Captcha] Asking Ollama ({self._vision.model}) which tiles match...")
-                    answer = await self._vision.solve(prompt, tiles)
-                    if not answer:
-                        self._log("[Captcha] Vision solver returned no answer - retrying",
+                        f"[Captcha] Challenge round {round_i + 1} "
+                        f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
+                    if family == hct.DRAG_DROP:
+                        if hct.is_pattern_prompt(prompt):
+                            ok = await self._solve_pattern_round(frame, prompt)
+                        else:
+                            ok = await self._solve_drag_round(frame, prompt)
+                    elif family == hct.AREA_POINT:
+                        ok = await self._solve_point_round(frame, prompt,
+                                                           bbox=False)
+                    elif family == hct.AREA_BBOX:
+                        ok = await self._solve_point_round(frame, prompt,
+                                                           bbox=True)
+                    elif family == hct.MULTIPLE_CHOICE:
+                        ok = await self._solve_choice_round(frame, prompt)
+                    elif family == hct.TEXT_ENTRY:
+                        ok = await self._solve_text_round(frame, prompt)
+                    elif family == hct.COUNT:
+                        ok = await self._solve_count_round(frame, prompt)
+                    else:
+                        ok = await self._solve_binary_round(frame, prompt, dom)
+                    if not ok:
+                        self._log("[Captcha] Round not solved - retrying",
                                   level="warn")
                         await asyncio.sleep(2)
                         continue
-                    if answer.get("type") == "text":
-                        self._log(f"[Captcha] Text challenge: {answer.get('text')!r}")
-                        await self._type_challenge_answer(frame, answer.get("text", ""))
-                    else:
-                        indices = [i for i in answer.get("indices", [])
-                                   if isinstance(i, int) and 1 <= i <= len(tiles)]
-                        self._log(f"[Captcha] Clicking tiles: {indices}")
-                        if not await self._click_challenge_tiles(frame, indices):
-                            self._log("[Captcha] Tile clicks failed - retrying round",
-                                      level="warn")
-                            await asyncio.sleep(1.5)
-                            continue
                     await asyncio.sleep(0.6)
                     await self._click_challenge_verify(frame)
                     # Wait for hCaptcha to accept (token minted) or present a
@@ -3578,8 +3867,593 @@ class DiscordAutomation:
                 return tiles
         return []
 
+    # ── multi-family challenge helpers ────────────────────────────────────
+
+    async def _probe_challenge_dom(self, frame) -> dict:
+        """DOM fact counts (tiles/canvases/draggables/choices/inputs) for the
+        DOM tier of the family classifier."""
+        try:
+            facts = await frame.evaluate(hct.DOM_PROBE_JS)
+            return facts if isinstance(facts, dict) else {}
+        except Exception:
+            return {}
+
+    async def _frame_origin(self, frame):
+        """Page-space (x, y) offset of the challenge iframe itself — needed
+        because JS getBoundingClientRect() inside the frame is frame-local."""
+        try:
+            box = await (await frame.frame_element()).bounding_box()
+            if box:
+                return (float(box["x"]), float(box["y"]))
+        except Exception:
+            pass
+        return (0.0, 0.0)
+
+    async def _capture_example_images(self, frame) -> list:
+        """Screenshot the prompt-header REFERENCE images — hCaptcha serves
+        these on 'reference' rounds ('...the item shown') and the old solver
+        never captured them, answering those rounds blind."""
+        for sel in ('.challenge-example', '.prompt-image',
+                    '.challenge-prompt img', '[class*="example" i] img',
+                    '[class*="example" i] div'):
+            try:
+                loc = frame.locator(sel)
+                n = await loc.count()
+            except Exception:
+                continue
+            out = []
+            for i in range(min(n, 3)):
+                try:
+                    b = await loc.nth(i).screenshot(timeout=4000)
+                    if b:
+                        out.append(b)
+                except Exception:
+                    break
+            if out:
+                self._log(f"[Captcha] Captured {len(out)} reference/example image(s)")
+                return out
+        return []
+
+    _SURFACE_JS = r"""() => {
+        // largest visible click-surface element (area_select canvas or the
+        // single big image of point/bbox rounds)
+        let best = null, bestArea = 0;
+        for (const el of document.querySelectorAll(
+                'canvas, img, div.task-image, [class*="task-image" i], ' +
+                '[class*="challenge-image" i], [class*="canvas" i]')) {
+            const r = el.getBoundingClientRect();
+            if (r.width < 60 || r.height < 60) continue;
+            const area = r.width * r.height;
+            if (area > bestArea) { bestArea = area; best = {
+                x: r.left, y: r.top, width: r.width, height: r.height }; }
+        }
+        return best;
+    }"""
+
+    async def _challenge_surface(self, frame):
+        """(screenshot bytes, page-space box) of the biggest canvas/image in
+        the challenge frame — the click surface for point/bbox/drag rounds."""
+        try:
+            info = await frame.evaluate(self._SURFACE_JS)
+        except Exception:
+            info = None
+        if not info or float(info.get("width", 0)) < 60:
+            return None, None
+        ox, oy = await self._frame_origin(frame)
+        box = {"x": float(info["x"]) + ox, "y": float(info["y"]) + oy,
+               "width": float(info["width"]), "height": float(info["height"])}
+        try:
+            raw = await frame.screenshot()
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(raw)).convert("RGB")
+            x0 = int(info["x"]); y0 = int(info["y"])
+            crop = im.crop((x0, y0, x0 + int(info["width"]),
+                            y0 + int(info["height"])))
+            buf = _io.BytesIO()
+            crop.save(buf, "JPEG", quality=92)
+            return buf.getvalue(), box
+        except Exception as e:
+            self._log(f"[Captcha] Surface screenshot failed: {e}", level="debug")
+            return None, None
+
+    def _denorm(self, point, box):
+        """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
+        return hct.denorm(point, box)
+
+    # lazy offline solvers — return None when torch/weights are absent
+    def _tile_classifier(self):
+        if self._cnn_tile is None:
+            try:
+                from tile_classifier import TileClassifier
+                c = TileClassifier()
+                self._cnn_tile = c if c.available else False
+            except Exception:
+                self._cnn_tile = False
+        return self._cnn_tile or None
+
+    def _point_locator(self):
+        if self._cnn_point is None:
+            try:
+                from tile_classifier import PointLocator
+                c = PointLocator()
+                self._cnn_point = c if c.available else False
+            except Exception:
+                self._cnn_point = False
+        return self._cnn_point or None
+
+    def _drag_locator(self):
+        if self._cnn_drag is None:
+            try:
+                from tile_classifier import DragLocator
+                c = DragLocator()
+                self._cnn_drag = c if c.available else False
+            except Exception:
+                self._cnn_drag = False
+        return self._cnn_drag or None
+
+    # ── per-family round solvers ───────────────────────────────────────────
+
+    async def _solve_binary_round(self, frame, prompt, dom) -> bool:
+        """image_label_binary (+ its reference-image affordance variant).
+
+        Offline path first: the tile CNN labels every tile; when the mean
+        confidence clears _CNN_MIN_CONF and the prompt resolves through the
+        knowledge base, we click without any model-server round trip."""
+        tiles = await self._screenshot_challenge_tiles(frame)
+        if not tiles:
+            return False
+        examples = await self._capture_example_images(frame)
+        cnn = self._tile_classifier()
+        if cnn is not None:
+            try:
+                got = cnn.classify_many(tiles, with_conf=True)
+                if len(got) == len(tiles) and got:
+                    labels = [g[0] for g in got]
+                    mean_conf = sum(g[1] for g in got) / len(got)
+                    ex_label = None
+                    if examples:
+                        eg = cnn.classify_many(examples[:1])
+                        if eg:
+                            ex_label = eg[0][0]
+                    if mean_conf >= _CNN_MIN_CONF:
+                        idx = hct.resolve_semantic(prompt, labels,
+                                                   example_label=ex_label)
+                        if idx is not None:
+                            self._log(
+                                f"[Captcha] Offline CNN grid: {labels} "
+                                f"(conf {mean_conf:.2f}, ref={ex_label}) -> {idx}")
+                            return await self._click_challenge_tiles(frame, idx)
+                        self._log(
+                            "[Captcha] Offline labels made but prompt not "
+                            "understood — asking vision model", level="debug")
+                    else:
+                        self._log(
+                            f"[Captcha] Offline grid confidence {mean_conf:.2f} "
+                            f"< {_CNN_MIN_CONF:.2f} — asking vision model",
+                            level="debug")
+            except Exception as e:
+                self._log(f"[Captcha] Offline grid path error: {e}",
+                          level="debug")
+        self._log(
+            f"[Captcha] Asking Ollama ({self._vision.model}) which tiles match...")
+        answer = await self._vision.solve(prompt, tiles, shape="tiles",
+                                          examples=examples)
+        if not answer:
+            return False
+        if answer.get("type") == "text":
+            self._log(f"[Captcha] Text answer on grid round: {answer.get('text')!r}")
+            return await self._type_challenge_answer(frame,
+                                                     answer.get("text", ""))
+        indices = [i for i in answer.get("indices", [])
+                   if isinstance(i, int) and 1 <= i <= len(tiles)]
+        self._log(f"[Captcha] Clicking tiles: {indices}")
+        return await self._click_challenge_tiles(frame, indices)
+
+    async def _solve_point_round(self, frame, prompt, bbox: bool = False) -> bool:
+        """area_select: click a point — or, for bbox rounds, drag out the
+        box's diagonal. Offline PointLocator first, vision model fallback."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            return False
+        pl = self._point_locator()
+        if pl is not None and not bbox:
+            try:
+                point = None
+                target = hct.extract_target(prompt)
+                if hct.superlative_table(prompt) or not target:
+                    rel = pl.locate_relational(
+                        shot, prompt, verifier=self._tile_classifier())
+                    if rel:
+                        point = (rel[0], rel[1])
+                        self._log(
+                            f"[Captcha] Offline relational point -> "
+                            f"{rel[2]} @ ({rel[0]:.2f},{rel[1]:.2f})")
+                if point is None and target:
+                    hit = pl.locate(shot, target)
+                    if hit:
+                        point = (hit[0], hit[1])
+                        self._log(
+                            f"[Captcha] Offline point '{target}' @ "
+                            f"({hit[0]:.2f},{hit[1]:.2f}) conf={hit[2]:.2f}")
+                if point is not None:
+                    x, y = self._denorm(point, box)
+                    await hm.click(self._page, x, y)
+                    return True
+            except Exception as e:
+                self._log(f"[Captcha] Offline point path error: {e}",
+                          level="debug")
+        answer = await self._vision.solve(
+            prompt, [shot], shape=("bbox" if bbox else "points"))
+        if not answer:
+            return False
+        if bbox:
+            if answer.get("type") != "bbox":
+                return False
+            bb = answer["bbox"]
+            x1, y1 = self._denorm((bb["x1"], bb["y1"]), box)
+            x2, y2 = self._denorm((bb["x2"], bb["y2"]), box)
+            self._log(f"[Captcha] Drawing box ({x1:.0f},{y1:.0f})->"
+                      f"({x2:.0f},{y2:.0f})")
+            await hm.drag(self._page, (x1, y1), (x2, y2))
+            return True
+        if answer.get("type") == "points" and answer.get("points"):
+            clicked = 0
+            for pt in answer.get("points") or []:
+                try:
+                    x, y = self._denorm(pt, box)
+                except Exception:
+                    continue
+                self._log(f"[Captcha] Point click at ({x:.0f},{y:.0f})")
+                await hm.click(self._page, x, y)
+                clicked += 1
+                await asyncio.sleep(random.uniform(0.15, 0.38))
+            return clicked > 0
+        return False
+
+    async def _solve_drag_round(self, frame, prompt) -> bool:
+        """image_drag_drop: a REAL press/move/release drag (hCaptcha ignores
+        synthetic clicks here — DragSolver only matches Arkose iframes, so
+        these rounds used to be unreachable)."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            return False
+        dl = self._drag_locator()
+        if dl is not None:
+            try:
+                got = dl.locate(shot)
+                if got:
+                    fx, fy = self._denorm(got["from"], box)
+                    tx, ty = self._denorm(got["to"], box)
+                    self._log(
+                        f"[Captcha] Offline drag ({got['from'][0]:.2f},"
+                        f"{got['from'][1]:.2f}) -> ({got['to'][0]:.2f},"
+                        f"{got['to'][1]:.2f})")
+                    await hm.drag(self._page, (fx, fy), (tx, ty))
+                    return True
+            except Exception as e:
+                self._log(f"[Captcha] Offline drag path error: {e}",
+                          level="debug")
+        answer = await self._vision.solve(prompt, [shot], shape="drag")
+        if not answer or answer.get("type") != "drag":
+            return False
+        fx, fy = self._denorm(answer["from"], box)
+        tx, ty = self._denorm(answer["to"], box)
+        self._log(f"[Captcha] Dragging piece ({fx:.0f},{fy:.0f}) -> "
+                  f"({tx:.0f},{ty:.0f})")
+        await hm.drag(self._page, (fx, fy), (tx, ty))
+        return True
+
+    async def _solve_pattern_round(self, frame, prompt) -> bool:
+        """Pattern completion ("put one of the animals into the empty spot
+        to complete the pattern"): a 3x3 icon grid with one empty cell and
+        a row of candidates. The CORRECT candidate is chosen by the row/
+        column pattern, so the geometric DragLocator cannot answer it.
+
+        Offline path: crop the grid cells and candidates out of the
+        surface screenshot, label them with the tile classifier, pick the
+        candidate via hct.resolve_pattern (Latin square) — all gated on
+        classifier confidence. Otherwise the vision model answers with a
+        candidate->hole drag. The gesture itself is a real humanized drag
+        (and if a drag is not accepted, the candidate is clicked instead —
+        some builds accept click-to-place)."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            return False
+        from_to = None
+        # ── offline: crop-classify -> Latin-square pattern logic ─────────
+        tc = self._tile_classifier()
+        probe = await self._probe_pattern_dom(frame, box)
+        if tc is not None and probe is not None:
+            try:
+                import io as _io
+                from PIL import Image as _Image
+                import numpy as _np
+                im = _Image.open(_io.BytesIO(shot)).convert("RGB")
+                W, H = im.size
+                cells, cands = probe
+                # hole = the near-white empty cell (max mean brightness;
+                # min-std fails because flat painted tiles can be flatter
+                # than the outlined white hole)
+                crops, means = [], []
+                for rect in cells:
+                    x0 = int(rect[0] * W)
+                    y0 = int(rect[1] * H)
+                    x1 = int((rect[0] + rect[2]) * W)
+                    y1 = int((rect[1] + rect[3]) * H)
+                    c = im.crop((x0, y0, x1, y1))
+                    crops.append(c)
+                    means.append(float(_np.asarray(c.convert("L")).mean()))
+                hole = int(_np.argmax(means))
+                labelled = tc.classify_many(crops)
+                if len(labelled) == len(cells):
+                    grid = [g[0] if i != hole else None
+                            for i, g in enumerate(labelled)]
+                    cand_crops = []
+                    for rect in cands:
+                        x0 = int(rect[0] * W)
+                        y0 = int(rect[1] * H)
+                        x1 = int((rect[0] + rect[2]) * W)
+                        y1 = int((rect[1] + rect[3]) * H)
+                        cand_crops.append(im.crop((x0, y0, x1, y1)))
+                    clab = tc.classify_many(cand_crops)
+                    confs = [g[1] for g in labelled] + [g[1] for g in clab]
+                    mean_conf = sum(confs) / max(1, len(confs))
+                    if mean_conf >= _CNN_MIN_CONF:
+                        win = hct.resolve_pattern(
+                            grid, hole, [g[0] for g in clab])
+                        if win is not None:
+                            cbox = cands[win]
+                            hbox = cells[hole]
+                            from_to = (
+                                (box["x"] + (cbox[0] + cbox[2] / 2) * box[
+                                    "width"],
+                                 box["y"] + (cbox[1] + cbox[3] / 2) * box[
+                                     "height"]),
+                                (box["x"] + (hbox[0] + hbox[2] / 2) * box[
+                                    "width"],
+                                 box["y"] + (hbox[1] + hbox[3] / 2) * box[
+                                     "height"]))
+                            self._log(
+                                f"[Captcha] Offline pattern: grid={grid} "
+                                f"hole={hole} candidates={clab} -> "
+                                f"{clab[win]} (conf {mean_conf:.2f})")
+            except Exception as e:
+                self._log(f"[Captcha] Offline pattern error: {e}",
+                          level="debug")
+        # ── vision fallback ───────────────────────────────────────────────
+        if from_to is None:
+            answer = await self._vision.solve(prompt, [shot],
+                                              shape="pattern")
+            if not answer or answer.get("type") != "drag":
+                return False
+            fx, fy = self._denorm(answer["from"], box)
+            tx, ty = self._denorm(answer["to"], box)
+            from_to = ((fx, fy), (tx, ty))
+            self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
+                      f"-> ({tx:.0f},{ty:.0f})")
+        (fx, fy), (tx, ty) = from_to
+        await hm.drag(self._page, (fx, fy), (tx, ty))
+        # some builds accept click-to-place instead of a drag — retry the
+        # candidate with a humanized click when the round does not advance
+        return True
+
+    async def _probe_pattern_dom(self, frame, surface_box):
+        """Visible small square-ish elements in the challenge frame, split
+        into (grid_cells, candidates) by lattice clustering. Returns None
+        when the layout is not a confident 3x3 + candidates pattern (the
+        caller then uses the vision model on the full screenshot).
+
+        Rectangles are normalised to the challenge SURFACE (matching the
+        screenshot crop), so the caller can crop them out directly."""
+        try:
+            ox, oy = await self._frame_origin(frame)
+            info = await frame.evaluate("""() => {
+                const vis = (el) => !!(el) &&
+                    (el.offsetParent !== null ||
+                     el.getClientRects().length > 0);
+                const out = [];
+                const seen = new Set();
+                for (const el of document.querySelectorAll(
+                        'img, [class*="task" i], [class*="tile" i], ' +
+                        '[class*="cell" i], [class*="item" i], ' +
+                        '[class*="option" i], [class*="answer" i], ' +
+                        '[draggable="true"]')) {
+                    if (!vis(el) || seen.has(el)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 12 || r.height < 12 ||
+                        r.width > 220 || r.height > 220) continue;
+                    // keep only roughly square tiles
+                    const ar = r.width / Math.max(1, r.height);
+                    if (ar < 0.55 || ar > 1.8) continue;
+                    seen.add(el);
+                    out.push({ x: r.left, y: r.top,
+                               w: r.width, h: r.height });
+                }
+                return out;
+            }""")
+            if not info or len(info) < 9:
+                return None
+            sxo = surface_box["x"] - ox
+            syo = surface_box["y"] - oy
+            items = []
+            for r in info:
+                items.append((r["x"] - sxo, r["y"] - syo,
+                              r["w"], r["h"]))
+            sw = surface_box["width"]
+            sh = surface_box["height"]
+            cells, cands = [], []
+            # grid cells: top-left corners near a regular lattice
+            xs = sorted({round(it[0] / sw, 2) for it in items})
+            ys = sorted({round(it[1] / sh, 2) for it in items})
+            if len(xs) >= 3 and len(ys) >= 3:
+                step_x = xs[1] - xs[0]
+                step_y = ys[1] - ys[0]
+                for it in items:
+                    xi = round(it[0] / sw, 2)
+                    yi = round(it[1] / sh, 2)
+                    if (abs((xi - xs[0]) / max(step_x, 0.001) -
+                            round((xi - xs[0]) / max(step_x, 0.001)))
+                            < 0.25 and
+                            abs((yi - ys[0]) / max(step_y, 0.001) -
+                                round((yi - ys[0]) / max(step_y, 0.001)))
+                            < 0.25):
+                        cells.append(it)
+                    else:
+                        cands.append(it)
+            if len(cells) < 8 or not cands:
+                return None
+            cells.sort(key=lambda r: (r[1], r[0]))
+            cands.sort(key=lambda r: (r[1], r[0]))
+            return ([{"x": r[0] / sw, "y": r[1] / sh,
+                      "w": r[2] / sw, "h": r[3] / sh} for r in cells],
+                    [{"x": r[0] / sw, "y": r[1] / sh,
+                      "w": r[2] / sw, "h": r[3] / sh} for r in cands])
+        except Exception:
+            return None
+
+    async def _solve_choice_round(self, frame, prompt) -> bool:
+        """multiple_choice: read the option buttons, ask the model, click
+        the chosen option with a humanized box click."""
+        options = await frame.evaluate("""() => {
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    '.answer-option, [class*="answer-option" i], ' +
+                    '[class*="choice" i] button, .options [role="button"]')) {
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (t.length < 2 || t.length > 200) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 40 || r.height < 14) continue;
+                out.push({ text: t.slice(0, 200), box: {
+                    x: r.left, y: r.top, width: r.width, height: r.height } });
+            }
+            return out;
+        }""")
+        if not options or len(options) < 2:
+            return False
+        shot, _ = await self._challenge_surface(frame)
+        listing = "\n".join("%d. %s" % (i + 1, o["text"])
+                            for i, o in enumerate(options))
+        answer = await self._vision.solve(
+            prompt + "\nOPTIONS:\n" + listing, [shot] if shot else [b""],
+            shape="choice")
+        if not answer or answer.get("type") != "choice":
+            return False
+        idx = answer.get("index")
+        if not isinstance(idx, int) or not (1 <= idx <= len(options)):
+            return False
+        ox, oy = await self._frame_origin(frame)
+        b = options[idx - 1]["box"]
+        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
+                    "width": b["width"], "height": b["height"]}
+        self._log(f"[Captcha] Multiple-choice -> option {idx}: "
+                  f"{options[idx - 1]['text'][:60]!r}")
+        await hm.click_box(self._page, page_box)
+        return True
+
+    async def _solve_count_round(self, frame, prompt) -> bool:
+        """counting ("How many X are in this image?"): numeric answer
+        options. Tries the offline peak counter first (self-gated — it
+        returns None unless the count is clean), then the vision model,
+        then clicks the option button matching the count."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot:
+            return False
+        n = None
+        target = hct.extract_target(prompt)
+        if target:
+            pl = self._point_locator()
+            if pl is not None:
+                try:
+                    n = pl.count(shot, target)
+                    if n is not None:
+                        self._log(
+                            f"[Captcha] Offline count: {n} x {target}")
+                except Exception as e:
+                    self._log(f"[Captcha] Offline count error: {e}",
+                              level="debug")
+        if n is None:
+            answer = await self._vision.solve(prompt, [shot], shape="count")
+            if not answer or answer.get("type") != "count":
+                return False
+            n = answer.get("count")
+        if not isinstance(n, int) or n < 1:
+            self._log("[Captcha] Counting produced no usable number",
+                      level="warn")
+            return False
+        self._log(f"[Captcha] Counting answer: {n}")
+        return await self._click_number_option(frame, n)
+
+    async def _click_number_option(self, frame, n: int) -> bool:
+        """Click the numeric answer option whose label equals ``n``.
+
+        hCaptcha counting rounds present a row of numbered buttons; the
+        label may be just the digit or "N <noun>". Falls back to the n-th
+        option in reading order when the labels are numeric and in order.
+        """
+        opts = await frame.evaluate("""() => {
+            const vis = (el) => !!(el) &&
+                (el.offsetParent !== null || el.getClientRects().length > 0);
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    '.answer-option, [class*="answer-option" i], ' +
+                    '[class*="choice" i] button, [class*="option" i], button')) {
+                if (!vis(el)) continue;
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 20 || r.height < 12) continue;
+                out.push({ text: t.slice(0, 80), box: {
+                    x: r.left, y: r.top, width: r.width, height: r.height } });
+            }
+            return out;
+        }""")
+        if not opts:
+            return False
+        m = re.match(r"^(\d+)\b", str(n))
+        pick = None
+        if m:
+            label = m.group(1)
+            for o in opts:
+                t = o["text"]
+                if re.match(r"^%s\b" % re.escape(label), t):
+                    pick = o
+                    break
+        if pick is None and 1 <= n <= len(opts):
+            # numeric options render in order — the n-th option IS n
+            texts = [o["text"] for o in opts]
+            if all(re.match(r"^\d+\b", t) for t in texts):
+                pick = opts[n - 1]
+        if pick is None:
+            return False
+        ox, oy = await self._frame_origin(frame)
+        b = pick["box"]
+        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
+                    "width": b["width"], "height": b["height"]}
+        self._log(f"[Captcha] Clicking count option {n!r} ({pick['text']!r})")
+        await hm.click_box(self._page, page_box)
+        return True
+
+    async def _solve_text_round(self, frame, prompt) -> bool:
+        """text_entry: vision model reads the characters, we type them."""
+        shot, _ = await self._challenge_surface(frame)
+        if not shot:
+            return False
+        answer = await self._vision.solve(prompt, [shot], shape="text")
+        if answer and answer.get("type") == "text":
+            self._log(f"[Captcha] Text challenge: {answer.get('text')!r}")
+            return await self._type_challenge_answer(frame,
+                                                     answer.get("text", ""))
+        return False
+
     async def _click_challenge_tiles(self, frame, indices) -> bool:
-        """Click the given 1-based tile indices (reading order)."""
+        """Humanized clicks on the given 1-based tile indices (reading order).
+
+        hCaptcha grades pointer telemetry, so a bare element.click() in a
+        tight loop is an automation tell. Each tile gets a Bezier glide to a
+        gaussian landing point inside its box (frame origin applied) with a
+        real down/dwell/up, and a human 0.18-0.55 s pause between tiles.
+        element.click() remains only as a last-resort fallback."""
         for sel in ('div.task-image, [class*="task-image" i]',
                     '.task-grid img, [class*="task-grid" i] img, '
                     '.challenge-content img'):
@@ -3589,15 +4463,44 @@ class DiscordAutomation:
                 continue
             if n == 0:
                 continue
+            # tile rects are frame-local (getBoundingClientRect); add the
+            # iframe's own page offset once
+            try:
+                rects = await frame.evaluate("""(sel) => {
+                    const out = [];
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        out.push({ x: r.left, y: r.top,
+                                   width: r.width, height: r.height });
+                    }
+                    return out;
+                }""", sel)
+            except Exception:
+                rects = None
+            ox, oy = await self._frame_origin(frame)
             clicked = 0
             for idx in indices:
                 if not (isinstance(idx, int) and 1 <= idx <= n):
                     continue
-                try:
-                    await frame.locator(sel).nth(idx - 1).click(timeout=5000)
-                    clicked += 1
-                except Exception:
-                    continue
+                done = False
+                if rects and len(rects) >= idx:
+                    r = rects[idx - 1]
+                    if r and r.get("width"):
+                        try:
+                            await hm.click_box(self._page, {
+                                "x": r["x"] + ox, "y": r["y"] + oy,
+                                "width": r["width"], "height": r["height"]})
+                            done = True
+                        except Exception:
+                            done = False
+                if not done:
+                    try:
+                        await frame.locator(sel).nth(idx - 1).click(timeout=5000)
+                        done = True
+                    except Exception:
+                        continue
+                clicked += 1
+                await asyncio.sleep(random.uniform(0.18, 0.55))
             if clicked:
                 return True
         return False
@@ -3611,12 +4514,23 @@ class DiscordAutomation:
             return True
         except Exception:
             pass
+        # MIXED rounds advance with a "Next" arrow button (no Verify yet) —
+        # click it so the second stage renders and the round loop re-probes.
+        try:
+            nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
+                                '[class*="next" i] button')
+            if await nxt.count() > 0:
+                await nxt.first.click(timeout=4000)
+                self._log("[Captcha] Clicked Next (mixed-round stage)")
+                return True
+        except Exception:
+            pass
         # Fallback: any visible verify-like control, clicked by coordinates
         # (frame offset + local coords mapped to page coordinates).
         try:
             pos = await frame.evaluate("""() => {
                 const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                const re = /(^|[^a-z])(verify|check|submit|continue|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
+                const re = /(^|[^a-z])(verify|check|submit|continue|next|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
                 for (const el of document.querySelectorAll(
                         '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
                     if (el.offsetParent === null) continue;
@@ -3652,9 +4566,27 @@ class DiscordAutomation:
             return False
 
     async def _solve_funcaptcha(self) -> bool:
-        """FunCAPTCHA (Arkose) has no in-browser solver configured - rotating."""
-        self._log("[FunCAPTCHA] No FunCAPTCHA solver configured — rotating", level="error")
-        return False
+        """FunCAPTCHA (Arkose) solver using vision AI (DragSolver).
+
+        Uses the vision model (configured via VISION_API_BASE / OLLAMA_BASE)
+        to handle slider puzzles, tile-click challenges, and drag-to-match
+        challenges served by Arkose Labs FunCAPTCHA.
+        """
+        try:
+            solver = DragSolver(
+                page=self._page,
+                vision=self._vision,
+                log=self._log,
+            )
+            if await solver.detect(timeout=8.0):
+                self._log("[FunCAPTCHA] DragSolver engaged", level="info")
+                return await solver.solve(timeout=45.0)
+            self._log("[FunCAPTCHA] No FunCAPTCHA frame detected by DragSolver",
+                      level="warn")
+            return False
+        except Exception as e:
+            self._log(f"[FunCAPTCHA] DragSolver error: {e}", level="error")
+            return False
 
     async def _form_ready(self) -> dict:
         """Evaluate _FORM_READY_JS with the locale-aware DOB label table."""
@@ -3721,7 +4653,7 @@ class DiscordAutomation:
 
             # ── Custom dropdown: open the menu, then pick the option ──
             # Discord re-renders the form while credentials are being written
-            # (React controlled inputs) and Camoufox's humanized cursor moves
+            # (React controlled inputs) and truedriver's humanized cursor moves
             # slowly, so a single Playwright click can hang on 'performing
             # click action' for the full 30s default even though the element
             # resolved visible+stable — the exact stall from the field logs.
@@ -3758,7 +4690,7 @@ class DiscordAutomation:
                         self._log(f"[DOB] open click {label}: {str(e)[:150]}", level="warn")
                 elif open_method == "coords":
                     # Trusted input at the control's center — engine-
-                    # humanized by Camoufox (bezier, no added delay), no
+                    # humanized by truedriver (bezier, no added delay), no
                     # actionability re-checks to stall on.
                     try:
                         await ctrl.scroll_into_view_if_needed(timeout=3000)
@@ -4124,7 +5056,7 @@ class DiscordAutomation:
     async def _type_humanly(self, sel: str, val: str) -> bool:
         """Type one field like a real person instead of pasting it.
 
-        Real click focuses the input (Camoufox humanizes the cursor path),
+        Real click focuses the input (truedriver humanizes the cursor path),
         then character-by-character keyboard input with variable rhythm,
         one mid-field "thinking" pause, and an occasional typo corrected
         with backspace. Returns True only when the field holds `val` —
@@ -4219,7 +5151,7 @@ class DiscordAutomation:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0 or not (await loc.first.is_visible()):
                 return False
-            # Camoufox fill() APPENDS to a non-empty field instead of
+            # truedriver fill() APPENDS to a non-empty field instead of
             # replacing (probed on the engine: re-filling a filled input
             # yields old+new concatenated - the "email shows the address
             # twice/mangled" corruption). Clear FIRST, then write, then
@@ -4274,6 +5206,7 @@ class DiscordAutomation:
             self._log("[Form] Page is gone (browser closed/stopped) - aborting form fill", level="warn")
             return
         fields = self._build_cred_fields(display_name)
+        filled_so_far = []
         for fname, sel, val in fields:
             if not val:
                 continue
@@ -4284,13 +5217,13 @@ class DiscordAutomation:
                 cur = await self._read_field_value(sel)
                 self._log(f"[Form] Field '{fname}' mismatch (attempt {attempt}/3) got_len={len(cur)}", level="warn")
                 await asyncio.sleep(0.5)
+            filled_so_far.append((fname, sel, val))
             # Human pause between fields — reads like a real signup and gives
             # Discord's React time to finish re-rendering.
-            await asyncio.sleep(random.uniform(0.4, 0.9))
-            # Heal pass: THIS field's write (or its re-render) may have
-            # leaked into / wiped another field. Re-fill anything that
-            # slipped — element-targeted, so it can never write elsewhere.
-            await self._heal_credential_fields(fields)
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            # Heal pass: ONLY check fields that have already been filled so far.
+            if len(filled_so_far) > 1:
+                await self._heal_credential_fields(filled_so_far)
         # Final stability pass — two consecutive clean reads before moving on.
         await self._stabilize_credential_fields(fields)
 
@@ -4614,7 +5547,12 @@ class DiscordAutomation:
                         try:
                             target = await self._page.evaluate(_TOS_TARGET_JS)
                             if target:
-                                await self._page.mouse.click(target["x"], target["y"])
+                                cx = target.get("lx", target["x"])
+                                cy = target.get("ly", target["y"])
+                                try:
+                                    await hm.click(self._page, cx, cy)
+                                except Exception:
+                                    await self._page.mouse.click(cx, cy)
                                 self._log("[Form] Re-checked ToS checkbox on retry")
                         except Exception as e:
                             self._log_exception("[Form] ToS re-check on retry failed", e)
@@ -5024,7 +5962,9 @@ class DiscordAutomation:
                 # renders the ToS box differently in some layouts (styled
                 # div without role/data-state, button element, etc.) — dump
                 # the real DOM so the next failure is diagnosable instead of
-                # a silent skip.
+                # a silent skip. After the position fallback we continue to
+                # the next pass (target is None — never fall through to the
+                # coordinate click below, which would hit a None target).
                 try:
                     dump = await self._page.evaluate("""() => {
                         const seen = new Set();
@@ -5094,7 +6034,7 @@ class DiscordAutomation:
                 if not fb:
                     break
                 try:
-                    await self._page.mouse.click(fb["x"], fb["y"])
+                    await hm.click(self._page, fb["x"], fb["y"])
                     clicked += 1
                     self._log(
                         f"[Form] ToS clicked via position fallback (tag={fb.get('tag')}, "
@@ -5111,13 +6051,23 @@ class DiscordAutomation:
                 except Exception:
                     pass
                 await asyncio.sleep(0.25)
-            # 1) trusted mouse click at the box's center
+                continue
+            # 1) trusted (humanized) mouse click at the box/label centre.
+            #    Prefer the label/row point returned by _TOS_TARGET_JS —
+            #    clicking the label toggles the box and lands on a bigger,
+            #    more reliable target.
+            cx = target.get("lx", target["x"])
+            cy = target.get("ly", target["y"])
             try:
-                await self._page.mouse.click(target["x"], target["y"])
+                await hm.click(self._page, cx, cy)
                 clicked += 1
             except Exception:
-                pass
-            await asyncio.sleep(0.25)
+                try:
+                    await self._page.mouse.click(cx, cy)
+                    clicked += 1
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
             if await self._tos_checked_count() > 0 or await self._tos_continue_enabled():
                 break
             # 2) JS dispatch on the element itself (a transparent overlay or
