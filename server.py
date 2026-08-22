@@ -498,14 +498,13 @@ async () => {
     const optionMatches = (text, value) => {
         const t = low(text || ''); const v = low(value || '');
         if (!t && !v) return false;
-        if (t === wantStr) return true;
+        if (t === wantStr || v === wantStr) return true;
         if (MONTH_ALIASES[t] && MONTH_ALIASES[t] === wantNum) return true;
         if (!wantNum) return false;
         const n = String(wantNum);
         const p = n.length === 1 ? '0' + n : n;
-        const z = wantNum > 1 ? String(wantNum - 1) : '0';
-        const zp = z.length === 1 ? '0' + z : z;
-        return t === n || v === n || t === p || v === p || t === z || v === z || t === zp || v === zp;
+        const toks = t.split(/[^a-z0-9]+/).filter(Boolean);
+        return t === n || v === n || t === p || v === p || toks.indexOf(n) !== -1 || toks.indexOf(p) !== -1;
     };
     const labelHits = (el) => {
         const cls = (typeof el.className === 'string') ? el.className : '';
@@ -617,7 +616,7 @@ _DOB_LABEL_ALIASES = {
         "gün", "nap", "zi", "hari", "ngày", "일", "日", "يوم", "दिन", "วัน",
     ],
     "Year": [
-        "year", "jaar", "an", "année", "annee", "jahr", "año", "ano",
+        "year", "jaar", "année", "annee", "jahr", "año", "ano",
         "anno", "rok", "år", "год", "рік", "година", "vuosi", "aasta",
         "gads", "metai", "έτος", "yıl", "év", "tahun", "năm", "년", "年",
         "سنة", "साल", "ปี",
@@ -748,6 +747,7 @@ _DOB_VALUE_JS = r"""([label, aliases]) => {
 }"""
 
 _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
+    try { document.querySelectorAll('[data-dob-target="' + label + '"]').forEach(e => e.removeAttribute('data-dob-target')); } catch(e) {}
     const norm = (s) => (s == null ? '' : String(s)).replace(/\s+/g, ' ').trim();
     const low = (s) => norm(s).toLowerCase();
     const labels = (aliases && aliases[label]) || [label.toLowerCase()];
@@ -834,7 +834,7 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
 }"""
 
 # Options of an open DOB menu (custom dropdowns and native <select>).
-_DOB_OPTION_SEL = '[role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
+_DOB_OPTION_SEL = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
 
 # Find the index (within _DOB_OPTION_SEL) of the option that represents
 # `optionText` in the page's locale. Months resolve to their numeric index so
@@ -847,16 +847,20 @@ _DOB_OPTION_INDEX_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
     const sel = __OPT_SEL__;
     const opts = Array.from(document.querySelectorAll(sel));
@@ -883,27 +887,31 @@ _DOB_OPTION_POS_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
-    const all = document.querySelectorAll('[role="option"], [role="menuitem"], li, div, span');
+    const sel = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], [role="menuitem"], li';
+    const all = document.querySelectorAll(sel);
     for (const el of all) {
-        if (!el.offsetParent) continue;
-        el.scrollIntoView({ block: 'nearest' });
-        const r = el.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
-        if (!t) continue;
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            const r = el.getBoundingClientRect();
+            if (r.width < 3 || r.height < 3) continue;
             return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t.slice(0, 30) };
         }
     }
@@ -920,27 +928,29 @@ _DOB_OPTION_DISPATCH_JS = r"""([optionText, monthAliases]) => {
     const MONTHS = ['january','february','march','april','may','june','july',
         'august','september','october','november','december'];
     const wantStr = low(optionText);
-    const wantNum = (MONTHS.indexOf(wantStr) + 1) || monthAliases[wantStr] || (parseInt(optionText, 10) || 0);
+    const wantNum = (MONTHS.indexOf(wantStr) + 1) || (monthAliases && monthAliases[wantStr]) || (parseInt(optionText, 10) || 0);
     const matches = (t, v) => {
         const a = low(t || ''); const b = low(v || '');
         if (!a && !b) return false;
-        if (a === wantStr) return true;
-        if (wantNum && (monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
-        if (!wantNum) return false;
-        const n = String(wantNum);
-        const p = n.length === 1 ? '0' + n : n;
-        return a === n || b === n || a === p || b === p;
+        if (a === wantStr || b === wantStr) return true;
+        if (wantNum && (monthAliases && monthAliases[a] === wantNum || MONTHS.indexOf(a) + 1 === wantNum)) return true;
+        if (wantNum) {
+            const n = String(wantNum);
+            const p = n.length === 1 ? '0' + n : n;
+            const toksA = a.split(/[^a-z0-9]+/).filter(Boolean);
+            const toksB = b.split(/[^a-z0-9]+/).filter(Boolean);
+            if (toksA.some(tok => tok === n || tok === p) || toksB.some(tok => tok === n || tok === p)) return true;
+        }
+        return false;
     };
-    const all = document.querySelectorAll('[role="option"], [role="menuitem"], li, div, span');
+    const sel = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], [role="menuitem"], li';
+    const all = document.querySelectorAll(sel);
     for (const el of all) {
-        if (!el.offsetParent) continue;
-        try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-        const r = el.getBoundingClientRect();
-        if (r.width < 5 || r.height < 5) continue;
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
-        if (!t) continue;
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
             for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click']) {
                 el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
             }
@@ -984,14 +994,19 @@ def _human_typing_delay(ch: str) -> float:
 _REACT_SET_VALUE_JS = r"""([sel, value]) => {
     const el = document.querySelector(sel);
     if (!el) return false;
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-    setter.call(el, value);
-    try {
-        const t = el._valueTracker;
-        if (t && typeof t.setValue === 'function') t.setValue(value);
-    } catch (e) {}
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    const proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = (Object.getOwnPropertyDescriptor(proto, 'value') || {}).set
+                || (Object.getOwnPropertyDescriptor(el.__proto__, 'value') || {}).set;
+    if (setter) {
+        if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+            el._valueTracker.setValue(value === '' ? '__initial__' : '');
+        }
+        setter.call(el, value);
+    } else {
+        el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
     return true;
 }"""
 
@@ -1126,7 +1141,7 @@ FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
 
 
 async def capture_page_screenshot(page, log=None,
-                                  fullpage_timeout: float = 15.0,
+                                  fullpage_timeout: float = 20.0,
                                   viewport_timeout: float = 10.0) -> bytes:
     """FULL-PAGE PNG capture with an OOM safety net.
 
@@ -1144,7 +1159,7 @@ async def capture_page_screenshot(page, log=None,
     async def _viewport(attempt_timeout: float) -> bytes:
         try:
             data = await asyncio.wait_for(
-                page.screenshot(full_page=False), timeout=attempt_timeout)
+                page.screenshot(full_page=False, timeout=attempt_timeout * 1000), timeout=attempt_timeout)
             return data or b""
         except Exception:
             return b""
@@ -1155,15 +1170,15 @@ async def capture_page_screenshot(page, log=None,
             height = await asyncio.wait_for(page.evaluate(
                 "() => Math.max("
                 "document.documentElement ? document.documentElement.scrollHeight : 0,"
-                " document.body ? document.body.scrollHeight : 0)"), timeout=3.0)
+                " document.body ? document.body.scrollHeight : 0)"), timeout=2.5)
         except Exception:
             height = 0
         if not isinstance(height, (int, float)) or isinstance(height, bool):
             height = 0
-        if 0 < height <= FULLPAGE_MAX_PX:
+        if height <= FULLPAGE_MAX_PX:
             try:
                 data = await asyncio.wait_for(
-                    page.screenshot(full_page=True), timeout=fullpage_timeout)
+                    page.screenshot(full_page=True, timeout=fullpage_timeout * 1000), timeout=fullpage_timeout)
                 if data:
                     return data
                 if log:
@@ -1684,16 +1699,21 @@ class DiscordAutomation:
             # call _build_context() (which does browser.new_context()) on a
             # dead browser: that was the "'NoneType' object has no attribute
             # 'new_context'" crash. Relaunch the browser instead.
-            if proxy_changed or self._browser is None:
-                self._log("[Switch] Proxy changed — relaunching browser with new session")
+            if proxy_changed or self._browser is None or not getattr(self._browser, "is_connected", True):
+                self._log("[Switch] Proxy changed or browser restart needed — relaunching browser with new session")
                 await self._relaunch_browser()
             else:
-                await self._build_context()
+                try:
+                    await self._build_context()
+                except Exception as b_err:
+                    self._log(f"[Switch] Context rebuild failed ({b_err}) — falling back to full browser relaunch", level="warn")
+                    await self._relaunch_browser()
             label = 'proxy ' + str(new_proxy.get('key','?')[:40]) if new_proxy else 'fresh TOR circuit'
             self._log(f"[Switch] Context rebuilt with {label}")
             return True
         except Exception as e:
             self._log(f"[Switch] Context rebuild failed: {e}", level="error")
+            self._browser = None
             return False
 
     async def switch_direct(self) -> bool:
@@ -5186,6 +5206,7 @@ class DiscordAutomation:
             self._log("[Form] Page is gone (browser closed/stopped) - aborting form fill", level="warn")
             return
         fields = self._build_cred_fields(display_name)
+        filled_so_far = []
         for fname, sel, val in fields:
             if not val:
                 continue
@@ -5196,13 +5217,13 @@ class DiscordAutomation:
                 cur = await self._read_field_value(sel)
                 self._log(f"[Form] Field '{fname}' mismatch (attempt {attempt}/3) got_len={len(cur)}", level="warn")
                 await asyncio.sleep(0.5)
+            filled_so_far.append((fname, sel, val))
             # Human pause between fields — reads like a real signup and gives
             # Discord's React time to finish re-rendering.
-            await asyncio.sleep(random.uniform(0.4, 0.9))
-            # Heal pass: THIS field's write (or its re-render) may have
-            # leaked into / wiped another field. Re-fill anything that
-            # slipped — element-targeted, so it can never write elsewhere.
-            await self._heal_credential_fields(fields)
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            # Heal pass: ONLY check fields that have already been filled so far.
+            if len(filled_so_far) > 1:
+                await self._heal_credential_fields(filled_so_far)
         # Final stability pass — two consecutive clean reads before moving on.
         await self._stabilize_credential_fields(fields)
 

@@ -913,7 +913,31 @@ class _Page:
         return None
 
     # ---- screenshots ------------------------------------------------------
-    async def screenshot(self, full_page: bool = False, **kwargs) -> bytes:
+    async def screenshot(self, full_page: bool = False, timeout: Optional[float] = None, **kwargs) -> bytes:
+        t = (timeout or 25000) / 1000.0 if timeout else 25.0
+        try:
+            if full_page:
+                try:
+                    data = await asyncio.wait_for(
+                        self._tab.send(cdp.page.capture_screenshot(
+                            format_="png", capture_beyond_viewport=True
+                        )),
+                        timeout=t
+                    )
+                    if data:
+                        return base64.b64decode(data)
+                except Exception:
+                    pass
+            data = await asyncio.wait_for(
+                self._tab.send(cdp.page.capture_screenshot(
+                    format_="png", capture_beyond_viewport=False
+                )),
+                timeout=min(t, 10.0)
+            )
+            if data:
+                return base64.b64decode(data)
+        except Exception:
+            pass
         try:
             b64 = await self._tab.screenshot_b64("png", full_page=bool(full_page))
             return base64.b64decode(b64)
@@ -1010,6 +1034,14 @@ class _Browser:
     def __init__(self, browser: Any):
         self._browser = browser
         self._contexts: list = []
+
+    @property
+    def is_connected(self) -> bool:
+        if not self._browser:
+            return False
+        if getattr(self._browser, "stopped", False):
+            return False
+        return True
 
     async def new_context(self, **opts) -> "_Context":
         ctx = _Context(self, opts)
