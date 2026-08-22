@@ -95,8 +95,14 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 
 <div class="card">
-<h3>Live View</h3>
-<img id="screenshot" src="" alt="No screenshot yet">
+<div class="flex" style="justify-content:space-between;align-items:center">
+  <h3 style="margin:0">Live View</h3>
+  <div class="flex">
+    <button onclick="openLive()">FULL SCREEN</button>
+    <button onclick="refreshScreenshot()">REFRESH</button>
+  </div>
+</div>
+<img id="screenshot" src="" alt="No screenshot yet" onclick="openLive()" style="cursor:pointer" title="Click to view full screen">
 </div>
 
 <div class="card">
@@ -281,12 +287,24 @@ function viewAllLogs(){
 }
 window.viewAllLogs=viewAllLogs;
 
+function refreshScreenshot(){
+  var img=$('screenshot');
+  if(!img) return;
+  var src='/latest?worker=B1&t='+Date.now();
+  var tmp=new Image();
+  tmp.onload=function(){ img.src=src; };
+  tmp.src=src;
+}
+window.refreshScreenshot=refreshScreenshot;
+
 // Init
 refreshStatus();
 refreshLogs();
 refreshTokens();
+refreshScreenshot();
 setInterval(refreshStatus,5000);
 setInterval(refreshLogs,2200);
 setInterval(refreshTokens,12000);
+setInterval(refreshScreenshot,2500);
 </script>
 </body></html>
