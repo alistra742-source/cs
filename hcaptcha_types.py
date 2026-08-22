@@ -300,7 +300,10 @@ _PROMPT_RULES = (
         r"check all (the )?(images|pictures|photos|tiles)|"
         r"mark (all|every) (the )?(images|pictures|photos|tiles)|"
         r"click (all )?(the )?images (containing|with)|"
-        r"images? (containing|with|of) a|all (the )?squares with", re.I)),
+        r"images? (containing|with|of) a|all (the )?squares with|"
+        r"(two|2|pair).{0,60}(identical|same|matching|duplicate|alike|similar) "
+        r"(images|pictures|photos|tiles)|matching pair|"
+        r"most similar (images|pictures|photos|tiles)", re.I)),
     (COUNT, _COUNT_WORD_RE),
     (AREA_BBOX, _BBOX_WORD_RE),
     (MULTIPLE_CHOICE, re.compile(
@@ -310,9 +313,12 @@ _PROMPT_RULES = (
         r"\btype\b|enter the (characters|text|letters)|"
         r"characters (you see|in the image)", re.I)),
     (AREA_POINT, re.compile(
-        r"\bclick on\b|\btap on\b|click the (animal|object|item|largest|"
+        r"\bclick on\b|\btap on\b|click the (animal|object|item|element|largest|"
         r"smallest|fastest|slowest|highest)|click anywhere on|"
-        r"place (a|the) (point|dot)", re.I)),
+        r"place (a|the) (point|dot)|"
+        r"(two|2|pair).{0,80}(identical|same|matching|duplicate|alike|similar) "
+        r"(elements?|objects?|items?)|"
+        r"most similar (elements?|objects?|items?)", re.I)),
 )
 
 
@@ -638,6 +644,19 @@ def superlative_table(prompt: str):
 
 # ── offline answer resolution ────────────────────────────────────────────
 
+# Visual-pair rounds: prompts like “Please click on the two elements that are
+# identical”, “select the matching pair”, or “choose the two same pictures”.
+# The vision model handles the image comparison; this regex lets the offline
+# label path solve a clean duplicate-label grid without guessing.
+_IDENTICAL_PAIR_PHRASE = re.compile(
+    r"\b(two|2|pair|matching pair)\b.{0,80}\b"
+    r"(identical|same|matching|match|duplicate|alike|similar)\b|"
+    r"\b(identical|same|matching|duplicate|alike|similar)\b.{0,80}\b"
+    r"(two|2|pair|elements?|objects?|items?|images?|pictures?|tiles?)\b|"
+    r"which (two|2|pair).{0,80}(match|are alike|are similar)|"
+    r"most similar (two|2|pair|elements?|objects?|items?|images?|pictures?|tiles?)",
+    re.I)
+
 _AFFORDANCE_PHRASE = re.compile(
     r"work on|use (the )?(item|tool|object)|item shown|shown in the "
     r"(image|picture|example)|goes with|used (with|on|together)|"
@@ -672,6 +691,23 @@ def resolve_semantic(prompt: str, tile_labels, example_label=None):
     example = canonical(example_label) if example_label else None
 
     if not p and example is None:
+        return None
+
+    # 0) exact visual-pair wording on a grid. If the classifier labels reveal
+    # exactly one duplicate pair, click that pair. Ambiguous duplicate sets
+    # deliberately fall through to the vision model.
+    if _IDENTICAL_PAIR_PHRASE.search(p):
+        counts = {}
+        for lab in labels:
+            if lab:
+                counts[lab] = counts.get(lab, 0) + 1
+        pairs = [lab for lab, n in counts.items() if n == 2]
+        if len(pairs) == 1:
+            want = pairs[0]
+            return [i for i, lab in enumerate(labels, 1) if lab == want]
+        # If every matching label count is not a clean single pair, the prompt
+        # is understood but needs visual comparison (colour/pose/details), so
+        # defer rather than clicking a wrong duplicate category.
         return None
 
     # 1) superlatives ("click on the animal who jumps the highest")

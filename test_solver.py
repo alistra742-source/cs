@@ -281,6 +281,21 @@ class TestRoutePrompt(unittest.TestCase):
                 "Check all photos of a train"):
             self.assertEqual(hct.classify_from_prompt(prompt), hct.BINARY)
 
+    def test_prompt_identical_pair_variants(self):
+        for prompt in (
+                "Please click on the two elements that are identical",
+                "Please click on the two elements that are similar",
+                "Please click on the most similar elements"):
+            self.assertEqual(hct.classify_from_prompt(prompt),
+                             hct.AREA_POINT)
+        for prompt in (
+                "Please click the two identical images",
+                "Select the matching pair",
+                "Choose the two same pictures",
+                "Choose the two similar pictures",
+                "Select the most similar images"):
+            self.assertEqual(hct.classify_from_prompt(prompt), hct.BINARY)
+
     def test_prompt_alias_binary(self):
         # long-tail prompt nouns resolve through the alias table to the
         # binary family + the trained classes (offline path can fire)
@@ -560,6 +575,20 @@ class TestKnowledgeBase(unittest.TestCase):
             "Please click each image containing a red light", labels), [2])
         self.assertNotEqual(hct.canonical("red light"),
                             hct.canonical("traffic light"))
+
+    def test_identical_pair_duplicate_labels(self):
+        labels = ["cat", "dog", "cat", "bus"]
+        self.assertEqual(hct.resolve_semantic(
+            "Please click on the two elements that are identical", labels),
+            [1, 3])
+        self.assertEqual(hct.resolve_semantic(
+            "Select the matching pair", ["car", "bus", "bus", "tree"]),
+            [2, 3])
+        self.assertEqual(hct.resolve_semantic(
+            "Choose the two similar pictures", ["car", "bus", "bus", "tree"]),
+            [2, 3])
+        self.assertIsNone(hct.resolve_semantic(
+            "Choose the two same pictures", ["cat", "cat", "dog", "dog"]))
 
     def test_absent_class_empty_list(self):
         # "understood but nothing matches" is a legit [] (empty rounds are
