@@ -4945,14 +4945,35 @@ class DiscordAutomation:
             if is_select:
                 try:
                     ctrl = self._page.locator(f'[data-dob-target="{label}"]')
+                    # Exact index into the <select>'s OWN option list.
+                    # (The generic _DOB_OPTION_INDEX_JS only counts
+                    # offsetParent!==null elements — in a CLOSED native
+                    # select no <option> is rendered, so it always
+                    # returns -1 and the select gets silently skipped.)
                     idx = await self._page.evaluate(
-                        _DOB_OPTION_INDEX_JS.replace("__OPT_SEL__", json.dumps(_DOB_OPTION_SEL)),
-                        [option_text, _MONTH_ALIASES])
+                        """([sel, value, monthAliases]) => {
+                            const el = document.querySelector(sel);
+                            if (!el || el.tagName !== 'SELECT') return -1;
+                            const norm = s => (s == null ? '' : String(s)).toLowerCase().replace(/\\s+/g, ' ').trim();
+                            const want = norm(value);
+                            const wantNum = (monthAliases && monthAliases[want]) || 0;
+                            for (let i = 0; i < el.options.length; i++) {
+                                const o = el.options[i];
+                                const t = norm(o.text), v = norm(o.value);
+                                if (t === want || v === want) return i;
+                                if (wantNum &&
+                                    ((monthAliases && monthAliases[t]) === wantNum ||
+                                     (monthAliases && monthAliases[v]) === wantNum)) return i;
+                            }
+                            return -1;
+                        }""",
+                        [f'[data-dob-target="{label}"]', option_text, _MONTH_ALIASES])
                     if isinstance(idx, int) and idx >= 0:
                         await ctrl.select_option(index=idx)
                         await asyncio.sleep(0.3)
                         self._log(f"Selected {label} (native select index {idx})")
                         return True
+                    self._log(f"[DOB] native select for {label}: no option matched '{option_text}' (idx={idx})", level="warn")
                 except Exception as e:
                     self._log(f"[DOB] native select failed for {label}: {e}", level="warn")
                 return await self._dob_js_fallback(label, option_text)
@@ -5056,13 +5077,22 @@ class DiscordAutomation:
                         opened = False
                     if opened:
                         break
+            if opened:
+                self._log(f"[DOB] {label}: menu opened via {open_method}")
             if not opened:
                 self._log(f"[DOB] menu for {label} never opened — JS fallback", level="warn")
                 return await self._dob_js_fallback(label, option_text)
 
             # ── Pick the option ──
+            # Order: TYPEAHEAD first — it is geometry-independent and the
+            # only reliable path for a DEEP option in a long menu (Year's
+            # ~110 options vs Day's option sitting 4th). A human does
+            # exactly this: focus the control, type "1995", hit Enter.
+            # Works for native <select> AND custom React-Select; Enter
+            # commits through the component's own keyboard flow (no
+            # stale-DOM selection that a re-render would revert).
             picked = False
-            for sel_method in ("coords", "index", "dispatch", "keyboard"):
+            for sel_method in ("typeahead", "coords", "index", "keyboard", "dispatch"):
                 if picked or time.monotonic() > deadline:
                     break
                 idx = -1
@@ -5080,7 +5110,23 @@ class DiscordAutomation:
                             _DOB_OPTION_POS_JS, [option_text, _MONTH_ALIASES])
                     except Exception:
                         pos = None
-                if sel_method == "index":
+                if sel_method == "typeahead":
+                    try:
+                        # The control that opened the menu holds focus.
+                        # Type the option text with quick human cadence —
+                        # typeahead jumps to the first option whose label
+                        # starts with the accumulated string ("1"->1999,
+                        # "19"->1999, "1995"->1995) — then Enter confirms.
+                        for ch in str(option_text):
+                            await self._page.keyboard.type(ch)
+                            await asyncio.sleep(random.uniform(0.08, 0.18))
+                        await asyncio.sleep(0.25)
+                        await self._page.keyboard.press("Enter")
+                        picked = True
+                        self._log(f"[DOB] option for {label} by typeahead ({option_text})")
+                    except Exception as e:
+                        self._log(f"[DOB] option typeahead {label}: {str(e)[:120]}", level="warn")
+                elif sel_method == "index":
                     if isinstance(idx, int) and idx >= 0:
                         try:
                             # index is over VISIBLE options only (see
@@ -5167,6 +5213,11 @@ class DiscordAutomation:
                 await asyncio.sleep(0.3)
 
             self._log(f"[DOB] selection methods failed for {label} — JS fallback", level="warn")
+            try:
+                cur = await self._dob_current_value(label)
+                self._log(f"[DOB] {label} control still shows '{cur}' after all pick methods", level="warn")
+            except Exception:
+                pass
             return await self._dob_js_fallback(label, option_text)
 
         except Exception as e:
@@ -5829,6 +5880,24 @@ class DiscordAutomation:
             # re-writes are safe — nothing can leak into another field now),
             # then read once more; if anything is STILL missing, rotate
             # instead of "faking" a Create Account on a blank form.
+            #
+            # DOB included: a select can show its value in the DOM yet have
+            # the React state revert it on the ToS-triggered re-render
+            # (the "Required" error on the DOB row at submit). Re-verify all
+            # three right here and re-select anything that reverted — this
+            # is the last chance before the click.
+            for dob_label, dob_opt in (("Month", month_name),
+                                       ("Day", day_val),
+                                       ("Year", year_val)):
+                try:
+                    if not await self._dob_verify(dob_label, dob_opt):
+                        self._log(f"[DOB] {dob_label} reverted to placeholder before submit — re-selecting {dob_opt}", level="warn")
+                        await self._select_dob(dob_label, dob_opt)
+                        await self._human_pause()
+                        if not await self._dob_verify(dob_label, dob_opt):
+                            self._log(f"[DOB] {dob_label} still not holding '{dob_opt}' after re-select", level="error")
+                except Exception as _de:
+                    self._log_exception(f"[DOB] Final {dob_label} re-verify failed", _de)
             await self._stabilize_credential_fields(
                 self._build_cred_fields(self._display_name or self._username or ""))
             final_vals = await self._read_form_values()
