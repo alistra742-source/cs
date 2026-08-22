@@ -4,10 +4,10 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Browser engine: Playwright-managed Chromium.
-# The matching Chromium build and Linux dependencies are installed in the
-# Dockerfile with ``python -m playwright install --with-deps chromium``.
-playwright==1.61.0
+# Browser engine: truedriver — an async-first, undetectable Chrome driver
+# built directly on Chrome DevTools Protocol (no Selenium/WebDriver layer to
+# flag). Requires a Chrome/Chromium binary on PATH (installed in the Dockerfile).
+truedriver>=0.1.5
 
 # Web app (dashboard)
 flask>=3.0.0
