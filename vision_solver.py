@@ -73,6 +73,9 @@ _SYSTEM_PROMPT = (
     "reading order: image 1 is the top-left tile, image 2 is the tile to its "
     "right, and so on left-to-right, top-to-bottom. "
     "Look at EVERY tile carefully and decide which ones satisfy the instruction. "
+    "For visual-comparison prompts such as 'click the two elements/images that "
+    "are identical', 'the same', 'matching', 'duplicates', 'similar', or 'most similar', "
+    "compare all tiles against each other and return the matching tile numbers. "
     'Answer with ONLY a JSON object, never any other text: '
     '{"tiles": [1, 3, 7]} for a grid selection, or {"answer": "the text"} '
     "if the challenge asks you to type characters instead. "
@@ -89,7 +92,10 @@ _SYSTEM_POINT = (
     "Decide where the target is and answer with ONLY a JSON object: "
     '{"points": [[x, y]]} where x and y are NORMALISED coordinates between '
     "0.0 and 1.0 (x = fraction from the left edge, y = fraction from the top "
-    "edge). Give exactly one point, at the CENTRE of the requested object."
+    "edge). Give one point at the CENTRE of the requested object unless the "
+    "instruction asks for multiple targets. For prompts like 'click on the two "
+    "elements that are identical', 'same', 'matching', 'duplicates', 'similar', or 'most "
+    "similar', return one centre point for EACH requested matching element."
 )
 
 _SYSTEM_BBOX = (

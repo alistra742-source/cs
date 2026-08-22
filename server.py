@@ -4078,10 +4078,17 @@ class DiscordAutomation:
             await hm.drag(self._page, (x1, y1), (x2, y2))
             return True
         if answer.get("type") == "points" and answer.get("points"):
-            x, y = self._denorm(answer["points"][0], box)
-            self._log(f"[Captcha] Point click at ({x:.0f},{y:.0f})")
-            await hm.click(self._page, x, y)
-            return True
+            clicked = 0
+            for pt in answer.get("points") or []:
+                try:
+                    x, y = self._denorm(pt, box)
+                except Exception:
+                    continue
+                self._log(f"[Captcha] Point click at ({x:.0f},{y:.0f})")
+                await hm.click(self._page, x, y)
+                clicked += 1
+                await asyncio.sleep(random.uniform(0.15, 0.38))
+            return clicked > 0
         return False
 
     async def _solve_drag_round(self, frame, prompt) -> bool:
