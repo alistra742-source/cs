@@ -1597,3 +1597,7 @@ setInterval(refreshTokens,12000);
 </body></html>
 
 '''
+
+
+if __name__ == "__main__":
+    main()
