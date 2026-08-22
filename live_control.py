@@ -12,7 +12,7 @@ import base64
 import time
 
 from browser_engine import ENGINE
-from server import NAV_TIMEOUT_MS
+from server import NAV_TIMEOUT_MS, capture_page_screenshot
 
 VIEWPORT_W = 1920
 VIEWPORT_H = 1080
@@ -57,16 +57,20 @@ async def live_meta(bot) -> dict:
 
 
 async def live_screenshot(bot) -> str:
-    """Viewport-sized PNG -> base64 for the live feed. Retries once and logs
-    the EXACT failure so the dashboard's ALL LOGS shows why the frame is
+    """FULL-PAGE PNG -> base64 for the live feed.
+
+    Frames capture the whole scrollable page (so the operator sees
+    everything), budgeted by FULLPAGE_MAX_PX with a viewport fallback —
+    see server.capture_page_screenshot for the OOM safety net. Failures
+    log the EXACT reason so the dashboard's ALL LOGS shows why a frame is
     missing instead of silently sitting on 'waiting for frame'."""
     page = getattr(bot, "_page", None)
     if page is None:
         return ""
     last_err = ""
     try:
-        shot = await asyncio.wait_for(
-            page.screenshot(full_page=False), timeout=6)
+        shot = await capture_page_screenshot(
+            page, fullpage_timeout=10.0, viewport_timeout=6.0)
         if not shot:
             last_err = "empty capture"
     except Exception as e:

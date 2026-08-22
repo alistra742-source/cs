@@ -1112,6 +1112,76 @@ RENDER_WAIT_BUDGET_S = 75.0
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
+# ── Full-page LIVE camera frames ─────────────────────────────────
+# The operator asked to SEE EVERYTHING in the camera feed, so frames are
+# now FULL-PAGE captures. Uncapped full-page screenshots of a very tall
+# SPA (Discord's channel tree can scroll for tens of thousands of pixels)
+# force the renderer to paint + encode the entire surface — that is the
+# exact memory spike that used to OOM-kill the content process. So the
+# full-page capture is budgeted: pages taller than FULLPAGE_MAX_PX keep
+# the old viewport-only frame, and any full-page failure falls back to a
+# viewport capture instead of dropping the frame.
+FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
+
+
+async def capture_page_screenshot(page, log=None,
+                                  fullpage_timeout: float = 15.0,
+                                  viewport_timeout: float = 10.0) -> bytes:
+    """FULL-PAGE PNG capture with an OOM safety net.
+
+    Measures the page first; when its scroll height fits the
+    FULLPAGE_MAX_PX budget it captures the whole scrollable surface (what
+    the operator asked for: "see everything"), otherwise it degrades to a
+    viewport-only frame. Both the worker camera loop and the dashboard
+    LIVE feed go through here, so every frame in the dashboard is the
+    tallest safe capture. Returns PNG bytes, or b"" when even the
+    viewport capture fails (callers keep their last good frame).
+    """
+    if page is None:
+        return b""
+
+    async def _viewport(attempt_timeout: float) -> bytes:
+        try:
+            data = await asyncio.wait_for(
+                page.screenshot(full_page=False), timeout=attempt_timeout)
+            return data or b""
+        except Exception:
+            return b""
+
+    if FULLPAGE_SHOTS:
+        height = 0
+        try:
+            height = await asyncio.wait_for(page.evaluate(
+                "() => Math.max("
+                "document.documentElement ? document.documentElement.scrollHeight : 0,"
+                " document.body ? document.body.scrollHeight : 0)"), timeout=3.0)
+        except Exception:
+            height = 0
+        if not isinstance(height, (int, float)) or isinstance(height, bool):
+            height = 0
+        if 0 < height <= FULLPAGE_MAX_PX:
+            try:
+                data = await asyncio.wait_for(
+                    page.screenshot(full_page=True), timeout=fullpage_timeout)
+                if data:
+                    return data
+                if log:
+                    log("[Shot] empty full-page capture - viewport frame",
+                        level="warn")
+            except Exception as e:
+                if log:
+                    log(f"[Shot] full-page capture failed "
+                        f"({type(e).__name__}) - viewport frame", level="warn")
+        elif height > FULLPAGE_MAX_PX and log:
+            log(f"[Shot] page {int(height)}px tall exceeds the "
+                f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
+    # Viewport fallback (one retry, like the old capture loop).
+    shot = await _viewport(viewport_timeout)
+    if not shot and viewport_timeout >= 8.0:
+        shot = await _viewport(10.0)
+    return shot
+
 
 # ═══════════════════════════════════════════════════════════════
 # Human Behavior Simulation
@@ -2330,20 +2400,12 @@ class DiscordAutomation:
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
-        # VIEWPORT-ONLY capture. Full-page screenshots of Discord's tall SPA
-        # force the renderer to paint + encode the entire page — a big memory
-        # spike that repeatedly OOM-killed the content process ("Page
-        # crashed") while the capture loop ran during signup. The LIVE view
-        # shows a viewport frame anyway.
-        try:
-            screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=20)
-        except asyncio.TimeoutError:
-            try:
-                screenshot = await asyncio.wait_for(self._page.screenshot(full_page=False), timeout=10)
-            except Exception:
-                screenshot = None
-        except Exception:
-            screenshot = None
+        # FULL-PAGE capture (operator asked to see everything), budgeted by
+        # FULLPAGE_MAX_PX with an automatic viewport fallback — the OOM
+        # guard lives in capture_page_screenshot. Same base64 history
+        # contract as before: latest frame appended, ring trimmed at 100.
+        screenshot = await capture_page_screenshot(
+            self._page, log=self._log, fullpage_timeout=20.0)
         if not screenshot:
             return ""
         b64 = base64.b64encode(screenshot).decode('utf-8')

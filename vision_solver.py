@@ -113,6 +113,21 @@ _SYSTEM_DRAG = (
     "top-left)."
 )
 
+_SYSTEM_STACK = (
+    "You are a precise stacking-puzzle solver for a FunCAPTCHA/Arkose "
+    "challenge. You are given ONE canvas image showing vertical stacks "
+    "(columns/towers) of blocks and one or more loose draggable blocks. The "
+    "goal is to drag blocks onto the stacks so that EVERY stack ends up with "
+    "the SAME height (the number of blocks the puzzle demands — e.g. every "
+    'column 3 blocks tall). Answer with ONLY a JSON object: {"drags": '
+    "[[sx, sy, tx, ty], ...]} listing EVERY drag needed, in execution order. "
+    "sx, sy = the CENTRE of the block to grab; tx, ty = the point ON TOP of "
+    "the target stack where it must be dropped. All four numbers are integer "
+    "PERCENTAGES of the image dimensions (0-100, sx/tx from the LEFT edge, "
+    'sy/ty from the TOP edge). Example: {"drags": [[12, 80, 12, 40], '
+    "[88, 82, 50, 55]]}"
+)
+
 _SYSTEM_CHOICE = (
     "You are a precise multiple-choice solver for an hCaptcha challenge. You "
     "are given an instruction, a list of numbered answer options and one "
@@ -147,6 +162,7 @@ _SYSTEM_BY_SHAPE = {
     "bbox": _SYSTEM_BBOX,
     "drag": _SYSTEM_DRAG,
     "pattern": _SYSTEM_PATTERN,
+    "stack": _SYSTEM_STACK,
     "choice": _SYSTEM_CHOICE,
     "count": _SYSTEM_COUNT,
     "text": _SYSTEM_PROMPT,
@@ -234,6 +250,8 @@ class OllamaVisionClient:
           count     {"type": "count",  "count": 3}
           pattern   {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1;
                     candidate centre -> empty-cell centre)
+          stack     {"type": "drags",  "drags": [(sx, sy, tx, ty), ...]}
+                    (0-100 percent coords; Arkose block-stacking plan)
           text      {"type": "text",   "text": "abc123"}
           None      model unreachable or answer unparseable
         """
@@ -302,7 +320,7 @@ class OllamaVisionClient:
                 return None
             parse_shape = "drag" if shape == "pattern" else shape
             parsed = self._parse_geometry(content, parse_shape, len(images))
-            if parsed is None and shape in ("tiles", "text", "count"):
+            if parsed is None and shape in ("tiles", "text", "count", "stack"):
                 parsed = self._parse_answer(content, len(images), shape)
             if parsed is None:
                 self._log(f"[Ollama] Unparseable model answer: {content[:160]}",
@@ -399,6 +417,12 @@ class OllamaVisionClient:
             return None
         num = OllamaVisionClient._num
         pt = OllamaVisionClient._point
+
+        # Stacking plans (FunCAPTCHA/Arkose "make every column equal"): the
+        # generic branches below would squash a multi-drag {"drags": [...]}
+        # into one drag / a points pair, so parse the FULL plan first.
+        if shape == "stack":
+            return OllamaVisionClient._parse_stack_geometry(obj)
 
         # bare top-level atoms
         if isinstance(obj, (int, float)) and not isinstance(obj, bool):
@@ -502,6 +526,82 @@ class OllamaVisionClient:
         if isinstance(raw_txt, str) and raw_txt.strip():
             return {"type": "text", "text": raw_txt.strip()}
         return None
+
+    @staticmethod
+    def _parse_stack_geometry(obj) -> Optional[dict]:
+        """Full stacking-puzzle drag plan, in 0-100 PERCENT coordinates.
+
+        Accepts {"drags": [[sx, sy, tx, ty], ...]} (also "moves"/"drag"),
+        {"drags": {"from": [..], "to": [..]}}, a bare [[sx, sy, tx, ty], ..]
+        list, or per-drag {"from"/"to"} dicts — the shapes small models
+        emit. Coordinates beyond -3..103 reject the drag (a hallucinated
+        pixel coordinate, not a percent); the rest clamp to 0-100. When
+        EVERY coordinate in the plan is <= 1.0 the model answered in 0-1
+        fractions and the whole plan is scaled x100. Returns
+        {"type": "drags", "drags": [(sx, sy, tx, ty), ...]} or None when no
+        usable drag survives (max 12 kept).
+        """
+        raw = None
+        if isinstance(obj, dict):
+            for key in ("drags", "moves", "drag"):
+                v = obj.get(key)
+                if isinstance(v, (list, tuple)) and v:
+                    raw = v
+                    break
+                if isinstance(v, dict):
+                    f = OllamaVisionClient._point(
+                        v.get("from") or v.get("start"))
+                    t = OllamaVisionClient._point(
+                        v.get("to") or v.get("end"))
+                    if f and t:
+                        raw = [list(f) + list(t)]
+                    break
+        elif isinstance(obj, (list, tuple)) and obj:
+            raw = obj
+        if not raw:
+            return None
+        drags = []
+        for item in raw:
+            if isinstance(item, dict):
+                f = OllamaVisionClient._point(
+                    item.get("from") or item.get("start")
+                    or item.get("grab") or item.get("pick"))
+                t = OllamaVisionClient._point(
+                    item.get("to") or item.get("end")
+                    or item.get("drop") or item.get("target"))
+                if f is None or t is None:
+                    continue
+                vals = (f[0], f[1], t[0], t[1])
+            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                vals = item[:4]
+            else:
+                continue
+            try:
+                a, b, c, d = (float(v) for v in vals)
+            except (TypeError, ValueError):
+                continue
+            if any(v != v for v in (a, b, c, d)):  # NaN guard
+                continue
+            if any(v < -3 or v > 103 for v in (a, b, c, d)):
+                continue
+            drags.append((max(0.0, min(100.0, a)), max(0.0, min(100.0, b)),
+                          max(0.0, min(100.0, c)), max(0.0, min(100.0, d))))
+        if not drags:
+            return None
+        flat = [v for drag in drags for v in drag]
+        if flat and all(0 <= v <= 1.0 for v in flat) and any(flat):
+            # Model answered in 0-1 fractions despite the percent prompt —
+            # rescale the whole plan (a legit percent plan can never have
+            # every coordinate inside the top-left 1% of the image).
+            drags = [tuple(v * 100.0 for v in drag) for drag in drags]
+        elif flat and any(v > 1.0 for v in flat) and any(
+                0 < v <= 1.0 for v in flat):
+            # Mixed units: the plan is in percents but some coordinates
+            # came back as 0-1 fractions — scale just those.
+            drags = [tuple(v * 100.0 if 0 < v <= 1.0 else v for v in drag)
+                     for drag in drags]
+        drags = [tuple(round(v, 3) for v in drag) for drag in drags]
+        return {"type": "drags", "drags": drags[:12]}
 
     @staticmethod
     def _parse_answer(content: str, tile_count: int,
