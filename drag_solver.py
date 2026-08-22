@@ -217,7 +217,11 @@ class DragSolver:
                 continue
             if count > 0:
                 try:
-                    cf = await loc.first.content_frame()
+                    # Real Playwright: resolve the element handle first, then
+                    # its async content_frame() (Locator.content_frame is a
+                    # FrameLocator property, not the Frame we want here).
+                    el = await loc.first.element_handle(timeout=3000)
+                    cf = await el.content_frame() if el is not None else None
                     if cf is not None:
                         return cf, loc.first
                 except Exception:
@@ -828,7 +832,7 @@ class DragSolver:
             for f in self._page.frames:
                 try:
                     if f.url and f.url == (frame.url or ""):
-                        fe = f.frame_element()
+                        fe = await f.frame_element()
                         box = await fe.bounding_box()
                         if box and box.get("width", 0) > 4:
                             return box

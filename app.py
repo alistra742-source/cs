@@ -250,7 +250,7 @@ async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
     """Draw the next session and only accept it if it probes live against
     discord.com (the same gate the worker loop uses). Dead sessions are
     blacklisted as they're found, so an expired proxies.txt can't trap the
-    LIVE tab in a chrome-error loop. Returns a proven-live proxy or None."""
+    LIVE tab in a browser-error loop. Returns a proven-live proxy or None."""
     for _ in range(tries):
         try:
             proxy = await _next_proxy(force=PROXY_FORCE)
@@ -802,15 +802,15 @@ async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     discord.com then shows 'site can't be reached' (ERR_TUNNEL_CONNECTION_FAILED).
     Probe-gate the next session exactly like the worker loop, then fall back
     to TOR, then to a direct connection, so the LIVE tab never stays stuck on
-    chrome-error://chromewebdata/.
+    a browser error page.
     """
     st = await live_control.live_navigate(bot, url)
     if not st.get("error"):
         return st
     first_err = st.get("error", "")
     _log(f"[{wid}] [Live] Navigate failed ({first_err}) — rotating session and retrying", level="warn")
-    # The session the browser is currently on just produced chrome-error:
-    # blacklist it so it is never handed out again this run.
+    # The session the browser is currently on just produced a browser error
+    # page: blacklist it so it is never handed out again this run.
     if bot.proxy and proxy_pool is not None:
         try:
             proxy_pool.release(bot.proxy, ok=False)
@@ -912,7 +912,8 @@ async def _start_live_browser(wid: str, url: str = "",
             alive = False
         if not alive:
             # Probe-gate the first session: launching straight onto an expired
-            # residential tunnel is what left the LIVE tab on chrome-error.
+            # residential tunnel is what left the LIVE tab on a browser error
+            # page.
             proxy = await _probe_gated_proxy(wid, bot)
             if proxy is not None:
                 bot.proxy = proxy

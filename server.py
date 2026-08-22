@@ -1127,31 +1127,164 @@ RENDER_WAIT_BUDGET_S = 75.0
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
-# ── Full-page LIVE camera frames ─────────────────────────────────
-# The operator asked to SEE EVERYTHING in the camera feed, so frames are
-# now FULL-PAGE captures. Uncapped full-page screenshots of a very tall
-# SPA (Discord's channel tree can scroll for tens of thousands of pixels)
-# force the renderer to paint + encode the entire surface — that is the
-# exact memory spike that used to OOM-kill the content process. So the
-# full-page capture is budgeted: pages taller than FULLPAGE_MAX_PX keep
-# the old viewport-only frame, and any full-page failure falls back to a
-# viewport capture instead of dropping the frame.
-FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+# ── LIVE camera frames (full browser view) ─────────────────────────
+# A camera frame must be the BROWSER'S FULL VIEW — the whole window, with
+# the page exactly as it is. The old full_page=True primary path (the
+# engine maps it to CDP captureBeyondViewport) re-rendered the page with
+# the viewport expanded to the full page size BEFORE the capture:
+#   * Discord's React app listens for resize and re-lays out mid-capture,
+#     so frames caught the form blank, shifted or half-rendered — the
+#     "it looks like it hasn't loaded / the code is making it disappear"
+#     symptom;
+#   * content below the original viewport had never been painted (lazy
+#     React), so the "full" image was blank exactly where the filled
+#     form should have been;
+#   * when the expanded capture missed its 20s budget (common in the
+#     1 GB container — the re-render also allocates a huge paint buffer
+#     and can OOM-kill the renderer), the engine silently fell back to a
+#     viewport frame of just the top 720px — the "screenshot isn't full"
+#     symptom.
+# So the primary frame is now a plain FULL-VIEWPORT capture (the entire
+# browser window: stable, zero page perturbation, no blank regions, no
+# OOM), preceded by a conservative reveal step that scrolls the register
+# form into view ONLY when it is entirely out of sight and no menu is
+# open — the filled form is always in the Discord frame, and the camera
+# can never fight the bot's own actions.
+#
+# FULLPAGE_SHOTS=1 opts into the WHOLE SCROLLABLE PAGE instead: the page
+# is first scrolled through in viewport steps (forcing the lazy React
+# content to actually render), then the full surface is captured with an
+# explicit clip and the previous scroll position is restored. Off by
+# default — the full browser view above is what the live feed shows.
+FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "0").strip().lower() not in ("0", "false", "no", "off")
 FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
+
+# Scroll the register form back into view when it is ENTIRELY out of
+# sight. Never touches the scroll while a menu/popout is open (a DOB
+# dropdown mid-selection) or when the form is at least partially visible
+# (the bot is working in it). Returns 'scrolled' when it moved the page.
+_REVEAL_FORM_JS = r"""() => {
+    try {
+        const openMenu = document.querySelector(
+            '[role="option"], [role="menuitem"], [class*="popout" i]');
+        if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        const form = document.querySelector('form')
+            || document.querySelector(
+                'input[name="email"], input[type="email"], input[name="password"]');
+        if (!form) return 'ok';
+        const r = form.getBoundingClientRect();
+        if (!r || (r.width === 0 && r.height === 0)) return 'ok';
+        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (vh <= 0) return 'ok';
+        if (!(r.bottom <= 0 || r.top >= vh)) return 'ok';
+        form.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return 'scrolled';
+    } catch (e) {
+        return 'ok';
+    }
+}"""
+
+# Full size of the scrollable document + the current viewport.
+_PAGE_SIZE_JS = r"""() => {
+    const de = document.documentElement;
+    const b = document.body;
+    const docH = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
+    return {
+        docH: docH,
+        vw: window.innerWidth || (de ? de.clientWidth : 0),
+        vh: window.innerHeight || (de ? de.clientHeight : 0),
+    };
+}"""
+
+
+async def _full_page_shot(page, log=None,
+                          fullpage_timeout: float = 20.0) -> bytes:
+    """Whole scrollable surface of a lazy-rendering SPA, or b"".
+
+    1. Measure the full size; skip when the page fits the viewport (the
+       viewport frame IS the full page) or exceeds the OOM budget.
+    2. Scroll through in viewport-sized steps with short pauses so React
+       actually renders the lazy content below the fold (a bare
+       beyond-viewport capture would paint that area blank).
+    3. Capture the full surface with an explicit clip (one paint — no
+       viewport resize storm), then restore the pre-capture scroll
+       position so the frame never yanks the bot's working position.
+    """
+    try:
+        size = await asyncio.wait_for(page.evaluate(_PAGE_SIZE_JS), timeout=2.5)
+        if not isinstance(size, dict):
+            return b""
+        doc_h = float(size.get("docH") or 0)
+        vw = float(size.get("vw") or 0)
+        vh = float(size.get("vh") or 0)
+        if vw <= 0 or vh <= 0 or doc_h <= vh * 1.05:
+            return b""  # fits (roughly) in the viewport - viewport frame is full
+        if doc_h > FULLPAGE_MAX_PX:
+            if log:
+                log(f"[Shot] page {int(doc_h)}px tall exceeds the "
+                    f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
+            return b""
+        # Remember where the bot is working, then scroll through so the
+        # lazy content renders (real scroll events, short settle pauses).
+        try:
+            scroll_y = float(await asyncio.wait_for(
+                page.evaluate("window.scrollY || 0"), timeout=2.0))
+        except Exception:
+            scroll_y = 0.0
+        step = vh * 0.9
+        steps = max(1, int((doc_h - vh) / step)) + 1
+        for i in range(1, steps + 1):
+            y = min(step * i, doc_h - vh)
+            try:
+                await asyncio.wait_for(
+                    page.evaluate(f"window.scrollTo(0, {int(y)})"), timeout=2.0)
+            except Exception:
+                break
+            await asyncio.sleep(0.15)
+        data = b""
+        try:
+            data = await asyncio.wait_for(
+                page.screenshot(full_page=True,
+                                clip={"x": 0, "y": 0,
+                                      "width": int(vw), "height": int(doc_h)},
+                                timeout=fullpage_timeout * 1000),
+                timeout=fullpage_timeout)
+        except Exception as e:
+            if log:
+                log(f"[Shot] full-page capture failed "
+                    f"({type(e).__name__}) - viewport frame", level="warn")
+        finally:
+            try:
+                await asyncio.wait_for(
+                    page.evaluate(f"window.scrollTo(0, {int(scroll_y)})"),
+                    timeout=2.0)
+            except Exception:
+                pass
+        return data or b""
+    except Exception:
+        return b""
 
 
 async def capture_page_screenshot(page, log=None,
                                   fullpage_timeout: float = 20.0,
                                   viewport_timeout: float = 10.0) -> bytes:
-    """FULL-PAGE PNG capture with an OOM safety net.
+    """Full browser-view frame, with the register form guaranteed in sight.
 
-    Measures the page first; when its scroll height fits the
-    FULLPAGE_MAX_PX budget it captures the whole scrollable surface (what
-    the operator asked for: "see everything"), otherwise it degrades to a
-    viewport-only frame. Both the worker camera loop and the dashboard
-    LIVE feed go through here, so every frame in the dashboard is the
-    tallest safe capture. Returns PNG bytes, or b"" when even the
-    viewport capture fails (callers keep their last good frame).
+    Primary path (default): a conservative reveal step — scroll the
+    register form into view only when it is ENTIRELY out of sight and no
+    menu is open (see _REVEAL_FORM_JS), so the camera can never fight
+    the bot's own actions — then a FULL-VIEWPORT capture: the entire
+    browser window, zero page perturbation, no blank beyond-viewport
+    regions, no OOM. This is the "full browser view" the feed shows.
+
+    Opt-in path (FULLPAGE_SHOTS=1): the whole scrollable surface,
+    rendered first by a scroll-through so lazy content is in the paint
+    (see _full_page_shot), budgeted by FULLPAGE_MAX_PX.
+
+    Every caller (worker camera loop, dashboard LIVE feed, the event
+    captures in the signup flow) goes through here. Returns PNG bytes,
+    or b"" when even the viewport capture fails (callers keep their last
+    good frame).
     """
     if page is None:
         return b""
@@ -1164,38 +1297,46 @@ async def capture_page_screenshot(page, log=None,
         except Exception:
             return b""
 
+    # Reveal the form when it is entirely out of sight (see _REVEAL_FORM_JS).
+    try:
+        if await asyncio.wait_for(page.evaluate(_REVEAL_FORM_JS), timeout=2.0) == "scrolled":
+            await asyncio.sleep(0.25)  # let the scroll + repaint settle
+    except Exception:
+        pass
+
     if FULLPAGE_SHOTS:
-        height = 0
         try:
-            height = await asyncio.wait_for(page.evaluate(
-                "() => Math.max("
-                "document.documentElement ? document.documentElement.scrollHeight : 0,"
-                " document.body ? document.body.scrollHeight : 0)"), timeout=2.5)
-        except Exception:
-            height = 0
-        if not isinstance(height, (int, float)) or isinstance(height, bool):
-            height = 0
-        if height <= FULLPAGE_MAX_PX:
-            try:
-                data = await asyncio.wait_for(
-                    page.screenshot(full_page=True, timeout=fullpage_timeout * 1000), timeout=fullpage_timeout)
-                if data:
-                    return data
-                if log:
-                    log("[Shot] empty full-page capture - viewport frame",
-                        level="warn")
-            except Exception as e:
-                if log:
-                    log(f"[Shot] full-page capture failed "
-                        f"({type(e).__name__}) - viewport frame", level="warn")
-        elif height > FULLPAGE_MAX_PX and log:
-            log(f"[Shot] page {int(height)}px tall exceeds the "
-                f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
-    # Viewport fallback (one retry, like the old capture loop).
+            shot = await _full_page_shot(page, log=log,
+                                         fullpage_timeout=fullpage_timeout)
+            if shot:
+                return shot
+        except Exception as e:
+            if log:
+                log(f"[Shot] full-page path failed ({type(e).__name__}) - viewport frame",
+                    level="warn")
+
+    # Primary frame: the full viewport (the entire browser window).
     shot = await _viewport(viewport_timeout)
     if not shot and viewport_timeout >= 8.0:
         shot = await _viewport(10.0)
     return shot
+
+
+# ── Browser-error URL detection (engine-agnostic) ──────────────────────
+# A dead proxy / DNS failure lands the tab on the browser's built-in error
+# page. Chromium spells it chrome-error://chromewebdata/; Camoufox (Firefox)
+# spells it about:neterror::e-connection-failed (and friends). Both are
+# DEFINITIVE "this circuit cannot reach Discord at all" signals — rotate.
+_BROWSER_ERROR_URL_MARKERS = (
+    "chrome-error://",
+    "about:neterror",
+    "neterror::",
+)
+
+
+def _is_browser_error_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return any(m in u for m in _BROWSER_ERROR_URL_MARKERS)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1204,8 +1345,8 @@ async def capture_page_screenshot(page, log=None,
 
 # Pointer realism is provided by human_mouse.py (manual cubic-bezier glide,
 # settle, and human dwell on down/up) for the challenge interactions that need
-# it, and by plain page.mouse clicks elsewhere. The truedriver facade maps
-# page.mouse to native CDP Input.dispatchMouseEvent.
+# it, and by plain page.mouse clicks elsewhere. Camoufox's humanize layer
+# drives page.mouse with its own bezier trajectories on top of that.
 
 class DiscordAutomation:
     def __init__(self, headless: bool = False, email: str = "",
@@ -1279,8 +1420,9 @@ class DiscordAutomation:
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
         self._last_browser_diag = 0.0
-        # truedriver launches Chrome with a fresh temporary profile per launch
-        # — there is no bot-side fingerprint to keep.
+        # Camoufox owns the identity: a fresh temporary profile per launch and
+        # a freshly randomized fingerprint per context (engine-owned) —
+        # there is no bot-side fingerprint to keep.
         self._fingerprint = {}
 
     def _log(self, message: str, level: str = "info") -> None:
@@ -1336,17 +1478,17 @@ class DiscordAutomation:
         def _collect() -> dict:
             try:
                 from importlib.metadata import version
-                truedriver_version = version("truedriver")
+                camoufox_version = version("camoufox")
             except Exception:
-                truedriver_version = "unknown"
-            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "truedriver")
+                camoufox_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "camoufox")
             return {
                 "reason": reason,
                 "error_type": type(exc).__name__ if exc is not None else "",
                 "error": str(exc)[:500] if exc is not None else "",
                 "uid": os.getuid() if hasattr(os, "getuid") else None,
                 "engine": ENGINE,
-                "truedriver_package": truedriver_version,
+                "camoufox_package": camoufox_version,
                 "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
                 "page_present": self._page is not None,
                 "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
@@ -1370,10 +1512,10 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (truedriver applies it at launch
-        — a context-level proxy would either be ignored or rejected).
-        Returns the Playwright-style {server, username, password} dict
-        (or None for TOR/direct)."""
+        """The proxy rides on browser launch (Camoufox applies it at firefox
+        launch — a context-level proxy would be rejected when the browser
+        already has one). Returns the Playwright-style {server, username,
+        password} dict (or None for TOR/direct)."""
         if not (self.proxy and isinstance(self.proxy, dict)):
             return None
         p = self.proxy
@@ -1399,7 +1541,7 @@ class DiscordAutomation:
         # residential session, relaunch must ride TOR exactly like initialize()
         # does — otherwise switch_proxy(None) silently goes DIRECT (the
         # context-level proxy is ignored by the engine) and Discord's
-        # Cloudflare blocks the datacenter IP with chrome-error.
+        # Cloudflare blocks the datacenter IP with a browser error page.
         launch_proxy = self._launch_proxy()
         if launch_proxy is None and not self._direct and _tor_check():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
@@ -1452,16 +1594,16 @@ class DiscordAutomation:
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
-        # Chromium uses a clean Playwright context for each launch. Do not
-        # claim engine-level fingerprint randomization that the driver does
-        # not provide; diagnostics should reflect the runtime accurately.
+        # Camoufox mints a FRESH randomized identity per launch (OS, screen,
+        # GPU, fonts, UA, TLS) and another one per context — identity is
+        # engine-owned; there is nothing for the bot to pin or randomize.
         self._ua = ""
         self._fingerprint = {}
         self._log(f"[Engine] Fresh {ENGINE} context requested")
 
-        # Launch the browser WITH the proxy. The engine applies it as a
-        # --proxy-server launch arg — a proxy passed later to new_context()
-        # would be silently ignored and traffic would go direct.
+        # Launch the browser WITH the proxy. The engine applies it at
+        # firefox launch — a proxy passed later to new_context() would be
+        # rejected and traffic would go direct.
         launch_proxy = self._launch_proxy()
         if launch_proxy is None and _tor_check():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
@@ -1494,7 +1636,7 @@ class DiscordAutomation:
             self._log("[TOR] Using TOR SOCKS5 proxy...")
             if _tor_newnym():
                 self._log("[TOR] New identity requested")
-            # truedriver already rides the TOR proxy from browser launch — a
+            # Camoufox already rides the TOR proxy from browser launch — a
             # context-level proxy would be rejected by Playwright when the
             # browser was launched with one.
             await asyncio.sleep(1)
@@ -1719,7 +1861,7 @@ class DiscordAutomation:
     async def switch_direct(self) -> bool:
         """Relaunch the browser with NO proxy (direct egress). Last resort when
         every residential session is dead and TOR is unavailable — the LIVE
-        tab still renders a real page instead of chrome-error."""
+        tab still renders a real page instead of a browser error page."""
         self.proxy = None
         self._direct = True
         try:
@@ -1767,8 +1909,8 @@ class DiscordAutomation:
                 return bool(closed())
             if closed is not None:
                 return bool(closed)
-            # truedriver's wrapper may not expose is_closed; a tiny bounded read
-            # distinguishes a live page from a closed CDP target.
+            # some engine wrappers may not expose is_closed; a tiny bounded
+            # read distinguishes a live page from a closed target.
             await asyncio.wait_for(page.evaluate("location.href"), timeout=1.0)
             return False
         except Exception:
@@ -1777,8 +1919,9 @@ class DiscordAutomation:
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
-        The Chromium driver recreates its Playwright context on relaunch.
-        Reset local state so the next launch starts from a clean context."""
+        The Camoufox engine mints a fresh fingerprint per context, so a
+        relaunch/context rebuild is already a new identity. Reset local
+        state so the next launch starts from a clean context."""
         self._fingerprint = {}
         self._ua = ""
         self._log(f"[Engine] {ENGINE} context will be recreated on next launch")
@@ -1900,9 +2043,9 @@ class DiscordAutomation:
             # already waits for the Discord SPA to boot, so we lose nothing.
             #
             # WRAPPED in asyncio.wait_for: the engine's timeout is advisory
-            # only. When the proxy is dead, Chromium's internal TCP retry logic
-            # can hang regardless of timeout — asyncio.wait_for with a hard cap
-            # kills the coroutine and forces a fresh proxy.
+            # only. When the proxy is dead, the browser's internal TCP retry
+            # logic can hang regardless of timeout — asyncio.wait_for with a
+            # hard cap kills the coroutine and forces a fresh proxy.
             await asyncio.wait_for(
                 self._page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms),
                 timeout=(timeout_ms / 1000.0) + 3.0,  # hard cap (never 18s)
@@ -1919,7 +2062,7 @@ class DiscordAutomation:
             # attempt as "No email available". It can also raise transport
             # errors when the circuit dies mid-commit. None of that is fatal
             # here: the render-wait loop below is the real gate and rotates
-            # on chrome-error / dead reads, so a slow-but-alive TOR circuit
+            # on browser-error / dead reads, so a slow-but-alive TOR circuit
             # gets to finish loading instead of being killed at 30s.
             elapsed = time.time() - t0
             err_type = type(e).__name__.lower()
@@ -1989,15 +2132,16 @@ class DiscordAutomation:
         self._log('[Nav] Page: title="' + str(page_title)[:80] + '" url=' + str(page_url)[:80])
 
         # ── Dead proxy (cannot reach Discord at all) ──
-        # chrome-error:// is a REAL dead signal (DNS/connection failure).
-        # about:blank is NOT dead: a slow TOR/residential circuit can still be
-        # committing the navigation when the goto cap fires, so a blank tab
-        # means "still loading" here, not "dead". Dead sessions surface
-        # chrome-error within seconds; blank-but-alive sessions just need the
-        # render-wait loop below (which re-issues the goto if the tab stays
-        # blank). Bouncing on about:blank is what made the bot "fail instantly
-        # without waiting" on slow circuits.
-        if "chrome-error://" in (page_url or ""):
+        # A browser error page (chrome-error:// on Chromium, about:neterror
+        # on Camoufox/Firefox) is a REAL dead signal (DNS/connection
+        # failure). about:blank is NOT dead: a slow TOR/residential circuit
+        # can still be committing the navigation when the goto cap fires, so
+        # a blank tab means "still loading" here, not "dead". Dead sessions
+        # surface an error page within seconds; blank-but-alive sessions just
+        # need the render-wait loop below (which re-issues the goto if the
+        # tab stays blank). Bouncing on about:blank is what made the bot
+        # "fail instantly without waiting" on slow circuits.
+        if _is_browser_error_url(page_url):
             proxy_label = "PROXY SESSION" if self.proxy else "TOR CIRCUIT"
             self._nav_error = f"{proxy_label.lower()} dead (browser error page: {page_url[:60]})"
             self._log(f"[Nav] {proxy_label} DEAD (url={page_url[:60]}) - rotating to fresh circuit")
@@ -2009,7 +2153,7 @@ class DiscordAutomation:
         # A slow TOR/residential circuit can keep the page unreadable for
         # minutes while the navigation commits and React downloads. The
         # render-wait loop below is the only gate; real dead proxies were
-        # already caught by the chrome-error / about:blank check above.
+        # already caught by the browser-error / about:blank check above.
         title_blank = not str(page_title or "").strip()
         url_blank = not str(page_url or "").strip() or str(page_url or "").strip() in ("about:blank",)
         if title_blank and url_blank:
@@ -2177,8 +2321,8 @@ class DiscordAutomation:
                 # ── Mid-wait page-health checks ──
                 cur_url = (state.get("url") or "").strip() or ""
                 # Browser error page appearing mid-wait = the circuit died.
-                if "chrome-error://" in cur_url:
-                    self._nav_error = "proxy/circuit dead (chrome-error page)"
+                if _is_browser_error_url(cur_url):
+                    self._nav_error = "proxy/circuit dead (browser error page)"
                     self._log("[Nav] Browser error page - rotating circuit")
                     return False
                 if cur_url in ("", "about:blank"):
@@ -2387,7 +2531,7 @@ class DiscordAutomation:
                                     reason: str = "renderer crashed") -> bool:
         """Recover one unavailable page with a fresh browser process.
 
-        A truedriver renderer crash or a TargetClosedError can leave the browser
+        A renderer crash or a TargetClosedError can leave the browser
         transport technically connected while its page/context is unusable.
         Restarting the complete browser once avoids trying to poll a target
         that no longer exists; a second failure is left to normal rotation.
@@ -2420,10 +2564,10 @@ class DiscordAutomation:
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
-        # FULL-PAGE capture (operator asked to see everything), budgeted by
-        # FULLPAGE_MAX_PX with an automatic viewport fallback — the OOM
-        # guard lives in capture_page_screenshot. Same base64 history
-        # contract as before: latest frame appended, ring trimmed at 100.
+        # Full browser-view frame (form revealed when out of sight; whole
+        # scrollable page only when FULLPAGE_SHOTS=1) — the capture policy
+        # lives in capture_page_screenshot. Same base64 history contract
+        # as before: latest frame appended, ring trimmed at 100.
         screenshot = await capture_page_screenshot(
             self._page, log=self._log, fullpage_timeout=20.0)
         if not screenshot:
@@ -2634,7 +2778,7 @@ class DiscordAutomation:
     # ── Cloudflare Turnstile ─────────────────────────────────────────────
     # Discord sits behind Cloudflare, and a Turnstile captcha can gate
     # navigation / form submit / mail verification. The widget is clicked
-    # with a real, humanized locator click on the truedriver page (the engine's
+    # with a real, humanized locator click on the Camoufox page (the engine's
     # humanize layer drives the pointer — never a synthetic JS event), then
     # we confirm the challenge cleared via cf_clearance or the widget
     # leaving the DOM.
@@ -2669,14 +2813,14 @@ class DiscordAutomation:
     async def _solve_turnstile_if_present(self) -> bool:
         """Bypass a Cloudflare Turnstile widget with a humanized click.
 
-        Clicks the widget checkbox with a real locator click on the truedriver
+        Clicks the widget checkbox with a real locator click on the Camoufox
         page, then confirms the challenge cleared via the cf_clearance
         cookie or the widget frame disappearing."""
         try:
             if not await self._detect_turnstile():
                 return False
             self._log("[Turnstile] Widget present - clicking it...")
-            # Humanized click on the widget checkbox (truedriver drives the
+            # Humanized click on the widget checkbox (Camoufox drives the
             # pointer with its humanize layer — never a synthetic JS event).
             clicked = False
             for sel in self._TURNSTILE_SELECTORS:
@@ -4653,7 +4797,7 @@ class DiscordAutomation:
 
             # ── Custom dropdown: open the menu, then pick the option ──
             # Discord re-renders the form while credentials are being written
-            # (React controlled inputs) and truedriver's humanized cursor moves
+            # (React controlled inputs) and Camoufox's humanized cursor moves
             # slowly, so a single Playwright click can hang on 'performing
             # click action' for the full 30s default even though the element
             # resolved visible+stable — the exact stall from the field logs.
@@ -4690,7 +4834,7 @@ class DiscordAutomation:
                         self._log(f"[DOB] open click {label}: {str(e)[:150]}", level="warn")
                 elif open_method == "coords":
                     # Trusted input at the control's center — engine-
-                    # humanized by truedriver (bezier, no added delay), no
+                    # humanized by Camoufox (bezier travel), no
                     # actionability re-checks to stall on.
                     try:
                         await ctrl.scroll_into_view_if_needed(timeout=3000)
@@ -5056,7 +5200,7 @@ class DiscordAutomation:
     async def _type_humanly(self, sel: str, val: str) -> bool:
         """Type one field like a real person instead of pasting it.
 
-        Real click focuses the input (truedriver humanizes the cursor path),
+        Real click focuses the input (Camoufox humanizes the cursor path),
         then character-by-character keyboard input with variable rhythm,
         one mid-field "thinking" pause, and an occasional typo corrected
         with backspace. Returns True only when the field holds `val` —
@@ -5151,11 +5295,11 @@ class DiscordAutomation:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0 or not (await loc.first.is_visible()):
                 return False
-            # truedriver fill() APPENDS to a non-empty field instead of
-            # replacing (probed on the engine: re-filling a filled input
-            # yields old+new concatenated - the "email shows the address
-            # twice/mangled" corruption). Clear FIRST, then write, then
-            # verify; the JS-setter fallback below is the guaranteed-
+            # Clear FIRST, then write, then verify. Playwright fill() already
+            # replaces the value, but an explicit empty fill guards against
+            # any engine build that appends to a non-empty field (that
+            # concatenation was the "email shows the address twice/mangled"
+            # corruption); the JS-setter fallback below is the guaranteed-
             # replace path for anything that still slips.
             await loc.first.fill("")
             await asyncio.sleep(0.05)

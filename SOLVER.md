@@ -329,7 +329,7 @@ metrics). The models directory IS committed (~2.7 MB total).
 | `OLLAMA_MODEL` | vision model name | `qwen3-vl:2b` |
 | `SOLVER_CNN_MIN_CONF` | mean per-tile confidence to trust the offline grid path | `0.62` |
 | `SOLVER_MODELS_DIR` | where the `.pt`/`.json` live | `./models` |
-| `FULLPAGE_SHOTS` | capture FULL-PAGE dashboard camera frames | `1` |
+| `FULLPAGE_SHOTS` | whole scrollable page camera frames (default: full browser-view frames with the register form revealed when out of sight) | `0` |
 | `FULLPAGE_MAX_PX` | max page height (px) worth a full-page frame; taller pages fall back to viewport frames | `8000` |
 
 ## Measured results (`python test_solver.py`, held-out rounds, disjoint

@@ -57,13 +57,14 @@ async def live_meta(bot) -> dict:
 
 
 async def live_screenshot(bot) -> str:
-    """FULL-PAGE PNG -> base64 for the live feed.
+    """Full browser-view PNG -> base64 for the live feed.
 
-    Frames capture the whole scrollable page (so the operator sees
-    everything), budgeted by FULLPAGE_MAX_PX with a viewport fallback —
-    see server.capture_page_screenshot for the OOM safety net. Failures
-    log the EXACT reason so the dashboard's ALL LOGS shows why a frame is
-    missing instead of silently sitting on 'waiting for frame'."""
+    Frames are the whole browser window, with the register form revealed
+    when it is out of sight (whole scrollable page only when
+    FULLPAGE_SHOTS=1) — see server.capture_page_screenshot for the
+    capture policy and the OOM safety net. Failures log the EXACT reason
+    so the dashboard's ALL LOGS shows why a frame is missing instead of
+    silently sitting on 'waiting for frame'."""
     page = getattr(bot, "_page", None)
     if page is None:
         return ""
@@ -108,9 +109,13 @@ async def get_live_state(bot) -> dict:
 
 def _dead_page(url: str) -> bool:
     """True when the page is a browser error/blank page (proxy tunnel died,
-    site unreachable, or navigation never happened) rather than real content."""
+    site unreachable, or navigation never happened) rather than real content.
+
+    Engine-agnostic: Chromium spells a dead tunnel chrome-error://chromewebdata/,
+    Camoufox (Firefox) spells it about:neterror::e-connection-failed (and
+    friends)."""
     u = (url or "").lower()
-    if "chrome-error" in u or "err_tunnel" in u or "err_" in u:
+    if "chrome-error" in u or "neterror" in u or "err_tunnel" in u or "err_" in u:
         return True
     if u in ("", "about:blank") or u.startswith("about:"):
         return True
@@ -150,9 +155,10 @@ async def live_navigate(bot, url: str) -> dict:
         meta["error"] = f"navigation failed: {e}"
         return meta
     meta = await get_live_state(bot)
-    # goto() can 'succeed' straight onto a chrome-error page when the proxy
-    # CONNECT tunnel is dead — treat that as a navigation failure so the
-    # caller can rotate the session.
+    # goto() can 'succeed' straight onto a browser error page (chrome-error://
+    # on Chromium, about:neterror on Camoufox) when the proxy CONNECT tunnel
+    # is dead — treat that as a navigation failure so the caller can rotate
+    # the session.
     if _dead_page(meta.get("url", "")):
         meta["error"] = "site unreachable (proxy tunnel failed)"
         return meta
