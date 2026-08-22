@@ -204,7 +204,16 @@ def _key_parts(key: str):
 
 
 async def _dispatch_press(tab, key: str) -> None:
-    """Dispatch a single key press (down, optional char, up) with modifiers."""
+    """Dispatch a single key press (down, optional char, up) with modifiers.
+
+    Chromium inserts a character when EITHER keyDown carries ``text`` OR a
+    separate ``char`` event is sent. Emitting both doubles every letter
+    (``glass`` -> ``ggllaassss``). Non-Shift modifiers (Ctrl/Alt/Meta) must
+    never produce a char at all — otherwise ``Control+a`` types an ``a``
+    instead of selecting, the field never clears, and every refill appends
+    on top of the previous value (the mangled
+    ``shshsh@gggggglaaaaaassssswhiteeee`` form-fill bug).
+    """
     main, mods = _key_parts(key)
     if main in _SPECIAL_KEYS:
         vk, name = _SPECIAL_KEYS[main]
@@ -212,22 +221,26 @@ async def _dispatch_press(tab, key: str) -> None:
     elif len(main) == 1:
         ch = main
         if ch.isalpha():
-            vk, name = ord(ch.upper()), ch.upper()
+            vk, name = ord(ch.upper()), ch
         elif ch.isdigit():
             vk, name = ord(ch), ch
         else:
             vk, name = ord(ch), ch
         if ch.isupper() or ch in _SHIFTED_CHARS:
             mods |= 8
-        text = ch if ch.isprintable() else None
+        # Only emit an insertable char when no non-Shift modifier is held.
+        # Control/Alt/Meta shortcuts (Ctrl+A, Ctrl+C, ...) must not type.
+        non_shift = mods & ~8
+        text = ch if (ch.isprintable() and not non_shift) else None
     else:
         vk, name = ord(main[0]) if main else 0, main
         text = None
 
     code = _code_for(name)
+    # keyDown/keyUp must NOT carry text when a char event follows — Chrome
+    # would insert the character twice (once per event).
     down = dict(type_="keyDown", key=name, code=code, windows_virtual_key_code=vk,
-                native_virtual_key_code=vk, modifiers=mods, text=text,
-                unmodified_text=text)
+                native_virtual_key_code=vk, modifiers=mods)
     await tab.send(cdp.input_.dispatch_key_event(**down))
     if text:
         await tab.send(cdp.input_.dispatch_key_event(
@@ -526,6 +539,13 @@ class _Locator:
             button=cdp.input_.MouseButton("left"), buttons=0, click_count=1))
 
     async def fill(self, text: str, timeout: Optional[float] = None, **kwargs) -> None:
+        """Replace the whole input value (Playwright fill semantics).
+
+        Never appends. Clears via the native value setter first so a broken
+        Ctrl+A path cannot leave old characters in the field, then inserts
+        the new text with a single CDP insertText (trusted input events React
+        accepts). Falls back to per-char key events only if insertText fails.
+        """
         el = await self._wait_element(timeout)
         if el is None:
             raise TimeoutError(f"locator fill: element not found for '{self._selector}'")
@@ -533,9 +553,42 @@ class _Locator:
             await el.focus()
         except Exception:
             pass
-        await _dispatch_press(self._tab, "Control+a")
-        await _dispatch_press(self._tab, "Backspace")
-        for ch in str(text):
+        # Hard-clear the current value on the element itself. Focus + Ctrl+A
+        # alone is not enough: if select-all fails (or used to type an "a"),
+        # subsequent keystrokes APPEND and produce mangled concatenations
+        # like "user@domain.comuser@domain.com" / doubled letters.
+        try:
+            await el.apply(
+                "(e) => {"
+                "  try {"
+                "    const setter = Object.getOwnPropertyDescriptor("
+                "      window.HTMLInputElement.prototype, 'value').set"
+                "      || Object.getOwnPropertyDescriptor("
+                "      window.HTMLTextAreaElement.prototype, 'value').set;"
+                "    if (setter) setter.call(e, '');"
+                "    else e.value = '';"
+                "    try { const t = e._valueTracker; if (t && t.setValue) t.setValue(''); } catch (err) {}"
+                "    e.dispatchEvent(new Event('input', { bubbles: true }));"
+                "  } catch (err) { try { e.value = ''; } catch (e2) {} }"
+                "}"
+            )
+        except Exception:
+            # Last-resort clear via keyboard (now correctly non-typing Ctrl+A).
+            try:
+                await _dispatch_press(self._tab, "Control+a")
+                await _dispatch_press(self._tab, "Backspace")
+            except Exception:
+                pass
+        text = str(text)
+        if not text:
+            return
+        # Single trusted insert — no per-char doubling risk.
+        try:
+            await self._tab.send(cdp.input_.insert_text(text))
+            return
+        except Exception:
+            pass
+        for ch in text:
             if ch == "\n":
                 await _dispatch_press(self._tab, "Enter")
             else:
