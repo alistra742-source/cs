@@ -4011,21 +4011,54 @@ class DiscordAutomation:
             # down and comes back re-probes cleanly on the next challenge.
             if not getattr(self, "_vision_ready", False):
                 ok, models = False, []
+                # Authentication/protocol failures are deterministic: waiting
+                # and replaying the same request cannot fix them.  Only retry
+                # transient connection, timeout, rate-limit, and 5xx failures.
+                terminal_probe_errors = {"authentication", "authorization", "protocol"}
+                probes_made = 0
                 for _probe in range(3):
+                    probes_made = _probe + 1
                     ok, models = await self._vision.check()
                     if ok:
                         break
-                    self._log(
-                        f"[Captcha] Vision endpoint not responding (probe {_probe + 1}/3) - "
-                        "may be cold-starting or down; retrying in 10s", level="warn")
-                    await asyncio.sleep(10)
+                    check_error = getattr(self._vision, "last_check_error", "")
+                    if check_error in terminal_probe_errors:
+                        break
+                    if _probe < 2:
+                        self._log(
+                            f"[Captcha] Vision endpoint temporarily unavailable "
+                            f"(probe {_probe + 1}/3, {check_error or 'unknown error'}) - "
+                            "retrying in 10s", level="warn")
+                        await asyncio.sleep(10)
                 if not ok:
-                    self._log(
-                        f"[Captcha] Vision server unreachable after 3 probes at {self._vision.base} "
-                        "- check VISION_API_BASE / service status "
-                        "(recommended model: qwen3-vl:2b). This round cannot be "
-                        "solved until it answers; later challenges re-probe automatically.",
-                        level="error")
+                    check_error = getattr(self._vision, "last_check_error", "")
+                    http_status = getattr(self._vision, "last_check_http_status", None)
+                    if check_error == "authentication":
+                        self._log(
+                            f"[Captcha] Vision endpoint is UP but rejected authentication "
+                            f"(HTTP {http_status or 401}). This app and the Vision AI "
+                            "service have different or missing VISION_API_KEY values. "
+                            "Configure both Railway services from the same shared variable; "
+                            "do not put the secret in logs.", level="error")
+                    elif check_error == "authorization":
+                        self._log(
+                            f"[Captcha] Vision endpoint denied access "
+                            f"(HTTP {http_status or 403}); check the gateway authorization "
+                            "policy.", level="error")
+                    elif check_error == "protocol":
+                        self._log(
+                            f"[Captcha] Vision endpoint at {self._vision.base} is reachable "
+                            "but is not a compatible Ollama API; expected GET /api/tags.",
+                            level="error")
+                    else:
+                        self._log(
+                            f"[Captcha] Vision server unavailable after {probes_made} "
+                            f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
+                            "- check VISION_API_BASE / service status. Later challenges "
+                            "will re-probe automatically.", level="error")
+                    # Do not issue several expensive /api/chat requests after
+                    # the readiness probe already proved they cannot succeed.
+                    return False
                 elif self._vision.model not in models:
                     self._log(
                         f"[Captcha] Ollama model {self._vision.model} not pulled - "

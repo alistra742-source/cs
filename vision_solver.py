@@ -210,6 +210,12 @@ class OllamaVisionClient:
         self.model = model or "qwen3-vl:2b"
         self._api_key = VISION_API_KEY
         self.stats = {"calls": 0, "ok": 0, "failed": 0}
+        # Machine-readable result of the latest reachability probe.  Keep the
+        # public ``check() -> (ok, models)`` contract for existing callers,
+        # while letting them distinguish a transient connection failure from
+        # deterministic configuration errors such as HTTP 401 or 404.
+        self.last_check_error = ""
+        self.last_check_http_status: Optional[int] = None
         # Log which env var supplied the base, so diagnostics are clear.
         src = "VISION_API_BASE" if os.environ.get("VISION_API_BASE", "").strip() else \
               ("OLLAMA_BASE" if os.environ.get("OLLAMA_BASE", "").strip() else "default")
@@ -231,24 +237,83 @@ class OllamaVisionClient:
         """Probe the Ollama server and list pulled models.
 
         Returns ``(ok, models)`` — ``models`` is a list of model names
-        (including tags) or [] when the server is unreachable.
+        (including tags) or [] when the probe fails.  ``last_check_error``
+        classifies failures so callers do not mistake an HTTP 401 (the server
+        is up, but the credentials differ) for a cold start and retry it.
         """
+        self.last_check_error = ""
+        self.last_check_http_status = None
         try:
             timeout = aiohttp.ClientTimeout(total=VISION_CHECK_TIMEOUT)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.get(f"{self.base}/api/tags",
                                  headers=await self._headers()) as r:
                     if r.status != 200:
-                        self._log(f"[Ollama] /api/tags HTTP {r.status}", level="warn")
+                        self.last_check_http_status = int(r.status)
+                        if r.status == 401:
+                            self.last_check_error = "authentication"
+                            key_state = ("the configured VISION_API_KEY was rejected"
+                                         if self._api_key else
+                                         "VISION_API_KEY is not configured in this service")
+                            self._log(
+                                f"[Vision] Authentication failed at {self.base} "
+                                f"(HTTP 401): {key_state}", level="error")
+                        elif r.status == 403:
+                            self.last_check_error = "authorization"
+                            self._log(
+                                f"[Vision] Access forbidden at {self.base} (HTTP 403)",
+                                level="error")
+                        elif r.status == 404:
+                            self.last_check_error = "protocol"
+                            self._log(
+                                f"[Vision] {self.base} does not expose the expected "
+                                "Ollama /api/tags endpoint (HTTP 404)", level="error")
+                        elif r.status == 429:
+                            self.last_check_error = "rate_limit"
+                            self._log(f"[Vision] /api/tags rate limited (HTTP 429)",
+                                      level="warn")
+                        elif r.status >= 500:
+                            self.last_check_error = "server"
+                            self._log(f"[Vision] /api/tags server error HTTP {r.status}",
+                                      level="warn")
+                        else:
+                            self.last_check_error = "http"
+                            self._log(f"[Vision] /api/tags HTTP {r.status}", level="warn")
                         return False, []
-                    data = await r.json()
+                    try:
+                        data = await r.json()
+                    except Exception as e:
+                        self.last_check_error = "protocol"
+                        self._log(
+                            f"[Vision] /api/tags returned invalid JSON: "
+                            f"{type(e).__name__}", level="error")
+                        return False, []
+            if not isinstance(data, dict) or not isinstance(data.get("models", []), list):
+                self.last_check_error = "protocol"
+                self._log("[Vision] /api/tags returned an invalid model-list payload",
+                          level="error")
+                return False, []
             models = [m.get("name") or m.get("model") or ""
-                      for m in (data or {}).get("models", [])]
+                      for m in data.get("models", []) if isinstance(m, dict)]
             models = [m for m in models if m]
             self._log(f"[Ollama] Server OK at {self.base} ({len(models)} models pulled)")
             return True, models
+        except asyncio.TimeoutError:
+            self.last_check_error = "timeout"
+            self._log(
+                f"[Vision] Probe timed out after {VISION_CHECK_TIMEOUT:g}s at {self.base}",
+                level="error")
+            return False, []
+        except aiohttp.ClientError as e:
+            self.last_check_error = "connection"
+            self._log(
+                f"[Vision] Connection failed at {self.base}: {type(e).__name__}",
+                level="error")
+            return False, []
         except Exception as e:
-            self._log(f"[Ollama] Not reachable at {self.base}: {e}", level="error")
+            self.last_check_error = "connection"
+            self._log(f"[Vision] Not reachable at {self.base}: {type(e).__name__}: {e}",
+                      level="error")
             return False, []
 
     async def solve(self, prompt: str, images: List[bytes],

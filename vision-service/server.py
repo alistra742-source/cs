@@ -44,7 +44,11 @@ OLLAMA_MODEL = (
     or os.environ.get("DEFAULT_OLLAMA_MODEL")
     or "ahmadwaqar/smolvlm2-256m-video:q8_0"
 ).strip()
-API_KEY = os.environ.get("VISION_API_KEY", "")
+# Normalize accidental whitespace introduced while copying a Railway secret.
+# The client strips its environment value too; doing the same here prevents an
+# invisible trailing newline from turning two otherwise-identical keys into a
+# permanent HTTP 401. Never log this value.
+API_KEY = os.environ.get("VISION_API_KEY", "").strip()
 # The external/public URL clients use to reach this gateway.  Set by Railway
 # as RAILWAY_PUBLIC_DOMAIN, or override manually with VISION_API_BASE.
 VISION_API_BASE = (

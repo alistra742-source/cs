@@ -25,6 +25,21 @@ VISION_API_KEY=<generate-a-long-random-secret>
 you set both, make their values identical. Do not set `PORT` because Railway
 provides it automatically.
 
+`VISION_API_KEY` must be identical in every client and in this gateway. For two
+services in one Railway project, define it once under **Project Settings →
+Shared Variables**, then attach/reference that shared value from both services:
+
+```text
+VISION_API_KEY=${{ shared.VISION_API_KEY }}
+```
+
+Do not create two service-local values with the same name: they can drift and
+produce HTTP 401 even though both services report the variable as configured.
+Saving the shared reference redeploys the affected services. Never paste the
+secret into application logs, source code, or support messages. A probe that
+returns HTTP 401 means the endpoint is running and the keys do not match; it is
+not a cold-start or reachability failure.
+
 ### Optional variables
 
 ```text
