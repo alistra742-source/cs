@@ -1351,18 +1351,15 @@ class DiscordAutomation:
     async def initialize(self) -> None:
         self._playwright = await async_playwright().start()
 
-        # Best-human-stealth launch args: Camoufox owns launch prefs and the
-        # fingerprint entirely, so there is nothing to add.
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
-        # Engine-level identity: Camoufox mints a fresh randomized profile
-        # per launch — no bot-side UA / font / GPU / locale selection. It
-        # additionally geo-matches the fingerprint to the proxy's real exit
-        # region.
+        # Chromium uses a clean Playwright context for each launch. Do not
+        # claim engine-level fingerprint randomization that the driver does
+        # not provide; diagnostics should reflect the runtime accurately.
         self._ua = ""
         self._fingerprint = {}
-        self._log(f"[Fingerprint] Identity owned by {ENGINE} engine — fresh randomized profile per launch")
+        self._log(f"[Engine] Fresh {ENGINE} context requested")
 
         # Launch the browser WITH the proxy. The engine applies it as a
         # --proxy-server launch arg — a proxy passed later to new_context()
@@ -1677,12 +1674,11 @@ class DiscordAutomation:
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
-        Camoufox mints a fresh persona on EVERY launch (and on every
-        new_context()), so the next relaunch (new proxy session) is
-        automatically a new, unlinkable identity."""
+        The Chromium driver recreates its Playwright context on relaunch.
+        Reset local state so the next launch starts from a clean context."""
         self._fingerprint = {}
         self._ua = ""
-        self._log(f"[Fingerprint] Rotated: fresh {ENGINE} profile on next launch (engine-owned identity)")
+        self._log(f"[Engine] {ENGINE} context will be recreated on next launch")
 
     async def _rebuild_context_with_tor(self) -> bool:
         """Close the context and reopen WITH a fresh TOR circuit."""

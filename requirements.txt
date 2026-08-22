@@ -4,17 +4,10 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Browser engine: Camoufox (https://github.com/daijro/camoufox) — a
-# debloated Firefox fork with C++-level fingerprint spoofing, TLS/network
-# randomization, protocol-level WebRTC IP spoofing and per-context real
-# fingerprints. Fully Playwright-compatible. Incognito is ALWAYS on.
-#
-# After pip install, fetch the browser binary once:
-#   python -m camoufox fetch
-# The [geoip] extra enables geo-matching the fingerprint to the proxy's
-# real exit region (geolocation/timezone/locale + WebRTC IP spoofing);
-# without it the engine falls back to plain randomized fingerprints.
-camoufox[geoip]==0.5.5
+# Browser engine: Playwright-managed Chromium.
+# The matching Chromium build and Linux dependencies are installed in the
+# Dockerfile with ``python -m playwright install --with-deps chromium``.
+playwright==1.61.0
 
 # Web app (dashboard)
 flask>=3.0.0
