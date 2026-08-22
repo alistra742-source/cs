@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """vision_solver.py — local/remote vision solver for the hCaptcha image grid.
 
-Replaces the paid NoneCap / Nopecha token APIs with a vision model you own
-and run. Instead of minting a token server-side, the bot:
+Replaces paid token APIs with a vision model you own and run. Instead of minting a token server-side, the bot:
 
   1. reads the challenge prompt ("Please select all images with a boat") from
      the hCaptcha challenge frame,
@@ -243,6 +242,9 @@ class OllamaVisionClient:
             return None
         if not images:
             return None
+        # Log solving with si vision (vision service / vision_solver)
+        import time
+        self._log(f"{time.strftime('%b %d %H:%M:%S.000 [info]')} solving with si vision")
         self.stats["calls"] += 1
         examples = list(examples or [])
         system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)

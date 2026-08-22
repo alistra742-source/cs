@@ -1132,7 +1132,7 @@ class DiscordAutomation:
         self._password = ""
         self._token = ""
         # Local Ollama vision model solves the hCaptcha image grid itself -
-        # no paid token APIs (NoneCap / Nopecha are gone, see vision_solver.py).
+        # vision model solves the image grid directly (see vision_solver.py).
         self._vision = OllamaVisionClient(log=self._log)
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
@@ -3466,7 +3466,7 @@ class DiscordAutomation:
                 return False
 
             # ---- VISION SOLVER: reads the image grid via vision_solver ----
-            # No paid token APIs (NoneCap / Nopecha are gone). The bot reads
+            # The bot reads the challenge instruction, screenshots every
             # the challenge instruction, screenshots every tile, asks a
             # vision model (local Ollama or remote VISION_API_BASE endpoint)
             # which tiles match, clicks them + Verify, and hCaptcha itself

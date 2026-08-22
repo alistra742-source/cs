@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""hCaptcha DOM helpers (no paid solvers).
+"""hCaptcha DOM helpers (vision model solves the image grid directly).
 
-The paid token APIs (NoneCap / Nopecha) are gone — the bot now solves the
-image challenge itself with a local Ollama vision model (see vision_solver.py
-and server.py's ``_solve_hcaptcha_if_present``). This module keeps only the
-pure DOM helpers the flow still needs:
+The bot solves the challenge itself with a local Ollama vision model
+(see vision_solver.py and server.py's ``_solve_hcaptcha_if_present``).
+This module keeps only the pure DOM helpers the flow still needs:
 
   · extract_hcaptcha_sitekey / extract_hcaptcha_rqdata / extract_rqdata_from_body
     — read the exact sitekey and enterprise rqdata off the live page (still
