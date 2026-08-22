@@ -5,10 +5,12 @@ FunCAPTCHA renders challenges inside a cross-origin iframe with CANVAS —
 you CANNOT query the DOM for slider handles. This solver works entirely
 through screenshots + vision model, then executes drags via coordinates.
 
-Three challenge types:
+Four challenge types:
   1. SLIDER  — jigsaw puzzle piece on a track (canvas-based)
   2. TILES   — clickable tiles (DOM elements, sometimes canvas)
   3. MATCH   — drag items to targets
+  4. STACK   — stacks of blocks, drag blocks on top so every column is
+               equally tall (the "3, 3, 3" boxes puzzle)
 """
 
 from __future__ import annotations
@@ -37,6 +39,11 @@ FUNCAPTCHA_URL_PATTERNS = (
 _SLIDER_KEYWORDS = ("slide", "drag", "puzzle", "align", "piece", "slider")
 _TILE_KEYWORDS = ("click", "tap", "select", "ascending", "descending", "order")
 _MATCH_KEYWORDS = ("match", "pair", "connect", "correspond")
+# Block-stacking game ("drag the boxes so every column is the same height").
+# Checked BEFORE the generic drag wording above — "drag the block onto the
+# stack" contains "drag" but is a STACK round, not a slider.
+_STACK_KEYWORDS = ("same height", "equal height", "same number", "same amount",
+                   "stack", "tower", "pile", "balance")
 
 # ── Vision prompts ───────────────────────────────────────────────
 
@@ -73,6 +80,26 @@ _MATCH_PROMPT = (
     "This is a drag-to-match captcha. Items must be dragged to targets. "
     "Answer with ONLY a JSON object with items and targets arrays. "
     'Example: {"items": [1, 3, 2], "targets": [3, 1, 2]}'
+)
+
+# Block-stacking puzzle: several vertical stacks of blocks (e.g. one 3 tall,
+# one 2 tall, one 1 tall) plus loose draggable blocks; every stack must end
+# up the SAME height. The vision call uses shape="stack" so the multi-drag
+# plan comes back structured (see vision_solver._parse_stack_geometry);
+# this prompt is the task description that rides along with it.
+_STACK_PROMPT = (
+    "The image shows a stacking puzzle: several vertical stacks (columns / "
+    "towers) built from blocks, and one or more loose draggable blocks. "
+    "Drag blocks on top of the stacks so that EVERY stack ends up with the "
+    "SAME number of blocks (make all columns equally tall — e.g. if the "
+    "stacks must be 3 blocks high, every column needs exactly 3). List "
+    "EVERY drag needed, in order. Grab each block by its centre and drop "
+    "it exactly on top of the target stack. Answer with ONLY the JSON "
+    'object {"drags": [[sx, sy, tx, ty], ...]} where sx, sy is the centre '
+    "of the block to grab and tx, ty is the drop point on the target "
+    "stack, all four as integer PERCENTAGES of the image size (0-100, "
+    "measured from the left edge / top edge). "
+    'Example: {"drags": [[12, 80, 12, 40], [88, 82, 50, 55]]}'
 )
 
 
@@ -147,6 +174,8 @@ class DragSolver:
                 solved = await self._solve_tiles(frame, is_canvas)
             elif ctype == "match":
                 solved = await self._solve_match(frame, is_canvas)
+            elif ctype == "stack":
+                solved = await self._solve_stack(frame, is_canvas)
 
             if solved:
                 self._log("[DragSolver] [OK] Solved", level="info")
@@ -231,7 +260,7 @@ class DragSolver:
     # ── Challenge type detection ──────────────────────────────────
 
     async def _detect_challenge_type(self, frame) -> str:
-        """Classify challenge: slider / tiles / match."""
+        """Classify challenge: slider / tiles / match / stack."""
         try:
             text = await frame.evaluate(
                 "() => (document.body ? document.body.innerText : '')"
@@ -240,6 +269,10 @@ class DragSolver:
         except Exception:
             low = ""
 
+        # Stack wording first: it usually also contains "drag", which would
+        # otherwise misroute the round to the slider solver.
+        if any(kw in low for kw in _STACK_KEYWORDS):
+            return "stack"
         if any(kw in low for kw in _SLIDER_KEYWORDS):
             return "slider"
         if any(kw in low for kw in _TILE_KEYWORDS):
@@ -251,7 +284,9 @@ class DragSolver:
             "Which type of captcha is this? One word only: "
             "slider (puzzle piece on track), "
             "tiles (grid of clickable items), "
-            "or match (drag items to targets)."
+            "match (drag items to matching targets), or "
+            "stack (columns/towers of stacked blocks — drag blocks on top "
+            "so every column becomes the same height)."
         )
         try:
             img = await self._screenshot_frame(frame)
@@ -260,6 +295,8 @@ class DragSolver:
             ans = await self._vision.solve(fallback_prompt, [img], timeout=30)
             if ans and ans.get("type") == "text":
                 ta = ans["text"].strip().lower()
+                if "stack" in ta:
+                    return "stack"
                 if "tile" in ta:
                     return "tiles"
                 if "match" in ta:
@@ -578,6 +615,192 @@ class DragSolver:
             self._log(f"[DragSolver] Match error: {e}", level="error")
             return False
 
+    # ── STACK solver ──────────────────────────────────────────────
+
+    async def _solve_stack(self, frame, is_canvas: bool) -> bool:
+        """Solve the block-stacking puzzle ("make every column 3 tall").
+
+        Vision returns the drag plan as iframe-RELATIVE percentages
+        (0-100); we convert to absolute page coordinates using the iframe
+        box and replay each drag humanised. Wrong/failed rounds simply
+        return False — solve()'s retry loop re-screenshots and re-asks.
+        """
+        try:
+            img = await self._screenshot_frame(frame)
+            if not img:
+                self._log("[DragSolver] Stack: no screenshot", level="warn")
+                return False
+
+            fbox = await self._frame_box(frame)
+            if not fbox:
+                self._log("[DragSolver] Stack: no iframe box", level="warn")
+                return False
+            fx, fy = fbox["x"], fbox["y"]
+            fw, fh = fbox["width"], fbox["height"]
+
+            self._log("[DragSolver] Stack: asking vision for the drag plan...",
+                      level="info")
+            ans = None
+            try:
+                ans = await self._vision.solve(
+                    _STACK_PROMPT, [img], timeout=90, shape="stack")
+            except TypeError:
+                # Vision facade without the shape kwarg — plain call, the
+                # multi-transport plan parser handles whatever comes back.
+                ans = await self._vision.solve(_STACK_PROMPT, [img], timeout=90)
+
+            plan = self._parse_stack_plan(ans)
+            if not plan:
+                self._log(f"[DragSolver] Stack: no plan from {ans}",
+                          level="warn")
+                return False
+
+            self._log(f"[DragSolver] Stack: {len(plan)} drag(s): "
+                      + " ".join(f"({s:.0f},{sy:.0f})->({t:.0f},{ty:.0f})"
+                                 for s, sy, t, ty in plan), level="info")
+
+            # Save training sample (optional, only when train/ is available)
+            if img and self._collector:
+                self._collector.save(
+                    img, _STACK_PROMPT,
+                    json.dumps([list(d) for d in plan]), "stack")
+
+            # Percent -> page coords + a little human jitter that stays
+            # well inside the grabbed block.
+            for sx, sy, tx, ty in plan:
+                jx = fw * 0.015
+                jy = fh * 0.015
+                x1 = fx + fw * sx / 100.0 + random.uniform(-jx, jx)
+                y1 = fy + fh * sy / 100.0 + random.uniform(-jy, jy)
+                x2 = fx + fw * tx / 100.0 + random.uniform(-jx, jx)
+                y2 = fy + fh * ty / 100.0 + random.uniform(-jy, jy)
+                ok = await self._human_drag(x1, y1, x2, y2)
+                if not ok:
+                    ok = await self._direct_drag(x1, y1, x2, y2)
+                if not ok:
+                    self._log("[DragSolver] Stack: drag failed mid-plan",
+                              level="warn")
+                    return False
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+
+            # Give Arkose a moment to advance, then let solve()'s loop
+            # verify via _past_funcaptcha (and retry when it did not).
+            await asyncio.sleep(1.0)
+            return True
+
+        except Exception as e:
+            self._log(f"[DragSolver] Stack error: {e}", level="error")
+            return False
+
+    @staticmethod
+    def _parse_stack_plan(ans: Optional[dict]) -> Optional[list]:
+        """Extract a drag plan [(sx, sy, tx, ty), ...] in 0-100 iframe
+        percentages from a vision answer, tolerating every transport the
+        answer pipeline can produce:
+
+          {"type": "drags",  "drags": [(...), ...]}  — shape="stack" parse
+          {"type": "drag",   "from": (x, y), "to": (x, y)} — 0-1 fractions
+          {"type": "text",   "text": '{"drags": ...}' or "sx sy tx ty ..." }
+          {"type": "tiles",  "indices": [sx, sy, tx, ty, ...]} — chunks of 4
+          {"type": "points", "points": [(x, y), ...]} — 0-1 fractions,
+                            pairs (grab, drop, grab, drop, ...)
+
+        Values clamp to 0-100; a coordinate beyond -3..103 rejects its drag
+        (hallucinated pixels); at most 12 drags; None when nothing usable.
+        """
+        if not isinstance(ans, dict):
+            return None
+
+        def _finish(raw: list) -> Optional[list]:
+            out = []
+            for item in raw:
+                try:
+                    a, b, c, d = (float(v) for v in item)
+                except (TypeError, ValueError):
+                    continue
+                if any(v != v for v in (a, b, c, d)):  # NaN
+                    continue
+                if any(v < -3 or v > 103 for v in (a, b, c, d)):
+                    continue
+                out.append((max(0.0, min(100.0, a)), max(0.0, min(100.0, b)),
+                            max(0.0, min(100.0, c)), max(0.0, min(100.0, d))))
+            return [tuple(round(v, 3) for v in drag) for drag in out] or None
+
+        # Primary: the structured multi-drag plan from shape="stack".
+        if ans.get("type") == "drags" and ans.get("drags"):
+            plan = _finish(ans["drags"])
+            if plan:
+                return plan[:12]
+
+        # Squashed single drag (0-1 fractions) -> one percent drag.
+        if ans.get("type") == "drag" and ans.get("from") and ans.get("to"):
+            fx, fy = ans["from"]
+            tx, ty = ans["to"]
+            plan = _finish([[fx * 100.0, fy * 100.0, tx * 100.0, ty * 100.0]])
+            if plan:
+                return plan
+
+        # Flat number lists (tiles indices / free text) -> chunks of four.
+        nums: list = []
+        if ans.get("type") == "tiles" and ans.get("indices"):
+            nums = [float(v) for v in ans["indices"]]
+        elif ans.get("type") == "text" and isinstance(ans.get("text"), str):
+            text = ans["text"].strip()
+            # fenced / embedded JSON first
+            m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+            candidate = m.group(1).strip() if m else text
+            lo, hi = candidate.find("{"), candidate.rfind("}")
+            obj = None
+            if 0 <= lo < hi:
+                try:
+                    obj = json.loads(candidate[lo:hi + 1])
+                except Exception:
+                    obj = None
+            if obj is None:
+                lo, hi = candidate.find("["), candidate.rfind("]")
+                if 0 <= lo < hi:
+                    try:
+                        obj = json.loads(candidate[lo:hi + 1])
+                    except Exception:
+                        obj = None
+            if isinstance(obj, dict):
+                raw = None
+                for key in ("drags", "moves", "drag"):
+                    v = obj.get(key)
+                    if isinstance(v, list) and v:
+                        raw = v
+                        break
+                if raw is None:
+                    return None
+                nums = []
+                for d in raw:
+                    vals = d if isinstance(d, (list, tuple)) else [d]
+                    try:
+                        nums.extend(float(x) for x in vals[:4])
+                    except (TypeError, ValueError):
+                        return None
+            elif isinstance(obj, list):
+                nums = [float(x) for d in obj for x in
+                        (d if isinstance(d, (list, tuple)) else [d])]
+            else:
+                nums = [float(v) for v in re.findall(r"\d+\.?\d*", text)]
+        if len(nums) >= 4:
+            chunks = [nums[i:i + 4] for i in range(0, len(nums), 4)]
+            plan = _finish(chunks)
+            if plan:
+                return plan[:12]
+
+        # Points pairs (0-1 fractions): grab, drop, grab, drop, ...
+        if ans.get("type") == "points" and ans.get("points"):
+            pts = [(float(p[0]), float(p[1])) for p in ans["points"]]
+            if len(pts) >= 4 and len(pts) % 2 == 0:
+                plan = _finish([[pts[i][0] * 100.0, pts[i][1] * 100.0,
+                                 pts[i + 1][0] * 100.0, pts[i + 1][1] * 100.0]
+                                for i in range(0, len(pts), 2)])
+                if plan:
+                    return plan[:12]
+        return None
+
     # ── Utilities ─────────────────────────────────────────────────
 
     async def _screenshot_frame(self, frame) -> Optional[bytes]:
@@ -717,6 +940,60 @@ async def _self_test() -> None:
         status = "OK" if result == expected else \
             f"FAIL (got {result}, expected {expected})"
         print(f"  parse_dual({ans}) = {result} {status}")
+
+    # Stack plan parse tests
+    stack_cases = [
+        # structured multi-drag plan (shape="stack" transport)
+        ({"type": "drags", "drags": [[10, 80, 10, 45], [90, 85, 50, 60]]},
+         [(10.0, 80.0, 10.0, 45.0), (90.0, 85.0, 50.0, 60.0)]),
+        # squashed single drag, 0-1 fractions -> percent
+        ({"type": "drag", "from": (0.12, 0.8), "to": (0.12, 0.4)},
+         [(12.0, 80.0, 12.0, 40.0)]),
+        # fenced JSON in a text transport
+        ({"type": "text", "text":
+          '```json\n{"drags": [[12, 80, 12, 40], [88, 82, 50, 55]]}\n```'},
+         [(12.0, 80.0, 12.0, 40.0), (88.0, 82.0, 50.0, 55.0)]),
+        # bare numbers line ("10 80 10 45 88 82 50 60")
+        ({"type": "text", "text": "10 80 10 45 88 82 50 60"},
+         [(10.0, 80.0, 10.0, 45.0), (88.0, 82.0, 50.0, 60.0)]),
+        # flat tile indices -> chunks of four
+        ({"type": "tiles", "indices": [12, 80, 12, 40]},
+         [(12.0, 80.0, 12.0, 40.0)]),
+        # points pairs (0-1) -> grab/drop pairs in percent
+        ({"type": "points", "points": [(0.12, 0.8), (0.12, 0.4),
+                                       (0.88, 0.82), (0.5, 0.55)]},
+         [(12.0, 80.0, 12.0, 40.0), (88.0, 82.0, 50.0, 55.0)]),
+        # out-of-range percent (pixel hallucination) rejects the drag
+        ({"type": "drags", "drags": [[10, 80, 10, 450]]}, None),
+        # unparseable prose
+        ({"type": "text", "text": "I cannot see any blocks"}, None),
+        (None, None),
+    ]
+    for ans, expected in stack_cases:
+        result = DragSolver._parse_stack_plan(ans)
+        status = "OK" if result == expected else \
+            f"FAIL (got {result}, expected {expected})"
+        print(f"  parse_stack({(ans or {}).get('type')}) = {result} {status}")
+
+    # Stack wording routes to the stack solver, not the slider solver
+    class _StubFrame:
+        def __init__(self, text: str):
+            self._text = text
+
+        async def evaluate(self, js, *args):
+            return self._text
+
+    solver = DragSolver(page=None, vision=None)
+    for wording, expected in (
+        ("Drag the boxes so each column has the same height", "stack"),
+        ("Stack the blocks until every tower is equal", "stack"),
+        ("Slide the piece to align with the cutout", "slider"),
+        ("Click each tile in ascending order", "tiles"),
+    ):
+        got = await solver._detect_challenge_type(_StubFrame(wording))
+        status = "OK" if got == expected else \
+            f"FAIL (got {got}, expected {expected})"
+        print(f"  detect({wording[:38]!r}) = {got} {status}")
 
     print("[DragSolver] Self-test complete.")
 

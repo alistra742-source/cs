@@ -10,8 +10,8 @@ LIVE_INJECTION = r'''
 .live-title b{color:#34d399}
 .live-state{margin-left:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8a8a92;font-family:'JetBrains Mono','Courier New',monospace;font-size:11px}
 .live-close{padding:7px 11px;border-radius:9px;border:1px solid #5a2323;background:#2a1212;color:#fca5a5;cursor:pointer;font-weight:700}
-.live-frame{position:relative;min-height:240px;max-height:calc(100vh - 165px);overflow:hidden;display:flex;align-items:center;justify-content:center;background:#050506;border:1px solid #34343a;border-radius:12px}
-.live-frame img{display:none;max-width:100%;max-height:calc(100vh - 165px);object-fit:contain}
+.live-frame{position:relative;min-height:240px;max-height:calc(100vh - 165px);overflow:auto;display:flex;align-items:flex-start;justify-content:center;background:#050506;border:1px solid #34343a;border-radius:12px}
+.live-frame img{display:none;width:100%;height:auto;object-fit:contain}
 .live-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:#8a8a92;font-family:'JetBrains Mono','Courier New',monospace;font-size:12px;line-height:1.6}
 .live-foot{color:#5c5c64;font-family:'JetBrains Mono','Courier New',monospace;font-size:10px;letter-spacing:.3px}
 @media(max-width:640px){#liveOverlay{padding:10px}.live-modal{padding:12px;border-radius:13px}.live-state{display:none}.live-frame{min-height:220px}}
@@ -27,7 +27,7 @@ LIVE_INJECTION = r'''
       <div id="livePlaceholder" class="live-placeholder">Start the generator to view its camera.</div>
       <img id="liveImage" alt="Latest generator camera frame">
     </div>
-    <div class="live-foot">Camera refreshes every 3 seconds.</div>
+    <div class="live-foot">Full-page camera — refreshes every 3 seconds. Scroll the frame to see the whole page.</div>
   </div>
 </div>
 <script>

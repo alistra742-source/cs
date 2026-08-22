@@ -24,3 +24,6 @@ data_v2/
 # third-party photos - never committed
 image-search/
 data_real/
+
+# runtime training-sample collector output (drag_solver.py saves solved rounds)
+train/data/

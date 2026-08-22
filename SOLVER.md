@@ -204,6 +204,42 @@ landing points inside tile boxes, 0.18–0.55 s between tiles, and real
 press/travel/micro-adjust/release drags (a synthetic click does nothing on
 a drag round).
 
+### Arkose block-stacking rounds (`drag_solver.py` STACK)
+
+Arkose/FunCaptcha also serves a **block-stacking** game: vertical columns
+of blocks (e.g. one 3 tall, one 2, one 1) plus loose draggable blocks, and
+the answer is every drag that levels the columns ("3, 3, 3"). `DragSolver`
+now has a fourth challenge family besides slider/tiles/match:
+
+* **routing** — `_STACK_KEYWORDS` wording ("same height", "stack",
+  "tower", "balance", …) is checked *before* the slider keywords because
+  stack instructions also contain "drag"; the vision classifier fallback
+  offers "stack" as a fourth one-word answer, so cross-origin frames
+  (where `innerText` is unreadable) still route correctly.
+* **answering** — `_solve_stack` screenshots the iframe and asks the
+  vision model with the new `shape="stack"` answer contract
+  (`vision_solver._SYSTEM_STACK` + `_parse_stack_geometry`): a
+  `{"drags": [[sx, sy, tx, ty], ...]}` plan in 0–100 **percent** iframe
+  coordinates. The parser accepts every transport a small model emits
+  (per-drag from/to dicts, bare 4-lists, "moves" aliases, fenced JSON,
+  0–1 fractions rescaled ×100, mixed unit repair), rejects hallucinated
+  pixel coordinates (any value beyond ±3 of the 0–100 range drops that
+  drag), and caps plans at 12 drags. `DragSolver._parse_stack_plan`
+  re-parses the degraded transports (single `drag`, flat `tiles`
+  indices in chunks of four, `points` grab/drop pairs) for facades
+  without the `shape` kwarg.
+* **execution** — each plan drag is converted percent → absolute page
+  coordinates via the iframe box (with ±1.5 % human jitter inside the
+  grabbed block) and replayed through the humanised drag path; a failed
+  round just returns to `solve()`'s retry loop, which re-screenshots and
+  re-asks. Samples save to the training collector as type `stack`.
+
+Verified offline: 26 self-test cases (`python drag_solver.py`) cover the
+plan parser (all transports, clamps, rejections) and the stack/slider/
+tiles wording router; the vision-side geometry parser has its own case
+table and the other shapes (drag/points/tiles) parse identically before
+and after.
+
 ## Data
 
 **Real photographs.** `image-search/` (gitignored) holds the image-search
@@ -293,6 +329,8 @@ metrics). The models directory IS committed (~2.7 MB total).
 | `OLLAMA_MODEL` | vision model name | `qwen3-vl:2b` |
 | `SOLVER_CNN_MIN_CONF` | mean per-tile confidence to trust the offline grid path | `0.62` |
 | `SOLVER_MODELS_DIR` | where the `.pt`/`.json` live | `./models` |
+| `FULLPAGE_SHOTS` | capture FULL-PAGE dashboard camera frames | `1` |
+| `FULLPAGE_MAX_PX` | max page height (px) worth a full-page frame; taller pages fall back to viewport frames | `8000` |
 
 ## Measured results (`python test_solver.py`, held-out rounds, disjoint
 seeds — the figures below are painted-only content: the real-photo corpus
