@@ -57,9 +57,11 @@ payload tier only commits when the question is *only* the tower, so a
 mixed "select items, then move the block…" payload still defers). The
 DOM "Move" probe accepts `+ Move` / short labels with an icon child.
 The round loop dispatches to `_solve_tower_round` — **not**
-`DragLocator` — which finds the piece as the wood centroid in the right
-strip and drops onto the shortest stack or the largest internal gap;
-the vision model (`shape="tower"`) answers when the layout is ambiguous.
+`DragLocator`. It screenshots the **whole challenge iframe** (the Move
+piece is often a separate DOM node beside the photo), takes a Move-badge
+hint from the DOM, then finds warm/wood columns and drops onto the
+shortest stack or the largest internal gap. Vision (`shape="tower"`) is
+a 18s last resort only — a 180s 504 expires the challenge.
 
 The prompt tier also understands the **select-all** wording variants
 ("select/choose/pick/check/mark all the images/tiles with…"), the
