@@ -79,11 +79,10 @@ except Exception:  # pragma: no cover - raised as a clear error at launch
 _FRAME_RATES = (60, 60, 60, 60, 60, 60, 60, 60, 75, 90, 120, 144)
 
 # Memory-safe Firefox prefs. The runtime is a ~1 GB cgroup shared with the
-# Python app, TOR and the vision client, and Firefox's desktop defaults have
-# OOM-killed the renderer mid-Discord-load there: unbounded memory cache, up
-# to 8 pre-spawned content processes and GPU compositing. These prefs cap
-# the footprint without touching the fingerprint (runtime prefs, invisible
-# to page JS).
+# Python app and TOR, and desktop Firefox defaults have OOM-killed the
+# renderer mid-Discord-load there (cgroup memory.events oom_kill climbing
+# with every crash). These cap the footprint without touching the
+# fingerprint (runtime prefs, invisible to page JS).
 _MEMORY_SAFE_PREFS = {
     # No disk cache: the profile is a fresh temp dir per launch, and /tmp is
     # often RAM-backed in containers.
@@ -91,17 +90,44 @@ _MEMORY_SAFE_PREFS = {
     # Bound the in-memory cache (KB — the default is 4 GB, a no-cap in
     # practice). 256 MB is far more than a register page + captcha images.
     "browser.cache.memory.capacity": 262144,
+    # ...and per cache ENTRY (KB; default 512 MB each — one Discord JS
+    # bundle could claim half the container).
+    "browser.cache.memory.max_entry_size": 32768,
     # Don't hold extra copies of the current document for history viewers.
     "browser.sessionhistory.max_total_viewers": 0,
     # We render in software (LIBGL_ALWAYS_SOFTWARE) anyway — no GPU
     # compositor buffers.
     "layers.acceleration.disabled": True,
+    # Cap DECODED image memory (MB; default 512) — Discord's hero art +
+    # captcha grid is image-heavy.
+    "layers.image-memory-limit": 128,
     # No speculative parallel connections: fewer sockets/buffers, less
     # churn through slow proxy tunnels.
     "network.http.speculative-parallel-limit": 0,
-    # Bound pre-spawned content processes (default 8); each one costs tens
-    # of MB of heap.
-    "dom.ipc.processPrelimit": 4,
+    # No network prediction (pre-fetches consume buffers for requests that
+    # may never happen).
+    "network.predictor.enabled": False,
+    # NO pre-spawned content processes: each idle one costs ~40-80 MB and
+    # the desktop default is a pool of them — pure waste in a single-tab
+    # bot container. Content processes spawn on demand, capped at 2
+    # (top frame + at most one iframe).
+    "dom.ipc.processPrelimit": 0,
+    "dom.ipc.processCount": 2,
+    # Let Firefox unload a high-memory background tab if one ever exists.
+    "browser.tabs.unloadHighMemoryContentPages": True,
+}
+
+# Extra cuts for the 1 GB container (LOW_MEMORY_MODE): single-process
+# content — e10s OFF. With e10s on, Discord's top frame AND its hCaptcha
+# iframe each run in their OWN content process (~200-300 MB each), peaking
+# exactly when the captcha grid + canvas fingerprints load: ~800 MB total
+# at the 953 MB cap = the renderer OOM-kills. With all content in the
+# parent process the same moment is ~600 MB and fits. This pref is not
+# visible to page JS (the process model is not fingerprinted), so it costs
+# nothing anti-detection-wise. If a future Camoufox build misbehaves with
+# e10s off, LOW_MEMORY_MODE=0 restores multi-process (pre-spawn stays off).
+_LOW_MEMORY_EXTRA_PREFS = {
+    "browser.tabs.remote.autostart": False,
 }
 
 
@@ -142,6 +168,8 @@ async def _launch_browser(headless: bool = True, proxy: Optional[dict] = None):
     # benefit in a headless feed.
     _frame_rates = (60,) if _low_memory_mode() else _FRAME_RATES
     prefs = dict(_MEMORY_SAFE_PREFS)
+    if _low_memory_mode():
+        prefs.update(_LOW_MEMORY_EXTRA_PREFS)
     prefs["layout.frame_rate"] = random.choice(_frame_rates)
     opts = {
         "headless": bool(headless),
