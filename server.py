@@ -1088,6 +1088,10 @@ _ESSENTIAL_PREFIXES = (
     "[Captcha] Challenge round",
     "[Captcha] Clicking tiles:",
     "[Captcha] [OK] Vision",
+    "[Captcha] Clicked Next",
+    "[Captcha] Clicked Verify",
+    "[Captcha] Offline",
+    "[Captcha] Next challenge",
 )
 
 
@@ -4083,11 +4087,26 @@ class DiscordAutomation:
                 # drag, multiple choice, text) and answering a point round
                 # with tile indices (or vice versa) is a guaranteed fail —
                 # and a loud automation signal.
-                for round_i in range(6):
+                last_sig = None
+                for round_i in range(8):
                     if await self._past_captcha():
                         return True
                     chall = await self._challenge_iframe()
                     if chall is None or not await self._challenge_rendered(chall):
+                        # After Next the iframe often drops to a loader.
+                        # Wait for the next challenge to paint — do NOT
+                        # treat the dip as "challenge over".
+                        chall = await self._wait_for_image_challenge(timeout=10.0)
+                    if chall is None:
+                        if await read_hcaptcha_token(self._page):
+                            self._log(
+                                "[Captcha] [OK] hCaptcha token minted by the solved "
+                                "challenge - submitting form")
+                            await self._click_form_submit()
+                            for _ in range(8):
+                                await asyncio.sleep(1.0)
+                                if await self._past_captcha():
+                                    return True
                         break
                     frame = await self._hcaptcha_frame_for(chall)
                     if frame is None:
@@ -4105,6 +4124,16 @@ class DiscordAutomation:
                         await asyncio.sleep(2)
                         continue
                     family = hct.classify(self._challenge_payload, dom, prompt)
+                    sig = (prompt, family, int((dom or {}).get("tiles") or 0))
+                    # Same prompt + same layout: we already answered this
+                    # grid. Re-clicking tiles TOGGLES them off. Just hit
+                    # Next again and wait for the next challenge.
+                    if last_sig is not None and sig == last_sig:
+                        self._log(
+                            "[Captcha] Same challenge still showing — clicking Next again")
+                        await self._click_challenge_verify(frame)
+                        await asyncio.sleep(1.2)
+                        continue
                     self._log(
                         f"[Captcha] Challenge round {round_i + 1} "
                         f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
@@ -4132,13 +4161,15 @@ class DiscordAutomation:
                                   level="warn")
                         await asyncio.sleep(2)
                         continue
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.7)
                     await self._click_challenge_verify(frame)
-                    # Wait for hCaptcha to accept (token minted) or present a
-                    # new round.
+                    last_sig = sig
+                    # Wait for hCaptcha to accept (token minted) OR paint
+                    # the next challenge (new prompt / new layout).
                     token_seen = False
-                    for _ in range(10):
-                        await asyncio.sleep(1.0)
+                    advanced = False
+                    for _ in range(14):
+                        await asyncio.sleep(0.7)
                         if await self._past_captcha():
                             self._log("[Captcha] [OK] Vision solve ACCEPTED - past captcha")
                             return True
@@ -4148,6 +4179,23 @@ class DiscordAutomation:
                                 "[Captcha] [OK] hCaptcha token minted by the solved "
                                 "challenge - submitting form")
                             await self._click_form_submit()
+                            break
+                        c2 = await self._challenge_iframe()
+                        if c2 is None or not await self._challenge_rendered(c2):
+                            continue
+                        f2 = await self._hcaptcha_frame_for(c2)
+                        if f2 is None:
+                            continue
+                        p2 = await self._read_challenge_prompt(f2)
+                        if not p2:
+                            p2 = hct.question_text(self._challenge_payload or {})
+                        d2 = await self._probe_challenge_dom(f2)
+                        fam2 = hct.classify(self._challenge_payload, d2, p2)
+                        sig2 = (p2, fam2, int((d2 or {}).get("tiles") or 0))
+                        if p2 and sig2 != last_sig:
+                            self._log(
+                                f"[Captcha] Next challenge ready: {p2[:80]}")
+                            advanced = True
                             break
                     if token_seen:
                         for _ in range(8):
@@ -4161,6 +4209,8 @@ class DiscordAutomation:
                             "[Captcha] Form submitted after solve but not past captcha "
                             "yet - retrying",
                             level="warn")
+                    elif advanced:
+                        continue
                 self._log("[Captcha] Vision solve not accepted across rounds - retrying",
                           level="warn")
             self._log("[Captcha] [FAIL] Vision solver could not clear the challenge",
@@ -4380,6 +4430,10 @@ class DiscordAutomation:
                             self._log(
                                 f"[Captcha] Offline CNN grid: {labels} "
                                 f"(conf {mean_conf:.2f}, ref={ex_label}) -> {idx}")
+                            if not idx:
+                                # Understood empty round (no tile matches) —
+                                # Verify/Next with nothing selected is correct.
+                                return True
                             return await self._click_challenge_tiles(frame, idx)
                         self._log(
                             "[Captcha] Offline labels made but prompt not "
@@ -4862,54 +4916,103 @@ class DiscordAutomation:
                 return True
         return False
 
+    _NEXT_VERIFY_JS = r"""() => {
+        const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const vis = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (!r || r.width < 8 || r.height < 8) return false;
+            if (el.offsetParent === null && el.getClientRects().length === 0) return false;
+            try {
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+            } catch (e) {}
+            return true;
+        };
+        const disabled = (el) => !!(el.disabled
+            || el.getAttribute('aria-disabled') === 'true'
+            || /\bdisabled\b/i.test((el.className || '').toString()));
+        const nextRe = /(^|[^a-z])(next|continue|weiter|volgende|continuer|continuar)([^a-z]|$)/;
+        const verifyRe = /(^|[^a-z])(verify|check|submit|confirm|valider|verificar|bestätigen|bevestigen)([^a-z]|$)/;
+        const cands = [];
+        const sels = '.button-submit, #button-submit, .button-arrow, '
+            + '[class*="button-arrow" i], [class*="next" i], '
+            + 'button[type="submit"], [role="button"], button, .button, '
+            + '[class*="submit" i], [aria-label*="next" i], '
+            + '[aria-label*="verify" i], [title*="Next" i], [title*="Verify" i]';
+        for (const el of document.querySelectorAll(sels)) {
+            if (!vis(el) || disabled(el)) continue;
+            const t = norm((el.textContent || '') + ' '
+                + (el.getAttribute('aria-label') || '') + ' '
+                + (el.getAttribute('title') || ''));
+            const cls = norm((el.className || '').toString());
+            let kind = '';
+            if (nextRe.test(t) || cls.includes('arrow') || /\bnext\b/.test(cls)) kind = 'next';
+            else if (verifyRe.test(t) || cls.includes('verify')) kind = 'verify';
+            else if (cls.includes('button-submit') || cls.includes('submit')) kind = 'submit';
+            else continue;
+            const r = el.getBoundingClientRect();
+            cands.push({
+                kind, x: r.left, y: r.top, width: r.width, height: r.height,
+                t: t.slice(0, 40)
+            });
+        }
+        if (!cands.length) return null;
+        const pick = cands.find(c => c.kind === 'next')
+            || cands.find(c => c.kind === 'submit')
+            || cands[0];
+        return pick;
+    }"""
+
     async def _click_challenge_verify(self, frame) -> bool:
-        """Click hCaptcha's Verify/Submit button inside the challenge frame."""
-        try:
-            await frame.locator('.button-submit, #button-submit').first.click(
-                timeout=4000)
-            self._log("[Captcha] Clicked Verify")
-            return True
-        except Exception:
-            pass
-        # MIXED rounds advance with a "Next" arrow button (no Verify yet) —
-        # click it so the second stage renders and the round loop re-probes.
-        try:
-            nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
-                                '[class*="next" i] button')
-            if await nxt.count() > 0:
-                await nxt.first.click(timeout=4000)
-                self._log("[Captcha] Clicked Next (mixed-round stage)")
+        """Click hCaptcha's Next or Verify control inside the challenge frame.
+
+        Attribute/material grids and mixed rounds advance with a Next
+        button (often `.button-submit` whose label is "Next" or an arrow,
+        enabled only after tiles are selected). A disabled click is a
+        miss — wait for enablement, then humanize the click so the next
+        challenge can paint.
+        """
+        pick = None
+        for _wait in range(6):
+            try:
+                pick = await frame.evaluate(self._NEXT_VERIFY_JS)
+            except Exception:
+                pick = None
+            if pick and pick.get("width"):
+                break
+            await asyncio.sleep(0.28)
+        if pick and pick.get("width"):
+            try:
+                ox, oy = await self._frame_origin(frame)
+                await hm.click_box(self._page, {
+                    "x": float(pick["x"]) + ox,
+                    "y": float(pick["y"]) + oy,
+                    "width": float(pick["width"]),
+                    "height": float(pick["height"]),
+                })
+                kind = pick.get("kind") or "submit"
+                label = "Next" if kind == "next" else "Verify"
+                extra = f" ({pick.get('t')!r})" if pick.get("t") else ""
+                self._log(f"[Captcha] Clicked {label}{extra}")
                 return True
-        except Exception:
-            pass
-        # Fallback: any visible verify-like control, clicked by coordinates
-        # (frame offset + local coords mapped to page coordinates).
-        try:
-            pos = await frame.evaluate("""() => {
-                const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                const re = /(^|[^a-z])(verify|check|submit|continue|next|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
-                for (const el of document.querySelectorAll(
-                        '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
-                    if (el.offsetParent === null) continue;
-                    const t = norm(el.textContent || el.getAttribute('aria-label'));
-                    if (!t || !re.test(t)) continue;
-                    const r = el.getBoundingClientRect();
-                    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-                }
-                return null;
-            }""")
-            if not pos or not pos.get("x"):
-                return False
-            fbox = await (await frame.frame_element()).bounding_box()
-            if not fbox:
-                return False
-            x = fbox["x"] + float(pos["x"])
-            y = fbox["y"] + float(pos["y"])
-            await self._page.mouse.click(x, y)
-            self._log("[Captcha] Clicked Verify (coordinate fallback)")
-            return True
-        except Exception:
-            return False
+            except Exception as e:
+                self._log(f"[Captcha] Next/Verify humanized click failed: {e}",
+                          level="debug")
+        for sel, label in (
+                ('.button-submit, #button-submit', "Verify"),
+                ('.button-arrow, [class*="button-arrow" i], '
+                 '[class*="next" i], [aria-label*="next" i]', "Next"),
+        ):
+            try:
+                loc = frame.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=3000)
+                    self._log(f"[Captcha] Clicked {label}")
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _type_challenge_answer(self, frame, text: str) -> bool:
         """Fill the answer input for 'type the characters' challenges."""
@@ -6725,4 +6828,3 @@ async def run_discord_automation():
 
 if __name__ == "__main__":
     asyncio.run(run_discord_automation())
-

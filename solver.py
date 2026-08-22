@@ -467,35 +467,76 @@ async def _click_challenge_tiles(page, frame, indices) -> bool:
     return False
 
 
+_NEXT_VERIFY_JS = r"""() => {
+    const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const vis = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (!r || r.width < 8 || r.height < 8) return false;
+        if (el.offsetParent === null && el.getClientRects().length === 0) return false;
+        return true;
+    };
+    const disabled = (el) => !!(el.disabled
+        || el.getAttribute('aria-disabled') === 'true'
+        || /\bdisabled\b/i.test((el.className || '').toString()));
+    const nextRe = /(^|[^a-z])(next|continue|weiter|volgende|continuer|continuar)([^a-z]|$)/;
+    const verifyRe = /(^|[^a-z])(verify|check|submit|confirm|valider|verificar|bestätigen|bevestigen)([^a-z]|$)/;
+    const cands = [];
+    for (const el of document.querySelectorAll(
+            '.button-submit, #button-submit, .button-arrow, [class*="button-arrow" i], '
+            + '[class*="next" i], button[type="submit"], [role="button"], button, '
+            + '[aria-label*="next" i], [aria-label*="verify" i]')) {
+        if (!vis(el) || disabled(el)) continue;
+        const t = norm((el.textContent || '') + ' '
+            + (el.getAttribute('aria-label') || '') + ' '
+            + (el.getAttribute('title') || ''));
+        const cls = norm((el.className || '').toString());
+        let kind = '';
+        if (nextRe.test(t) || cls.includes('arrow') || /\bnext\b/.test(cls)) kind = 'next';
+        else if (verifyRe.test(t) || cls.includes('submit') || cls.includes('verify')) kind = 'verify';
+        else continue;
+        const r = el.getBoundingClientRect();
+        cands.push({ kind, x: r.left + r.width / 2, y: r.top + r.height / 2, t: t.slice(0, 40) });
+    }
+    return cands.find(c => c.kind === 'next') || cands[0] || null;
+}"""
+
+
 async def _click_challenge_verify(page, frame) -> bool:
+    """Click Next or Verify so the following challenge can render."""
+    pick = None
+    for _ in range(5):
+        try:
+            pick = await frame.evaluate(_NEXT_VERIFY_JS)
+        except Exception:
+            pick = None
+        if pick and pick.get("x"):
+            break
+        await asyncio.sleep(0.25)
+    if pick and pick.get("x"):
+        try:
+            fbox = await (await frame.frame_element()).bounding_box()
+            if fbox:
+                await page.mouse.click(
+                    fbox["x"] + float(pick["x"]),
+                    fbox["y"] + float(pick["y"]))
+                return True
+        except Exception:
+            pass
     try:
-        await frame.locator('.button-submit, #button-submit').first.click(timeout=4000)
+        await frame.locator('.button-submit, #button-submit').first.click(timeout=3000)
         return True
     except Exception:
         pass
     try:
-        pos = await frame.evaluate("""() => {
-            const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-            const re = /(^|[^a-z])(verify|check|submit|continue|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
-            for (const el of document.querySelectorAll(
-                    '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
-                if (el.offsetParent === null) continue;
-                const t = norm(el.textContent || el.getAttribute('aria-label'));
-                if (!t || !re.test(t)) continue;
-                const r = el.getBoundingClientRect();
-                return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-            }
-            return null;
-        }""")
-        if not pos or not pos.get("x"):
-            return False
-        fbox = await (await frame.frame_element()).bounding_box()
-        if not fbox:
-            return False
-        await page.mouse.click(fbox["x"] + float(pos["x"]), fbox["y"] + float(pos["y"]))
-        return True
+        nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
+                            '[class*="next" i], [aria-label*="next" i]')
+        if await nxt.count() > 0:
+            await nxt.first.click(timeout=3000)
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 async def _type_challenge_answer(page, frame, text: str) -> bool:
@@ -635,11 +676,30 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
             await asyncio.sleep(3)
             log(f"[Captcha] Retrying vision solve (attempt {solve_attempt + 1}/{max_solve_attempts})...", "warn")
         rounds_done = 0
-        for round_i in range(6):
+        last_prompt = ""
+        for round_i in range(8):
             rounds_done = round_i + 1
             c = await _challenge_iframe(page)
             if c is None or not await _challenge_rendered(page, c):
-                break
+                # After Next the iframe often drops to a loader — wait for
+                # the next challenge instead of treating the dip as done.
+                deadline = time.time() + 10.0
+                c = None
+                while time.time() < deadline:
+                    cand = await _challenge_iframe(page)
+                    if cand is not None and await _challenge_rendered(page, cand):
+                        c = cand
+                        break
+                    token = await read_hcaptcha_token(page)
+                    if token:
+                        log("[Captcha] [OK] hCaptcha token minted by the solved challenge")
+                        return {"ok": True, "token": token, "prompt": last_prompt,
+                                "answer": None, "tiles": 0,
+                                "rounds": rounds_done, "sitekey": sitekey,
+                                "elapsed": round(time.time() - started, 1)}
+                    await asyncio.sleep(0.5)
+                if c is None:
+                    break
             frame = await _hcaptcha_frame_for(page, c)
             if frame is None:
                 await asyncio.sleep(1.5)
@@ -648,6 +708,11 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
             if not prompt:
                 log("[Captcha] Prompt not readable yet (new round loading?)", "warn")
                 await asyncio.sleep(2)
+                continue
+            if last_prompt and prompt == last_prompt:
+                log("[Captcha] Same challenge still showing — clicking Next again")
+                await _click_challenge_verify(page, frame)
+                await asyncio.sleep(1.2)
                 continue
             log(f"[Captcha] Challenge round {round_i + 1}: {prompt[:120]}")
             tiles = await _screenshot_challenge_tiles(page, frame)
@@ -668,15 +733,16 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
                 indices = [i for i in answer.get("indices", [])
                            if isinstance(i, int) and 1 <= i <= len(tiles)]
                 log(f"[Captcha] Clicking tiles: {indices}")
-                if not await _click_challenge_tiles(page, frame, indices):
+                if indices and not await _click_challenge_tiles(page, frame, indices):
                     log("[Captcha] Tile clicks failed — retrying round", "warn")
                     await asyncio.sleep(1.5)
                     continue
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.7)
             await _click_challenge_verify(page, frame)
+            last_prompt = prompt
             # Wait for hCaptcha to accept (token minted) or present a new round.
-            for _ in range(10):
-                await asyncio.sleep(1.0)
+            for _ in range(14):
+                await asyncio.sleep(0.7)
                 token = await read_hcaptcha_token(page)
                 if token:
                     log("[Captcha] [OK] hCaptcha token minted by the solved challenge")
@@ -684,6 +750,16 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
                             "answer": answer, "tiles": len(tiles),
                             "rounds": rounds_done, "sitekey": sitekey,
                             "elapsed": round(time.time() - started, 1)}
+                c2 = await _challenge_iframe(page)
+                if c2 is None or not await _challenge_rendered(page, c2):
+                    continue
+                f2 = await _hcaptcha_frame_for(page, c2)
+                if f2 is None:
+                    continue
+                p2 = await _read_challenge_prompt(page, f2)
+                if p2 and p2 != last_prompt:
+                    log(f"[Captcha] Next challenge ready: {p2[:80]}")
+                    break
         log("[Captcha] Vision solve not accepted across rounds — retrying", "warn")
 
     return {"ok": False,

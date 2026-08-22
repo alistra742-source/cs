@@ -49,9 +49,17 @@ the vision model as fallback (which answers as a candidate→hole drag and
 can also handle multi-candidate variants the offline logic refuses).
 
 The prompt tier also understands the **select-all** wording variants
-("select/choose/pick/check/mark all the images/tiles with…") and the
-**drag-puzzle** wording variants ("complete the puzzle", "missing piece",
-"matching outline", "empty space", "move the piece…").
+("select/choose/pick/check/mark all the images/tiles with…"), the
+**attribute/material** wording variants ("select items that are primarily
+metal", "made of wood", "have fur" — resolved offline against METAL /
+WOODEN / FURRY class sets, unknown materials like plastic/glass fall
+through to the vision model), and the **drag-puzzle** wording variants
+("complete the puzzle", "missing piece", "matching outline", "empty
+space", "move the piece…"). After every answered round the solver clicks
+the enabled **Next** or **Verify** control and waits for the next
+challenge to paint (it does not treat the brief iframe-loader dip as
+"challenge over", and it will not re-click the same tiles — that would
+toggle them off).
 
 ## Architecture
 
@@ -142,6 +150,11 @@ The prompt tier also understands the **select-all** wording variants
   (opposite labels).
 * `EDIBLE` / `WHEELED` / `MOTORISED` / `ANIMALS` / `TOOLS` — set
   predicates for "click each image containing an animal" style prompts.
+* `METAL` / `WOODEN` / `FURRY` / `PLANTS` — dominant-material sets for
+  "select items that are primarily metal / made of wood / have fur".
+  `is_attribute_prompt()` / `attribute_members()` gate them; unknown
+  materials return `None` so the vision model (which reads the object
+  itself, not the background) answers.
 * `resolve_semantic(prompt, tile_labels, example_label) →` 1-based
   indices, trying superlatives → affordance → same-category-as-example →
   set predicates → plain noun. Returns **`None`** when the prompt is not

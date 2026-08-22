@@ -129,7 +129,10 @@ _BINARY_GRID_Q_RE = re.compile(
     r"click (on )?(each|every|all (the )?) (image|photo|picture|tile)s?|"
     r"select all (the )?(images|photos|pictures|tiles)|"
     r"choose all (the )?(images|photos|pictures|tiles)|"
-    r"pick (all|every) (the )?(images?|photos?|pictures?)", re.I)
+    r"pick (all|every) (the )?(images?|photos?|pictures?)|"
+    r"(select|choose|pick|check|mark) (all )?(the )?items|"
+    r"items that (are|have|contain)|"
+    r"primarily \w+|made (of|from) ", re.I)
 
 
 # Counting tasks ("How many X are in this image?") — a photo + numeric
@@ -301,6 +304,9 @@ _PROMPT_RULES = (
         r"mark (all|every) (the )?(images|pictures|photos|tiles)|"
         r"click (all )?(the )?images (containing|with)|"
         r"images? (containing|with|of) a|all (the )?squares with|"
+        r"(select|choose|pick|check|mark) (all )?(the )?items|"
+        r"items that (are|have|contain)|objects that (are|have)|"
+        r"primarily \w+|made (of|from) |"
         r"(two|2|pair).{0,60}(identical|same|matching|duplicate|alike|similar) "
         r"(images|pictures|photos|tiles)|matching pair|"
         r"most similar (images|pictures|photos|tiles)", re.I)),
@@ -410,6 +416,25 @@ WHEELED = {"car", "bus", "truck", "bicycle", "motorcycle"}
 MOTORISED = {"car", "bus", "truck", "motorcycle", "boat", "airplane", "train"}
 TOOLS = set(TOOL_AFFORDANCE)
 MATERIALS = {"wood", "nail", "screw", "bolt", "wall", "canvas"}
+
+# Dominant-material / attribute sets for "Select items that are primarily
+# metal" and the sibling prompts hCaptcha serves on the same grid family.
+# Conservative: only classes whose MAIN subject is that material at tile
+# scale. Unknown materials (plastic, glass, fabric, colour, …) stay
+# unmapped so resolve_semantic returns None and the vision model answers.
+METAL = {
+    "nail", "screw", "bolt",
+    "hammer", "wrench", "screwdriver", "drill", "saw",
+    "fire_hydrant", "parking_meter", "traffic_light", "red_light",
+    "bicycle", "motorcycle", "car", "bus", "truck", "train", "airplane",
+    "clock",
+}
+WOODEN = {"wood", "table", "chair", "guitar"}
+FURRY = {
+    "dog", "cat", "rabbit", "horse", "cow", "kangaroo",
+    "zebra", "giraffe", "lion", "bear", "sheep",
+}
+PLANTS = {"tree", "flower", "cactus"}
 
 # Synonyms -> canonical class name. Keys are lowercase, spaces as "_".
 # NB: "red_light" and "traffic_light" are deliberately kept exclusive —
@@ -676,6 +701,51 @@ _SET_PREDICATES = (
     (re.compile(r"\btools?\b", re.I), TOOLS),
 )
 
+# "Select items that are primarily metal / made of wood / have fur" — the
+# live wording hCaptcha uses for attribute grids. Matched BEFORE the
+# plain-noun extractor so "primarily wood" does not collapse to the single
+# class `wood` and miss wooden chairs/tables/guitars.
+_ATTRIBUTE_PROMPT_RE = re.compile(
+    r"primarily\s+\w+|"
+    r"made (?:of|from)\s+\w+|"
+    r"(?:items?|objects?)\s+that\s+(?:are|have|contain)|"
+    r"(?:select|choose|pick|check|mark)\s+(all\s+)?(the\s+)?items|"
+    r"\b(?:has|have|with)\s+fur\b",
+    re.I)
+
+_ATTRIBUTE_SETS = (
+    (re.compile(r"\bmetal(lic|s)?\b", re.I), METAL),
+    (re.compile(r"\bwood(en|s)?\b|\blumber\b|\bplanks?\b", re.I), WOODEN),
+    (re.compile(r"\bfur(ry)?\b|\bhair(y)?\b", re.I), FURRY),
+    (re.compile(r"\bplants?\b|\bvegetation\b|\bfoliage\b", re.I), PLANTS),
+    (re.compile(r"\banimals?\b", re.I), ANIMALS),
+    (re.compile(r"\b(food|edible)\b", re.I), EDIBLE),
+    (re.compile(r"\b(vehicles?|transport(ation)?)\b", re.I),
+     WHEELED | MOTORISED),
+    (re.compile(r"\btools?\b", re.I), TOOLS),
+)
+
+
+def is_attribute_prompt(prompt: str) -> bool:
+    """True for material/attribute grids ('select items that are primarily metal')."""
+    return bool(_ATTRIBUTE_PROMPT_RE.search(prompt or ""))
+
+
+def attribute_members(prompt: str):
+    """Class set for a material/attribute prompt, or None if unknown.
+
+    None means either the prompt is not an attribute grid, or it is one
+    whose material (plastic, glass, colour, …) is not defensible from the
+    60 offline classes — the caller should ask the vision model.
+    """
+    p = prompt or ""
+    if not _ATTRIBUTE_PROMPT_RE.search(p):
+        return None
+    for rx, members in _ATTRIBUTE_SETS:
+        if rx.search(p):
+            return members
+    return None
+
 
 def resolve_semantic(prompt: str, tile_labels, example_label=None):
     """Prompt + per-tile canonical labels -> 1-based indices, offline.
@@ -742,6 +812,17 @@ def resolve_semantic(prompt: str, tile_labels, example_label=None):
                        "wheeled": WHEELED, "motorised": MOTORISED,
                        "tools": TOOLS, "materials": MATERIALS}[wanted]
             return [i for i, lab in enumerate(labels, 1) if lab in members]
+
+    # 3.5) material / attribute grids ("Select items that are primarily
+    # metal", "made of wood", "have fur"). Must run BEFORE the plain-noun
+    # extractor: "primarily wood" would otherwise collapse to the single
+    # class `wood` and miss wooden chairs/tables. Unknown materials
+    # (plastic, glass, colour, …) return None so the vision model answers.
+    if is_attribute_prompt(p):
+        members = attribute_members(p)
+        if members is not None:
+            return [i for i, lab in enumerate(labels, 1) if lab in members]
+        return None
 
     # 4) set predicates ("click each image containing an animal")
     for rx, s in _SET_PREDICATES:

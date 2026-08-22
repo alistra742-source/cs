@@ -26,7 +26,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 65 passed (58 when the models are not trained yet).
+Expected: 73 collected (65 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -95,6 +95,16 @@ class TestRoutePayload(unittest.TestCase):
              "requester_question": {"en": "Please outline the target"},
              "request_config": {"asset_type": "bounding_box"}}
         self.assertEqual(hct.classify_from_payload(p), hct.AREA_BBOX)
+
+    def test_payload_mixed_select_items_then_point_defers(self):
+        p = {"request_type": "image_label_area_select",
+             "requester_question": {"en": "Select items that are primarily "
+                                          "metal, then click on the largest"}}
+        self.assertEqual(hct.classify_from_payload(p), hct.UNKNOWN)
+        dom_grid = {"tiles": 9, "images": 9, "choices": 0, "inputs": 0,
+                    "canvases": 0, "draggables": 0, "move_badge": False}
+        self.assertEqual(hct.classify(p, dom_grid, hct.question_text(p)),
+                         hct.BINARY)
 
     def test_payload_mixed_binary_then_point_defers(self):
         # hCaptcha's MIXED round shares image_label_area_select: a binary
@@ -280,6 +290,21 @@ class TestRoutePrompt(unittest.TestCase):
                 "Mark all the images with a motorcycle",
                 "Check all photos of a train"):
             self.assertEqual(hct.classify_from_prompt(prompt), hct.BINARY)
+
+    def test_prompt_select_items_attribute(self):
+        # Live hCaptcha wording: material/attribute grids are BINARY, not
+        # multiple-choice ("select the most accurate…") and not a point click.
+        for prompt in (
+                "Select items that are primarily metal",
+                "Select items that are made of wood",
+                "Select items that have fur",
+                "Choose items that are primarily plastic",
+                "Pick items that are primarily glass"):
+            self.assertEqual(hct.classify_from_prompt(prompt), hct.BINARY)
+            self.assertTrue(hct.is_attribute_prompt(prompt))
+        # A normal noun grid is NOT an attribute prompt
+        self.assertFalse(hct.is_attribute_prompt(
+            "Please click each image containing a bus"))
 
     def test_prompt_identical_pair_variants(self):
         for prompt in (
@@ -600,6 +625,42 @@ class TestKnowledgeBase(unittest.TestCase):
         self.assertIsNone(hct.resolve_semantic(
             "xyzzy blorp wobble", ["cat", "dog"]))
         self.assertIsNone(hct.resolve_semantic("", []))
+
+    def test_primarily_metal(self):
+        # wrench/nail/car are metal; butterfly sitting on something is not;
+        # wood/chair/dog are not.
+        labels = ["wrench", "butterfly", "nail", "wood", "car", "dog"]
+        self.assertEqual(hct.resolve_semantic(
+            "Select items that are primarily metal", labels), [1, 3, 5])
+        self.assertEqual(hct.resolve_semantic(
+            "Please select items that are metallic", labels), [1, 3, 5])
+        self.assertEqual(hct.attribute_members(
+            "Select items that are primarily metal"), hct.METAL)
+
+    def test_primarily_wood_does_not_collapse_to_wood_class(self):
+        # "primarily wood" must pick EVERY wooden object, not just the
+        # lumber tile (extract_target("wood") would only return [1]).
+        labels = ["wood", "chair", "guitar", "cat", "table"]
+        self.assertEqual(hct.resolve_semantic(
+            "Select items that are made of wood", labels), [1, 2, 3, 5])
+
+    def test_have_fur(self):
+        labels = ["dog", "frog", "bear", "fish", "cat"]
+        self.assertEqual(hct.resolve_semantic(
+            "Select items that have fur", labels), [1, 3, 5])
+
+    def test_unknown_material_defers_to_vision(self):
+        # plastic/glass/colour are not defensible from the 60 classes
+        self.assertTrue(hct.is_attribute_prompt(
+            "Select items that are primarily plastic"))
+        self.assertIsNone(hct.attribute_members(
+            "Select items that are primarily plastic"))
+        self.assertIsNone(hct.resolve_semantic(
+            "Select items that are primarily plastic",
+            ["cup", "bottle", "dog"]))
+        self.assertIsNone(hct.resolve_semantic(
+            "Select items that are primarily glass",
+            ["cup", "window", "car"]))
 
 
 # ── pointer realism ───────────────────────────────────────────────────────
