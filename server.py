@@ -4002,19 +4002,37 @@ class DiscordAutomation:
                 return False
             self._log("[Captcha] [READY] Image challenge rendered - reading prompt + tiles")
 
-            if not getattr(self, "_ollama_checked", False):
-                self._ollama_checked = True
-                ok, models = await self._vision.check()
+            # Probe the vision endpoint with RETRIES and NO permanent
+            # failure cache. Hosted endpoints (Railway etc.) cold-start on
+            # the first request after sleeping — one fast probe would mark
+            # a healthy service down for the bot's whole lifetime (the
+            # "Ollama server unreachable" that kills every captcha round).
+            # _vision_ready is only set on success, so a service that was
+            # down and comes back re-probes cleanly on the next challenge.
+            if not getattr(self, "_vision_ready", False):
+                ok, models = False, []
+                for _probe in range(3):
+                    ok, models = await self._vision.check()
+                    if ok:
+                        break
+                    self._log(
+                        f"[Captcha] Vision endpoint not responding (probe {_probe + 1}/3) - "
+                        "may be cold-starting or down; retrying in 10s", level="warn")
+                    await asyncio.sleep(10)
                 if not ok:
                     self._log(
-                        "[Captcha] Ollama server unreachable - set VISION_API_BASE (or OLLAMA_BASE) "
-                        "or run 'ollama serve' (recommended model: qwen3-vl:2b)",
+                        f"[Captcha] Vision server unreachable after 3 probes at {self._vision.base} "
+                        "- check VISION_API_BASE / service status "
+                        "(recommended model: qwen3-vl:2b). This round cannot be "
+                        "solved until it answers; later challenges re-probe automatically.",
                         level="error")
                 elif self._vision.model not in models:
                     self._log(
                         f"[Captcha] Ollama model {self._vision.model} not pulled - "
                         f"run: ollama pull {self._vision.model}",
                         level="warn")
+                else:
+                    self._vision_ready = True
 
             for solve_attempt in range(3):
                 if solve_attempt:

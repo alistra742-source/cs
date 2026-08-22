@@ -23,6 +23,8 @@ Configuration (env vars):
                    header to every request when set).
   OLLAMA_MODEL     vision model to use (default qwen3-vl:2b)
   OLLAMA_TIMEOUT   per-request timeout in seconds (default 180)
+  VISION_CHECK_TIMEOUT  reachability-probe timeout in seconds (default 60 —
+                        hosted endpoints cold-start on first request)
 
 Model recommendation (small, better than Moondream):
 
@@ -64,6 +66,10 @@ OLLAMA_BASE = VISION_API_BASE or _OLLAMA_BASE_LEGACY or "http://localhost:11434"
 VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:2b").strip()
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
+# Reachability probe timeout (seconds). Hosted endpoints (Railway etc.)
+# COLD-START on the first request after sleeping — the wake-up itself can
+# take 30-90s, so a 10s probe marks a healthy service permanently down.
+VISION_CHECK_TIMEOUT = float(os.environ.get("VISION_CHECK_TIMEOUT", "60"))
 
 # Instruct the model to answer in reading order: image 1 = top-left tile,
 # then left→right, top→bottom. JSON-only output (no markdown, no prose).
@@ -73,6 +79,17 @@ _SYSTEM_PROMPT = (
     "reading order: image 1 is the top-left tile, image 2 is the tile to its "
     "right, and so on left-to-right, top-to-bottom. "
     "Look at EVERY tile carefully and decide which ones satisfy the instruction. "
+    "THE ANSWER IS A SET: select EVERY tile that satisfies the instruction - "
+    "the correct answer is OFTEN SEVERAL tiles, sometimes just ONE, and "
+    "sometimes NONE. Never stop at the first match; check all tiles before "
+    "answering, and do not return a single tile when several match. "
+    "For attribute/material prompts ('select items that are primarily metal', "
+    "'made of wood', 'has fur', 'is red', 'transparent', ...), judge the "
+    "DOMINANT material or attribute of each tile's MAIN subject: a tile "
+    "counts when its main subject is primarily that material / has that "
+    "attribute. A butterfly is NOT 'primarily metal' even if it sits on a "
+    "metal surface; a solid metal object IS. Judge the object itself, not "
+    "the background. "
     "For visual-comparison prompts such as 'click the two elements/images that "
     "are identical', 'the same', 'matching', 'duplicates', 'similar', or 'most similar', "
     "compare all tiles against each other and return the matching tile numbers. "
@@ -217,7 +234,7 @@ class OllamaVisionClient:
         (including tags) or [] when the server is unreachable.
         """
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=VISION_CHECK_TIMEOUT)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.get(f"{self.base}/api/tags",
                                  headers=await self._headers()) as r:
