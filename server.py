@@ -1657,6 +1657,23 @@ class DiscordAutomation:
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 
+        # Self-identifying memory profile: if this line is ABSENT from the
+        # log, the deployed image predates the memory fixes (pre-spawn off,
+        # single-process content) and the OOMs it shows are the old,
+        # un-optimized Firefox — rebuild before concluding 1 GB is too
+        # small. Prints exactly which footprint reductions are active.
+        try:
+            import camoufox_engine as _ce
+            _e10s_off = _ce._low_memory_mode()
+            _prelimit = _ce._MEMORY_SAFE_PREFS.get("dom.ipc.processPrelimit")
+        except Exception:
+            _e10s_off, _prelimit = LOW_MEMORY_MODE, "?"
+        self._log(
+            f"[Engine] memory profile: single-process-content={'on' if _e10s_off else 'off'} "
+            f"(e10s off), pre-spawned-content-processes={_prelimit}, "
+            f"60Hz, capped image/cache memory, LOW_MEMORY_MODE={'on' if LOW_MEMORY_MODE else 'off'}"
+        )
+
         # Use a smaller renderer surface in a 1 GB container. This keeps
         # page paint and screenshot buffers materially below a 1920x1080
         # desktop surface while preserving a standard desktop layout.

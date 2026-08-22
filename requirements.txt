@@ -8,7 +8,10 @@ lxml>=5.0.0
 # fingerprint spoofing and its own built-in Playwright driver
 # (camoufox.async_api). No Chrome, no truedriver. The Camoufox browser
 # build itself is fetched with `python -m camoufox fetch` (Dockerfile).
-camoufox>=0.5.0
+# PINNED (not >=): the Firefox base upgrades silently with each release
+# and memory footprint moves with it — re-test the 1 GB container before
+# bumping the pin.
+camoufox==0.5.5
 
 # Web app (dashboard)
 flask>=3.0.0
