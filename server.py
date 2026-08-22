@@ -1094,6 +1094,8 @@ NAV_TIMEOUT_MS = 30000
 # auto-resolve and get unlimited time; everything else rotates to a fresh
 # circuit once the budget is exhausted.
 RENDER_WAIT_BUDGET_S = 75.0
+LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
+LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1372,7 +1374,9 @@ class DiscordAutomation:
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 
-        # Standard desktop viewport (1920x1080) — most common real resolution
+        # Use a smaller renderer surface in a 1 GB container. This keeps
+        # page paint and screenshot buffers materially below a 1920x1080
+        # desktop surface while preserving a standard desktop layout.
         await self._build_context()
 
         # Done — context created by _build_context with full CDP evasion
@@ -1380,7 +1384,7 @@ class DiscordAutomation:
     async def _build_context(self) -> None:
         """Build a fresh browser context with current self.proxy.
         Shared by initialize() and switch_proxy()."""
-        vp = {'width': 1920, 'height': 1080}
+        vp = dict(LOW_MEMORY_VIEWPORT) if LOW_MEMORY_MODE else {'width': 1920, 'height': 1080}
         ctx_opts = build_context_options(
             self._fingerprint, self._ua, proxy=self.proxy, viewport=vp
         )
@@ -1984,8 +1988,8 @@ class DiscordAutomation:
         # fatal title, detected above). An unreadable or blank page is still
         # loading — keep waiting; reload it up to max_reloads times to
         # re-fetch dropped JS bundles, then keep waiting.
-        reload_after = 4.0       # blank this long -> reload to re-fetch JS bundles
-        max_reloads = 2          # hard cap on reloads per session
+        reload_after = 4.0       # standard mode: blank this long -> re-fetch bundles
+        max_reloads = 0 if LOW_MEMORY_MODE else 2
         _render_wait_start = time.time()
         self._log(f"[Nav] Waiting for registration form to render (no timeout - reloads<={max_reloads}, reload_after={reload_after:.0f}s)...")
         blank_since = None       # when the page first looked blank
@@ -2184,7 +2188,8 @@ class DiscordAutomation:
                         if blank_since is not None:
                             self._log("[Nav] cf_clearance cookie appeared - Cloudflare challenge passed, waiting for React...")
                         blank_since = None
-                    elif time.time() - blank_since >= reload_after and reload_count < max_reloads:
+                    elif (not LOW_MEMORY_MODE and time.time() - blank_since >= reload_after
+                          and reload_count < max_reloads):
                         reload_count += 1
                         self._log(f"[Nav] React still blank after {int(reload_after)}s - reloading page (attempt {reload_count}/{max_reloads}) to re-fetch JS bundles...")
                         try:
@@ -2195,7 +2200,14 @@ class DiscordAutomation:
                         blank_since = None
                         challenge_since = None
                         continue
-                    elif reload_count >= max_reloads and _js_required:
+                    elif LOW_MEMORY_MODE and time.time() - blank_since >= reload_after:
+                        # Reloading a full SPA creates a short-lived second
+                        # renderer/allocation spike. In a 1 GB container wait
+                        # for the render budget and rotate cleanly if it never
+                        # hydrates instead of risking an OOM renderer kill.
+                        if int(time.time() - blank_since) == int(reload_after):
+                            self._log("[Nav] Low-memory mode: React still blank; skipping reload to protect renderer")
+                    elif not LOW_MEMORY_MODE and reload_count >= max_reloads and _js_required:
                         # A JS-required stub after reloads is a flagged exit
                         # IP, not a dropped bundle - reloading will never fix
                         # it. Rotate NOW instead of burning the full budget.

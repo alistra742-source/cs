@@ -56,6 +56,14 @@ _workers: Dict[str, dict] = {}
 # immediately instead of waiting for the current navigation or retry to end.
 _worker_tasks: Dict[str, asyncio.Task] = {}
 WORKER_COUNT = 1
+
+# Railway's 1 GB container can OOM when a browser renderer and a large proxy
+# TLS sweep start together. Low-memory mode is on by default; a single worker
+# continues to probe each selected proxy, while bulk validation waits until the
+# browser is idle.
+LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
+LOW_MEMORY_SWEEP_DELAY_S = max(15.0, float(os.environ.get("LOW_MEMORY_SWEEP_DELAY_S", "60")))
+LOW_MEMORY_SWEEP_CONCURRENCY = max(1, min(8, int(os.environ.get("LOW_MEMORY_SWEEP_CONCURRENCY", "4"))))
 WORKER_IDS = [f"B{i+1}" for i in range(WORKER_COUNT)]
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -207,6 +215,13 @@ async def _worker_capture_loop(wid: str, cfg: dict, stagger: int) -> None:
     interval = base * len(WORKER_IDS)
     await asyncio.sleep(stagger)
     while _running and bot is not None and bot._page is not None:
+        # Screenshot encoding can briefly allocate a full viewport buffer. Do
+        # not compete with the most memory-sensitive stage: initial React
+        # navigation and hydration. The Live modal resumes 3-second frames as
+        # soon as the register page has rendered.
+        if LOW_MEMORY_MODE and not bool(getattr(bot, "_nav_ok", False)):
+            await asyncio.sleep(interval)
+            continue
         try:
             shot = await asyncio.wait_for(bot.capture_screenshot(), timeout=25)
             if shot:
@@ -560,6 +575,52 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
     if bot:
         state["bot"] = bot
 
+def _browser_busy() -> bool:
+    return any((state or {}).get("status") in ("starting", "running")
+               for state in _workers.values())
+
+
+async def _deferred_proxy_sweep(n_sessions: int) -> None:
+    """Validate a large proxy pool only while the renderer is idle.
+
+    Workers retain their one-at-a-time live probe, so deferring this optional
+    dashboard-wide sweep does not weaken the connection gate for an attempt.
+    """
+    if proxy_pool is None or not n_sessions:
+        return
+    if LOW_MEMORY_MODE:
+        _log(
+            f"[Proxy] Low-memory mode: deferred {n_sessions}-session sweep; "
+            "workers still probe their selected session individually"
+        )
+        await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
+        while _running and _browser_busy():
+            _log("[Proxy] Low-memory mode: browser active, delaying bulk validation")
+            await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
+        if not _running:
+            return
+        concurrency = LOW_MEMORY_SWEEP_CONCURRENCY
+        window = max(20.0, LOW_MEMORY_SWEEP_DELAY_S)
+    else:
+        concurrency = None
+        window = 10.0
+
+    try:
+        kwargs = {"window": window, "log": _log}
+        if concurrency is not None:
+            kwargs["concurrency"] = concurrency
+        _log(f"[Proxy] Background sweep of {n_sessions} sessions against discord.com "
+             f"(window={int(window)}s, concurrency={concurrency or 'default'})...")
+        sw = await proxy_pool.sweep(**kwargs)
+        _log(f"[Proxy] Sweep done: {sw['reachable']} Discord-reachable, "
+             f"{sw['unproven']} unproven (available, re-checked on use), "
+             f"{sw['untested']} untested of {n_sessions}")
+        if sw.get("tested") and not sw.get("reachable"):
+            _log("[Proxy] Bulk validation found no reachable sessions; workers will continue individual probe-gating", level="warn")
+    except Exception as e:
+        _log(f"[Proxy] Sweep error: {e}", level="warn")
+
+
 async def _proxy_validate_loop() -> None:
     """Background: re-confirm which proxies can reach Discord, using the
     worker's single-shot HTTPS probe. Dead sessions get blacklisted so
@@ -604,11 +665,14 @@ async def _proxy_file_watcher(interval: float = 15.0) -> None:
                     src = ", ".join(p.name for p in proxy_files()) or "env"
                     _log(f"[Proxy] proxies file changed — reloaded {n} sessions from {src}", level="warn")
                     if n:
-                        try:
-                            sw = await proxy_pool.sweep(window=10.0, log=_log)
-                            _log(f"[Proxy] Re-sweep: {sw['reachable']} Discord-reachable of {n} reloaded")
-                        except Exception:
-                            pass
+                        if LOW_MEMORY_MODE:
+                            _log("[Proxy] Low-memory mode: re-sweep deferred until browser is idle")
+                        else:
+                            try:
+                                sw = await proxy_pool.sweep(window=10.0, log=_log)
+                                _log(f"[Proxy] Re-sweep: {sw['reachable']} Discord-reachable of {n} reloaded")
+                            except Exception:
+                                pass
         except Exception as e:
             _log(f"[Proxy] file watcher error: {e}", level="warn")
 
@@ -664,31 +728,12 @@ async def _start_all_async(cfg: dict) -> None:
             task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")
             _worker_tasks[wid] = task
 
-        # ── Background sweep: test against discord.com (real, not ipify) ──
-        # This runs concurrently with workers. Results only improve
-        # future proxy picks; workers don't wait for it.
-        _log(f"[Proxy] Background sweep of {n_sessions} sessions against discord.com (10s window)...")
-        try:
-            sw = await proxy_pool.sweep(window=10.0, log=_log)
-            _log(f"[Proxy] Sweep done: {sw['reachable']} Discord-reachable, "
-                 f"{sw['unproven']} unproven (available, re-checked on use), "
-                 f"{sw['untested']} untested of {n_sessions} — "
-                 f"workers probe-gate every session before launching a browser")
-            if sw.get("tested") and not sw.get("reachable"):
-                _log(
-                    "[Proxy] 0 of the loaded sessions can reach Discord. "
-                    "vaultproxies sessions expire (ttl-600 = 10 min) and cannot "
-                    "be revived — re-saving the SAME session IDs under a new "
-                    "filename changes nothing (it's the identical expired list). "
-                    "Generate a FRESH session list in the vaultproxies dashboard "
-                    "and save it as proxies.txt — the session IDs (the part after "
-                    "'-s-') must be NEW. The bot auto-reloads proxies.txt when it "
-                    "changes, so save the fresh list and the next sweep picks it up.",
-                    level="info",
-                )
-        except Exception as e:
-            _log(f"[Proxy] Sweep error: {e}", level="warn")
-        asyncio.create_task(_proxy_validate_loop())
+        # A 530-session TLS sweep at the default 250-way concurrency can use
+        # most of the 1 GB container while Camoufox is also hydrating React.
+        # Run optional pool-wide validation only after browser work is idle;
+        # the active worker still probes its chosen session before every use.
+        asyncio.create_task(_deferred_proxy_sweep(n_sessions), name="deferred-proxy-sweep")
+        asyncio.create_task(_proxy_validate_loop(), name="proxy-validation-summary")
 
     if not n_sessions:
         # No proxy sessions — start workers directly (TOR fallback)
