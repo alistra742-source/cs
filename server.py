@@ -837,6 +837,39 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
 # Options of an open DOB menu (custom dropdowns and native <select>).
 _DOB_OPTION_SEL = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
 
+# Scoped "did THIS control's menu actually open?" check. The old global
+# check (any visible [class*=menu]/[class*=option] anywhere on the page)
+# false-positived on the Month/Day menus' leftovers and on unrelated page
+# chrome, so the Year step could proceed to pick an option from a menu that
+# was never open and then fail every pick method. This requires a visible
+# option/menu element that sits in the SAME ROW as the marked control and
+# opens directly above or below it — i.e. the control's own menu.
+_DOB_MENU_OPEN_JS = r"""(label) => {
+    const ctrl = document.querySelector('[data-dob-target="' + label + '"]');
+    if (!ctrl) return false;
+    const cr = ctrl.getBoundingClientRect();
+    if (!cr.width || !cr.height) return false;
+    let n = 0;
+    const cands = document.querySelectorAll(
+        '[role="option"], [role="menuitem"], [class*="option" i], ' +
+        '[class*="menu" i], [class*="listbox" i], [class*="popout" i]');
+    for (const e of cands) {
+        if (e === ctrl) continue;
+        if (e.offsetParent !== null && e.getClientRects().length === 0) continue;
+        const r = e.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        // Same horizontal band as the control (menus drop under it).
+        const sameRow = (r.left < cr.right + 250) && (r.right > cr.left - 250);
+        // Opening just below OR just above the control's edge.
+        const adjacent =
+            (r.top >= cr.bottom - 12 && r.top <= cr.bottom + 260) ||
+            (r.bottom <= cr.top + 12 && r.bottom >= cr.top - 260);
+        if (sameRow && adjacent) n++;
+    }
+    // >=2 so a single stray fragment can't count as an open menu.
+    return n >= 2;
+}"""
+
 # Find the index (within _DOB_OPTION_SEL) of the option that represents
 # `optionText` in the page's locale. Months resolve to their numeric index so
 # the English "January" matches the Dutch "Januari" / French "janvier" / ...
@@ -910,9 +943,22 @@ _DOB_OPTION_POS_JS = r"""([optionText, monthAliases]) => {
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
-            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-            const r = el.getBoundingClientRect();
-            if (r.width < 3 || r.height < 3) continue;
+            // Bring the option fully inside the VIEWPORT, not just the menu
+            // listbox: the Year menu drops past the 720px viewport bottom
+            // and a 'nearest' scroll cannot fix that (the page has no room
+            // to scroll). Center it, then correct with an explicit window
+            // scroll if the page itself couldn't reach. Re-measure after.
+            try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+            let r = el.getBoundingClientRect();
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (vh && r && (r.top < 0 || r.bottom > vh)) {
+                const delta = (r.top < 0) ? (r.top - 24) : (r.bottom - vh + 24);
+                try { window.scrollBy(0, delta); } catch (e) {}
+                r = el.getBoundingClientRect();
+            }
+            if (!r || r.width < 3 || r.height < 3) continue;
+            const vh2 = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (vh2 && (r.top < 0 || r.bottom > vh2 + 2)) continue; // still unreachable
             return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t.slice(0, 30) };
         }
     }
@@ -4920,6 +4966,21 @@ class DiscordAutomation:
             # Rule: SHORT click timeouts + verify the menu actually opened +
             # layered fallbacks (coordinate click -> trusted locator click
             # -> JS dispatch -> keyboard) so no single step can ever eat 30s.
+            #
+            # Center the control in the viewport BEFORE opening: the Year
+            # menu is the longest (~110 options) and the DOB row sits near
+            # the bottom of the 1280x720 viewport — opened from the row's
+            # natural position the menu runs PAST the viewport bottom, the
+            # page can't scroll it back in, and the option click lands in
+            # empty space. That is why Month/Day filled and Year didn't.
+            # Centering leaves room for the menu to drop below the control.
+            try:
+                await self._page.evaluate(
+                    "() => { const el = document.querySelector('[data-dob-target=\""
+                    + label + "\"]'); if (el) { try { el.scrollIntoView({ block: 'center' }); } catch (e) {} } }")
+                await asyncio.sleep(0.25)
+            except Exception:
+                pass
             deadline = time.monotonic() + 25.0
             opened = False
             for open_method in ("coords", "click", "dispatch", "keyboard"):
@@ -4982,17 +5043,15 @@ class DiscordAutomation:
                     except Exception as e:
                         self._log(f"[DOB] open keyboard {label}: {str(e)[:120]}", level="warn")
                         continue
-                # Did the menu actually open? Poll for any visible option /
-                # menu element — a timed-out click may still have opened it.
+                # Did THIS control's menu actually open? Poll with the
+                # scoped check (adjacent to the marked control, >=2 visible
+                # parts) — a timed-out click may still have opened it, but a
+                # stale Month/Day menu or page chrome must NOT count.
                 for _poll in range(8):
                     await asyncio.sleep(0.25)
                     try:
                         opened = bool(await self._page.evaluate(
-                            "() => Array.from(document.querySelectorAll("
-                            "'[role=\"option\"], [role=\"menuitem\"], "
-                            "[id*=\"option\" i], [class*=\"option\" i], "
-                            "[class*=\"menu\" i]'))"
-                            ".some(e => e.offsetParent !== null)"))
+                            _DOB_MENU_OPEN_JS, label))
                     except Exception:
                         opened = False
                     if opened:
@@ -5051,14 +5110,43 @@ class DiscordAutomation:
                 elif sel_method == "keyboard":
                     if isinstance(idx, int) and idx >= 0 and idx <= 300:
                         try:
-                            # The combobox still holds focus from the open;
-                            # Home normalizes the highlight to the first
-                            # visible option, then idx ArrowDowns land on
-                            # the wanted one and Enter selects it.
+                            # Guarantee the menu is actually open: if the
+                            # open-check was a false positive, Home on a
+                            # closed combobox does nothing and the first
+                            # ArrowDown (which opens the menu) desyncs the
+                            # highlight. One ArrowDown opens it when closed.
+                            menu_up = False
+                            try:
+                                menu_up = bool(await self._page.evaluate(
+                                    _DOB_MENU_OPEN_JS, label))
+                            except Exception:
+                                menu_up = False
                             await ctrl.focus()
-                            await self._page.keyboard.press("Home")
-                            for _k in range(max(idx, 0)):
+                            if not menu_up:
                                 await self._page.keyboard.press("ArrowDown")
+                                await asyncio.sleep(0.2)
+                            # Navigate from the NEAR end: Home + idx downs
+                            # for the top half, End + (count-1-idx) ups for
+                            # the bottom half — the Year menu has ~110
+                            # options, and each press is a CDP round-trip.
+                            count = idx + 1
+                            try:
+                                count = int(await self._page.evaluate(
+                                    "(sel) => Array.from(document"
+                                    ".querySelectorAll(sel)).filter("
+                                    "e => e.offsetParent !== null).length",
+                                    _DOB_OPTION_SEL)) or (idx + 1)
+                            except Exception:
+                                count = idx + 1
+                            if idx * 2 <= count:
+                                await self._page.keyboard.press("Home")
+                                for _k in range(max(idx, 0)):
+                                    await self._page.keyboard.press("ArrowDown")
+                            else:
+                                await self._page.keyboard.press("End")
+                                for _k in range(max(count - 1 - idx, 0)):
+                                    await self._page.keyboard.press("ArrowUp")
+                            await asyncio.sleep(0.15)
                             await self._page.keyboard.press("Enter")
                             picked = True
                         except Exception as e:

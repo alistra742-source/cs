@@ -558,6 +558,19 @@ class _Locator:
             pos = await el.get_position()
         if not pos:
             raise TimeoutError(f"locator click: element not visible for '{self._selector}'")
+        # Playwright auto-scrolls the element into view BEFORE clicking —
+        # a center below the viewport edge would click empty space. That is
+        # exactly how the DOB Year option (its menu opens past the 720px
+        # viewport bottom) went unclicked while Month/Day filled fine.
+        if not force:
+            try:
+                await el.scroll_into_view()
+                await asyncio.sleep(0.12)
+                fresh = await el.get_position()
+                if fresh:
+                    pos = fresh
+            except Exception:
+                pass
         x, y = pos.center
         tab = el.tab if el.tab is not None else self._tab
         await tab.send(cdp.input_.dispatch_mouse_event(
