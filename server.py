@@ -3550,6 +3550,8 @@ class DiscordAutomation:
                         ok = await self._solve_choice_round(frame, prompt)
                     elif family == hct.TEXT_ENTRY:
                         ok = await self._solve_text_round(frame, prompt)
+                    elif family == hct.COUNT:
+                        ok = await self._solve_count_round(frame, prompt)
                     else:
                         ok = await self._solve_binary_round(frame, prompt, dom)
                     if not ok:
@@ -3958,6 +3960,89 @@ class DiscordAutomation:
         await hm.click_box(self._page, page_box)
         return True
 
+    async def _solve_count_round(self, frame, prompt) -> bool:
+        """counting ("How many X are in this image?"): numeric answer
+        options. Tries the offline peak counter first (self-gated — it
+        returns None unless the count is clean), then the vision model,
+        then clicks the option button matching the count."""
+        shot, box = await self._challenge_surface(frame)
+        if not shot:
+            return False
+        n = None
+        target = hct.extract_target(prompt)
+        if target:
+            pl = self._point_locator()
+            if pl is not None:
+                try:
+                    n = pl.count(shot, target)
+                    if n is not None:
+                        self._log(
+                            f"[Captcha] Offline count: {n} x {target}")
+                except Exception as e:
+                    self._log(f"[Captcha] Offline count error: {e}",
+                              level="debug")
+        if n is None:
+            answer = await self._vision.solve(prompt, [shot], shape="count")
+            if not answer or answer.get("type") != "count":
+                return False
+            n = answer.get("count")
+        if not isinstance(n, int) or n < 1:
+            self._log("[Captcha] Counting produced no usable number",
+                      level="warn")
+            return False
+        self._log(f"[Captcha] Counting answer: {n}")
+        return await self._click_number_option(frame, n)
+
+    async def _click_number_option(self, frame, n: int) -> bool:
+        """Click the numeric answer option whose label equals ``n``.
+
+        hCaptcha counting rounds present a row of numbered buttons; the
+        label may be just the digit or "N <noun>". Falls back to the n-th
+        option in reading order when the labels are numeric and in order.
+        """
+        opts = await frame.evaluate("""() => {
+            const vis = (el) => !!(el) &&
+                (el.offsetParent !== null || el.getClientRects().length > 0);
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    '.answer-option, [class*="answer-option" i], ' +
+                    '[class*="choice" i] button, [class*="option" i], button')) {
+                if (!vis(el)) continue;
+                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 20 || r.height < 12) continue;
+                out.push({ text: t.slice(0, 80), box: {
+                    x: r.left, y: r.top, width: r.width, height: r.height } });
+            }
+            return out;
+        }""")
+        if not opts:
+            return False
+        m = re.match(r"^(\d+)\b", str(n))
+        pick = None
+        if m:
+            label = m.group(1)
+            for o in opts:
+                t = o["text"]
+                if re.match(r"^%s\b" % re.escape(label), t):
+                    pick = o
+                    break
+        if pick is None and 1 <= n <= len(opts):
+            # numeric options render in order — the n-th option IS n
+            texts = [o["text"] for o in opts]
+            if all(re.match(r"^\d+\b", t) for t in texts):
+                pick = opts[n - 1]
+        if pick is None:
+            return False
+        ox, oy = await self._frame_origin(frame)
+        b = pick["box"]
+        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
+                    "width": b["width"], "height": b["height"]}
+        self._log(f"[Captcha] Clicking count option {n!r} ({pick['text']!r})")
+        await hm.click_box(self._page, page_box)
+        return True
+
     async def _solve_text_round(self, frame, prompt) -> bool:
         """text_entry: vision model reads the characters, we type them."""
         shot, _ = await self._challenge_surface(frame)
@@ -4038,12 +4123,23 @@ class DiscordAutomation:
             return True
         except Exception:
             pass
+        # MIXED rounds advance with a "Next" arrow button (no Verify yet) —
+        # click it so the second stage renders and the round loop re-probes.
+        try:
+            nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
+                                '[class*="next" i] button')
+            if await nxt.count() > 0:
+                await nxt.first.click(timeout=4000)
+                self._log("[Captcha] Clicked Next (mixed-round stage)")
+                return True
+        except Exception:
+            pass
         # Fallback: any visible verify-like control, clicked by coordinates
         # (frame offset + local coords mapped to page coordinates).
         try:
             pos = await frame.evaluate("""() => {
                 const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                const re = /(^|[^a-z])(verify|check|submit|continue|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
+                const re = /(^|[^a-z])(verify|check|submit|continue|next|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
                 for (const el of document.querySelectorAll(
                         '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
                     if (el.offsetParent === null) continue;

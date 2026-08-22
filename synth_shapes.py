@@ -676,11 +676,17 @@ def paint_book(d, w, h, rng, mood):
         d.rounded_rectangle([w * frac / 2, y0, w * (1 - frac / 2), y0 + h * 0.22],
                             radius=max(1, _i(h * 0.03)), fill=cover,
                             outline=_shade(cover, 0.5))
-        d.rectangle([w * frac / 2 + 4, y0 + h * 0.16, w * (1 - frac / 2) - 4,
-                     y0 + h * 0.22], fill=(238, 234, 222))
-        d.line([(w * frac / 2 + 8, y0 + h * 0.05), (w * (1 - frac / 2) - 8,
-                y0 + h * 0.05)], fill=_shade(cover, 0.6),
-               width=max(1, _i(h * 0.015)))
+        # the inset page block only fits when the book is wide enough
+        # (point/count rounds render books as small as ~15 px — Pillow
+        # rejects inverted rects on Pillow >= 12)
+        page = [w * frac / 2 + 4, y0 + h * 0.16, w * (1 - frac / 2) - 4,
+                y0 + h * 0.22]
+        if page[2] > page[0] + 1:
+            d.rectangle(page, fill=(238, 234, 222))
+        lx0, lx1 = w * frac / 2 + 8, w * (1 - frac / 2) - 8
+        if lx1 > lx0 + 1:
+            d.line([(lx0, y0 + h * 0.05), (lx1, y0 + h * 0.05)],
+                   fill=_shade(cover, 0.6), width=max(1, _i(h * 0.015)))
 
 
 def paint_clock(d, w, h, rng, mood):
@@ -1131,22 +1137,31 @@ def paint_guitar(d, w, h, rng, mood):
 
 
 def paint_cactus(d, w, h, rng, mood):
+    def _rr(box, radius, **kw):
+        # Pillow >= 9.2 rejects radius > half the smaller side, and its
+        # outline path needs one extra pixel of slack (it draws
+        # [x0+r+1, x1-r-1]). The arm rects are thin and point rounds
+        # render cacti at ~30px, so clamp with the margin.
+        r = max(0.0, min(radius, (box[2] - box[0]) / 2.0 - 1.0,
+                         (box[3] - box[1]) / 2.0 - 1.0))
+        d.rounded_rectangle(box, radius=r, **kw)
+
     green = _jit(rng, rng.choice([(72, 130, 70), (90, 150, 80), (60, 110, 60)]), 10)
     dark = _shade(green, 0.55)
     rid = _shade(green, 0.72)
     # main column
-    d.rounded_rectangle([w * 0.40, h * 0.10, w * 0.62, h * 0.96],
-                        radius=max(4, _i(w * 0.11)), fill=green, outline=dark)
+    _rr([w * 0.40, h * 0.10, w * 0.62, h * 0.96],
+        radius=max(4, _i(w * 0.11)), fill=green, outline=dark)
     # left arm
-    d.rounded_rectangle([w * 0.18, h * 0.40, w * 0.42, h * 0.52],
-                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
-    d.rounded_rectangle([w * 0.18, h * 0.24, w * 0.30, h * 0.52],
-                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    _rr([w * 0.18, h * 0.40, w * 0.42, h * 0.52],
+        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    _rr([w * 0.18, h * 0.24, w * 0.30, h * 0.52],
+        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
     # right arm
-    d.rounded_rectangle([w * 0.60, h * 0.32, w * 0.86, h * 0.44],
-                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
-    d.rounded_rectangle([w * 0.74, h * 0.16, w * 0.86, h * 0.44],
-                        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    _rr([w * 0.60, h * 0.32, w * 0.86, h * 0.44],
+        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
+    _rr([w * 0.74, h * 0.16, w * 0.86, h * 0.44],
+        radius=max(3, _i(w * 0.06)), fill=green, outline=dark)
     # vertical ridges
     for fx in (0.46, 0.56):
         d.line([(w * fx, h * 0.14), (w * fx, h * 0.94)], fill=rid,

@@ -49,12 +49,23 @@
     "flower",
     "house",
     "mountain",
-    "boot"
+    "boot",
+    "zebra",
+    "giraffe",
+    "lion",
+    "bear",
+    "sheep",
+    "duck",
+    "fish",
+    "butterfly",
+    "banana",
+    "guitar",
+    "cactus"
   ],
   "size": 96,
   "width": 24,
   "metrics": {
-    "val_median_err": 0.03612223267555237,
-    "val_hit_at_10": 0.8028571428571428
+    "val_median_err": 0.03618434816598892,
+    "val_hit_at_10": 0.9044444444444445
   }
 }

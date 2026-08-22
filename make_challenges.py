@@ -27,7 +27,7 @@ training corpora) without touching the filesystem.
 
 CLI:
     python make_challenges.py --out data_v2/challenges \
-        --n_point 7000 --n_drag 4000 --n_grid 1500
+        --n_point 7000 --n_drag 4000 --n_grid 1500 --n_count 500
 """
 
 from __future__ import annotations
@@ -72,10 +72,12 @@ _POINT_SUPERLATIVES = (
     ("Please click on the smallest object in the image", "SIZE", "min"),
     ("Please click on the fastest moving object", "SPEED", "max"),
     ("Please click on the slowest moving object", "SPEED", "min"),
+    ("Please click on the animal from the coldest place", "TEMP", "min"),
+    ("Please click on the animal from the warmest place", "TEMP", "max"),
 )
 
 _TABLES = {"JUMP": hct.JUMP_RANK, "SIZE": hct.SIZE_RANK,
-           "SPEED": hct.SPEED_RANK}
+           "SPEED": hct.SPEED_RANK, "TEMP": hct.TEMP_RANK}
 
 _DRAG_PROMPTS = (
     "Please drag the element to the place where it fits",
@@ -198,6 +200,8 @@ def make_point_round(rng: random.Random, size: int = 96):
         # pick objects with UNIQUE table values so the argmax target is
         # unambiguous — dedupe BEFORE pasting so labels match pixels
         pool = [c for c in RANKABLE if c in table]
+        if table_name == "TEMP":   # the prompt says "animal" — keep it true
+            pool = [c for c in pool if c in hct.ANIMALS]
         rng.shuffle(pool)
         names, seen = [], set()
         for cand in pool:
@@ -238,6 +242,34 @@ def make_point_round(rng: random.Random, size: int = 96):
         "x": round(tgt["x"], 4),
         "y": round(tgt["y"], 4),
         "relational": relational,
+        "objects": objects,
+    }
+    return img, meta
+
+
+def make_count_round(rng: random.Random, size: int = 96):
+    """Counting round: k separated instances of ONE class on a scene,
+    prompt "How many X are in this image?", ground-truth count k."""
+    name = rng.choice(POINT_CLASSES)
+    k = rng.randint(2, 5)
+    img = _scene_bg(size, rng)
+    centers = _spread_centers(rng, k, lo=0.14, hi=0.86, min_gap=0.30)
+    k = len(centers)
+    if k < 2:
+        return make_count_round(rng, size)      # degenerate rng; resample
+    objects = []
+    for c in centers:
+        scale = rng.uniform(0.16, 0.26)
+        x, y, r = _paste_object(img, name, (c[0], c[1], scale), rng)
+        objects.append({"x": round(x, 4), "y": round(y, 4),
+                        "r": round(r, 4)})
+    prompt = "How many %ss are in this image?" % name.replace("_", " ")
+    meta = {
+        "type": "count",
+        "prompt": prompt,
+        "target": name,
+        "target_id": CID[name],
+        "count": k,
         "objects": objects,
     }
     return img, meta
@@ -417,6 +449,7 @@ def main():
     ap.add_argument("--n_point", type=int, default=7000)
     ap.add_argument("--n_drag", type=int, default=4000)
     ap.add_argument("--n_grid", type=int, default=1500)
+    ap.add_argument("--n_count", type=int, default=500)
     ap.add_argument("--size", type=int, default=96)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
@@ -426,7 +459,8 @@ def main():
     with open(manifest_path, "w", encoding="utf-8") as mf:
         for sub, count, fn in (("point", a.n_point, make_point_round),
                                ("drag", a.n_drag, make_drag_round),
-                               ("grid", a.n_grid, make_grid_round)):
+                               ("grid", a.n_grid, make_grid_round),
+                               ("count", a.n_count, make_count_round)):
             d = os.path.join(a.out, sub)
             os.makedirs(d, exist_ok=True)
             for i in range(count):

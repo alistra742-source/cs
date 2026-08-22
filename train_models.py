@@ -13,12 +13,26 @@ Heads
 TileNet   60-way tile classifier (input 64 px by default)
 PointNet  spatial heatmap head, ONE CHANNEL PER CLASS. ``heatmap(x, onehot)``
           selects the target class channel; a point is decoded with
-          soft-argmax. Loss = spatial cross-entropy on the target cell
-          + 4.0 * soft-argmax L1. (A flattened FC coordinate head was tried
-          first and plateaued at 0.36 median error — the heatmap head beats
-          that in one epoch.)
+          soft-argmax. Loss = spatial CE on the target cells + background
+          competition + 4.0 * soft-argmax L1 (single-instance rows only).
+          Count rounds (k instances of ONE class) join the point training
+          with a per-instance cell mask — this is what teaches the runtime
+          peak-counter (PointLocator.count) to fire at every instance. (A
+          flattened FC coordinate head was tried first and plateaued at
+          0.36 median error — the heatmap head beats that in one epoch.
+          Gaussian-softened spatial targets were A/B-tested later and also
+          plateau; hard targets win.)
 DragNet   same heatmap head with 2 channels: piece (drag-from) and slot
           (drag-to).
+
+Augmentation
+------------
+Tile training: photometric jitter + horizontal flip + label smoothing.
+Point/drag: coordinate-mapped geometric augmentation (_prep_geom) — the
+batch is rotated (+-15 deg), scaled (0.78-1.28), translated (+-10%) and
+flipped, and the click targets are carried through the SAME affine, so
+every round teaches a continuum of poses instead of one. This is the main
+lever for the point localiser.
 
 Usage
 -----
@@ -242,15 +256,66 @@ def load_rounds(manifest, kind, size):
 def _prep(batch_u8, rng_aug=True, flip=True):
     x = batch_u8.float() / 255.0
     if rng_aug:
-        # NB: horizontal flips are ONLY valid for the tile classifier — for
-        # point/drag rounds a flip moves the click target, so the coordinate
-        # tasks are trained with photometric augmentation only.
         if flip:
             fmask = torch.rand(x.shape[0]) < 0.5
             x[fmask] = torch.flip(x[fmask], dims=[3])
         gain = 0.85 + 0.30 * torch.rand(x.shape[0], 1, 1, 1)
         x = (x * gain).clamp(0, 1)
     return (x - 0.5) / 0.5
+
+
+def _prep_geom(batch_u8, targets, rng, flip=True):
+    """Photometric + coordinate-mapped geometric augmentation.
+
+    The same affine is applied to the image AND the click targets, so
+    rotated/scaled/translated/flipped rounds are valid training samples.
+    This is the main data-expansion lever for the coordinate tasks: one
+    round now teaches ~infinite poses instead of one, which is what the
+    point localiser (the weakest offline family) needs most.
+
+    batch_u8: (B, 3, S, S) uint8 tensor
+    targets:  (B, K, 2) float tensor, normalised 0..1 coordinates
+    Returns (float batch in [-1, 1], augmented targets clamped 0..1).
+    """
+    B = batch_u8.shape[0]
+    theta = torch.zeros(B)
+    scale = torch.zeros(B)
+    txy = torch.zeros(B, 2)
+    flipm = torch.zeros(B, dtype=torch.bool)
+    for i in range(B):
+        theta[i] = rng.uniform(-0.26, 0.26)          # +-15 deg
+        scale[i] = rng.uniform(0.78, 1.28)
+        txy[i, 0] = rng.uniform(-0.10, 0.10)
+        txy[i, 1] = rng.uniform(-0.10, 0.10)
+        flipm[i] = flip and rng.random() < 0.5
+    # Forward transform in normalised coords:  T(p) = A p + b  with
+    #   F = diag(-1,1) when flipped (x -> 1-x), f = [1,0] then
+    #   A = s*R*F,  b = s*R*(f - c) + c + t      (c = centre 0.5)
+    cos, sin = torch.cos(theta), torch.sin(theta)
+    R = torch.stack([cos, -sin, sin, cos], dim=1).view(B, 2, 2)
+    Fm = torch.eye(2).repeat(B, 1, 1)
+    Fm[flipm, 0, 0] = -1.0
+    f = torch.zeros(B, 2)
+    f[flipm, 0] = 1.0
+    c = torch.full((B, 2), 0.5)
+    A = scale.view(B, 1, 1) * (R @ Fm)
+    b = (scale.view(B, 1, 1) * (R @ (f - c).unsqueeze(-1))).squeeze(-1) \
+        + c + txy
+    # labels move with the image: out = A p + b
+    tout = torch.einsum("bij,bkj->bki", A, targets) + b.unsqueeze(1)
+    # warped image: sample each output pixel at T^-1(q). affine_grid wants
+    # the map from [-1,1] grid coords g to [-1,1] input coords:
+    #   x_i = A^-1 g + (A^-1 (1 - 2b) - 1)
+    Ainv = torch.inverse(A)
+    M = torch.zeros(B, 2, 3)
+    M[:, :, :2] = Ainv
+    M[:, :, 2] = (Ainv @ (1.0 - 2.0 * b).unsqueeze(-1)).squeeze(-1) - 1.0
+    grid = F.affine_grid(M, batch_u8.shape, align_corners=False)
+    xf = F.grid_sample(batch_u8.float() / 255.0, grid,
+                       align_corners=False, padding_mode="border")
+    gain = 0.85 + 0.30 * torch.rand(B, 1, 1, 1)
+    xf = (xf * gain).clamp(0, 1)
+    return (xf - 0.5) / 0.5, tout.clamp(0.0, 1.0)
 
 
 # ── training loops ────────────────────────────────────────────────────────
@@ -307,7 +372,13 @@ def train_tile(a):
               "held-out real in val: %d"
               % (n_real_train, a.real_repeat, len(extra_va)))
     model = TileNet(N_CLASSES, a.width)
+    if getattr(a, "resume", None):
+        state = torch.load(a.resume, map_location="cpu")
+        model.load_state_dict(state)
+        print("  resumed weights from %s" % a.resume)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, a.epochs), eta_min=a.lr * 0.05)
     steps_per_ep = math.ceil(len(tr) / a.batch)
     print("  TileNet %d params | %d train / %d val | %d steps/epoch" % (
         sum(p.numel() for p in model.parameters()), len(tr), len(va),
@@ -319,11 +390,12 @@ def train_tile(a):
         for s in range(steps_per_ep):
             b = tr[s * a.batch:(s + 1) * a.batch]
             x = _prep(xs[b])
-            loss = F.cross_entropy(model(x), ys[b])
+            loss = F.cross_entropy(model(x), ys[b], label_smoothing=0.05)
             opt.zero_grad()
             loss.backward()
             opt.step()
             tot_loss += loss.item()
+        sched.step()
         acc = _eval_tile(model, xs, ys, va, a.batch)
         print("  epoch %d/%d  loss %.4f  val %.4f  (%.0fs)"
               % (ep + 1, a.epochs, tot_loss / steps_per_ep, acc,
@@ -347,7 +419,11 @@ def _eval_tile(model, xs, ys, va, batch):
 
 
 def _point_loss(hm_sel, target_xy):
-    """Spatial CE on the target cell + 4.0 * soft-argmax L1."""
+    """Spatial CE on the target cell + 4.0 * soft-argmax L1.
+
+    (A gaussian-softened target was A/B-tested against this: it plateaus
+    — see the commit notes — the hard single-cell signal is what actually
+    trains the heatmap peak.)"""
     B, H, W = hm_sel.shape
     cx = (target_xy[:, 0] * W).long().clamp(0, W - 1)
     cy = (target_xy[:, 1] * H).long().clamp(0, H - 1)
@@ -358,68 +434,119 @@ def _point_loss(hm_sel, target_xy):
     return ce + 4.0 * l1
 
 
-def _point_loss_bg(hm_all, target_cls, target_xy):
-    """Per-cell classification with a background channel.
+def _point_loss_bg(hm_all, target_cls, masks, l1_targets, single_rows):
+    """Per-cell classification with a background channel, multi-instance.
 
-    hm_all is (B, C+1, H, W): channel C is background. Every non-target cell
-    is supervised to background (so off-class channels stop firing at random
-    scene patches — that phantom noise destroyed relational ranking), and the
-    target cell to its class with 5x weight. Plus the 4.0 * soft-argmax L1
-    on the target channel for sub-cell precision."""
+    hm_all is (B, C+1, H, W): channel C is background. ``masks`` marks every
+    target-instance cell (0/1 float, one cell per instance — count rounds
+    carry k instances of the same class). Instance cells are supervised to
+    their class with 5x weight, every other cell to background. The
+    4.0 * soft-argmax L1 applies only to single-instance rows (for k>1 the
+    centroid is not a valid target).
+
+    (Gaussian-softened variants of this were A/B-tested and plateau — the
+    hard single-cell signal is what converges.)"""
     B, C1, H, W = hm_all.shape
-    C = C1 - 1
     device = hm_all.device
-    cx = (target_xy[:, 0] * W).long().clamp(0, W - 1)
-    cy = (target_xy[:, 1] * H).long().clamp(0, H - 1)
-    ar = torch.arange(B, device=device)
-    cell = cy * W + cx
-    labels = torch.full((B, H * W), C, dtype=torch.long, device=device)
-    labels[ar, cell] = target_cls
+    cells = masks.reshape(B, H * W)
+    bg = torch.full((B, H * W), C1 - 1, dtype=torch.long, device=device)
+    labels = torch.where(cells > 0.5,
+                         target_cls.view(B, 1).expand(B, H * W), bg)
     logits = hm_all.reshape(B, C1, H * W).permute(0, 2, 1).reshape(-1, C1)
     nll = F.cross_entropy(logits, labels.reshape(-1),
                           reduction="none").reshape(B, H * W)
-    w = torch.ones_like(nll)
-    w[ar, cell] = 5.0
+    w = 1.0 + 4.0 * cells
     ce = (nll * w).sum() / w.sum()
     sel = hm_all.gather(1, target_cls.view(-1, 1, 1, 1).expand(-1, 1, H, W)
                         ).squeeze(1)
-    l1 = F.l1_loss(soft_argmax(sel), target_xy)
+    l1 = 0.0
+    if single_rows.any():
+        l1 = F.l1_loss(soft_argmax(sel)[single_rows],
+                       l1_targets[single_rows])
     return ce + 4.0 * l1
+
+
+def _instances(meta):
+    """Instance points for a round: 1 for plain point rounds, k for count
+    rounds (one point per object in the scene)."""
+    if meta.get("type") == "count":
+        return [(o["x"], o["y"]) for o in meta["objects"]]
+    return [(meta["x"], meta["y"])]
 
 
 def train_point(a):
     xs, metas = load_rounds(a.data, "point", a.size)
-    ty = torch.tensor([[m["x"], m["y"]] for m in metas], dtype=torch.float32)
+    # counting rounds join the point training: k instances of ONE class per
+    # scene teach the per-cell competition to fire at every instance, which
+    # is what makes the runtime peak-counter (PointLocator.count) possible
+    xs2, metas2 = load_rounds(a.data, "count", a.size)
+    if len(xs2):
+        xs = torch.cat([xs, xs2])
+        metas = metas + metas2
+        print("  + %d count rounds (multi-instance)" % len(xs2))
+    is_multi = [m.get("type") == "count" for m in metas]
+    n_inst = [len(_instances(m)) for m in metas]
+    ty = torch.zeros((len(metas), 2), dtype=torch.float32)
+    for i, m in enumerate(metas):
+        pts = _instances(m)
+        ty[i, 0] = sum(p[0] for p in pts) / len(pts)
+        ty[i, 1] = sum(p[1] for p in pts) / len(pts)
     tc = torch.tensor([m["target_id"] for m in metas], dtype=torch.long)
     tr, va = _split(len(xs))
+    va_single = [i for i in va if not is_multi[i]]
     model = PointNet(N_CLASSES, a.width)
+    if getattr(a, "resume", None):
+        state = torch.load(a.resume, map_location="cpu")
+        model.load_state_dict(state)
+        print("  resumed weights from %s" % a.resume)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
-    # gentle LR decay consolidates the click-tail (hit@10%) in the late epochs
-    sched = torch.optim.lr_scheduler.MultiStepLR(
-        opt, milestones=[max(1, a.epochs // 2 - 1), a.epochs - 3], gamma=0.5)
+    # cosine decay consolidates the click-tail (hit@10%) in the late epochs
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, a.epochs), eta_min=a.lr * 0.05)
     steps_per_ep = math.ceil(len(tr) / a.batch)
-    print("  PointNet %d params | %d train / %d val | %d steps/epoch" % (
-        sum(p.numel() for p in model.parameters()), len(tr), len(va),
-        steps_per_ep))
+    print("  PointNet %d params | %d train / %d val (single) | %d steps/epoch"
+          % (sum(p.numel() for p in model.parameters()), len(tr),
+             len(va_single), steps_per_ep))
     for ep in range(a.epochs):
         model.train()
         random.Random(a.seed * 100 + ep).shuffle(tr)
         tot_loss, t0 = 0.0, time.time()
         for s in range(steps_per_ep):
             b = tr[s * a.batch:(s + 1) * a.batch]
-            hm = model.heatmaps(_prep(xs[b], flip=False))
-            loss = _point_loss_bg(hm, tc[b], ty[b])
+            K = max(n_inst[i] for i in b)
+            pts_all = torch.full((len(b), K, 2), -1.0)
+            for row, i in enumerate(b):
+                p = _instances(metas[i])
+                pts_all[row, :len(p)] = torch.tensor(p)
+            valid = (pts_all >= 0).all(dim=2)    # (B, K)
+            # coordinate-mapped geometric augmentation: every round teaches
+            # many poses, not one (ALL instance labels move with the image)
+            x, tpts = _prep_geom(xs[b], pts_all, random.Random(
+                a.seed * 100000 + ep * 1000 + s))
+            tpts = tpts.clamp(0.0, 1.0)
+            H = W = x.shape[-1] // 8
+            masks = torch.zeros(len(b), H, W)
+            tgt_cx = (tpts[:, :, 0] * W).long().clamp(0, W - 1)
+            tgt_cy = (tpts[:, :, 1] * H).long().clamp(0, H - 1)
+            rows = torch.arange(len(b)).view(-1, 1).expand(len(b), K)
+            keep = valid.reshape(len(b), K)
+            masks[rows[keep], tgt_cy[keep], tgt_cx[keep]] = 1.0
+            single_rows = masks.sum(dim=(1, 2)) == 1
+            l1_xy = tpts.sum(dim=1) / keep.sum(dim=1, keepdim=True).clamp(
+                min=1)
+            hm = model.heatmaps(x)
+            loss = _point_loss_bg(hm, tc[b], masks, l1_xy, single_rows)
             opt.zero_grad()
             loss.backward()
             opt.step()
             tot_loss += loss.item()
         sched.step()
-        med, hit = _eval_point(model, xs, tc, ty, va)
+        med, hit = _eval_point(model, xs, tc, ty, va_single)
         print("  epoch %d/%d  loss %.4f  val med-err %.4f  hit@10%% %.3f"
               "  (%.0fs)"
               % (ep + 1, a.epochs, tot_loss / steps_per_ep, med, hit,
                  time.time() - t0))
-    med, hit = _eval_point(model, xs, tc, ty, va)
+    med, hit = _eval_point(model, xs, tc, ty, va_single)
     _save("point", model, {
         "kind": "point", "classes": CLASSES, "size": a.size,
         "width": a.width,
@@ -450,6 +577,8 @@ def train_drag(a):
     tr, va = _split(len(xs))
     model = DragNet(2, a.width)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, a.epochs), eta_min=a.lr * 0.05)
     steps_per_ep = math.ceil(len(tr) / a.batch)
     print("  DragNet %d params | %d train / %d val | %d steps/epoch" % (
         sum(p.numel() for p in model.parameters()), len(tr), len(va),
@@ -460,10 +589,14 @@ def train_drag(a):
         tot_loss, t0 = 0.0, time.time()
         for s in range(steps_per_ep):
             b = tr[s * a.batch:(s + 1) * a.batch]
-            x = _prep(xs[b], flip=False)
+            # coordinate-mapped geometric augmentation (both endpoints move
+            # through the SAME affine as the image)
+            x, txy = _prep_geom(xs[b], torch.cat(
+                [tf[b].unsqueeze(1), tt[b].unsqueeze(1)], dim=1),
+                random.Random(a.seed * 100000 + ep * 1000 + s))
             hms = model.heatmaps(x)
-            lf = _point_loss(hms[:, 0], tf[b])
-            lt = _point_loss(hms[:, 1], tt[b])
+            lf = _point_loss(hms[:, 0], txy[:, 0])
+            lt = _point_loss(hms[:, 1], txy[:, 1])
             loss = lf + lt
             opt.zero_grad()
             loss.backward()
@@ -524,6 +657,9 @@ def main():
     ap.add_argument("--real_root", default=os.path.join(
         ROOT, "data_real", "tiles"))
     ap.add_argument("--real_repeat", type=int, default=30)
+    ap.add_argument("--resume", default=None,
+                    help="init weights from this checkpoint (.pt) instead "
+                         "of training from scratch")
     a = ap.parse_args()
     if a.data is None:
         a.data = DEFAULT_TILES if a.task == "tile" else DEFAULT_ROUNDS

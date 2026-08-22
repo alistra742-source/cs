@@ -122,12 +122,20 @@ _SYSTEM_CHOICE = (
     "(integer)."
 )
 
+_SYSTEM_COUNT = (
+    "You are a precise counting solver for an hCaptcha challenge. You are "
+    "given ONE image and an instruction asking how many of something appear "
+    'in it. Count carefully and answer with ONLY a JSON object: '
+    '{"count": N} where N is the integer count (e.g. {"count": 3}).'
+)
+
 _SYSTEM_BY_SHAPE = {
     "tiles": _SYSTEM_PROMPT,
     "points": _SYSTEM_POINT,
     "bbox": _SYSTEM_BBOX,
     "drag": _SYSTEM_DRAG,
     "choice": _SYSTEM_CHOICE,
+    "count": _SYSTEM_COUNT,
     "text": _SYSTEM_PROMPT,
 }
 
@@ -210,6 +218,7 @@ class OllamaVisionClient:
           bbox      {"type": "bbox",   "bbox": {x1,y1,x2,y2}}      (0-1)
           drag      {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1)
           choice    {"type": "choice", "index": 2}                 (1-based)
+          count     {"type": "count",  "count": 3}
           text      {"type": "text",   "text": "abc123"}
           None      model unreachable or answer unparseable
         """
@@ -274,8 +283,8 @@ class OllamaVisionClient:
                 self.stats["failed"] += 1
                 return None
             parsed = self._parse_geometry(content, shape, len(images))
-            if parsed is None and shape in ("tiles", "text"):
-                parsed = self._parse_answer(content, len(images))
+            if parsed is None and shape in ("tiles", "text", "count"):
+                parsed = self._parse_answer(content, len(images), shape)
             if parsed is None:
                 self._log(f"[Ollama] Unparseable model answer: {content[:160]}",
                           level="warn")
@@ -373,9 +382,11 @@ class OllamaVisionClient:
         pt = OllamaVisionClient._point
 
         # bare top-level atoms
-        if isinstance(obj, (int, float)) and not isinstance(obj, bool) \
-                and shape == "choice":
-            return {"type": "choice", "index": int(round(obj))}
+        if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+            if shape == "choice":
+                return {"type": "choice", "index": int(round(obj))}
+            if shape == "count":
+                return {"type": "count", "count": int(round(obj))}
         if isinstance(obj, list):
             if obj and all(isinstance(x, (int, float))
                            and not isinstance(x, bool) for x in obj):
@@ -409,6 +420,11 @@ class OllamaVisionClient:
         raw_c = first(("choice", "option", "answer_index", "answerIndex"))
         if isinstance(raw_c, (int, float)) and not isinstance(raw_c, bool):
             return {"type": "choice", "index": int(round(raw_c))}
+
+        raw_n = first(("count", "number", "total", "amount", "answer"))
+        if isinstance(raw_n, (int, float)) and not isinstance(raw_n, bool) \
+                and shape == "count":
+            return {"type": "count", "count": int(round(raw_n))}
 
         raw_p = first(("points", "point", "clicks", "coordinates",
                        "locations"))
@@ -469,11 +485,13 @@ class OllamaVisionClient:
         return None
 
     @staticmethod
-    def _parse_answer(content: str, tile_count: int) -> Optional[dict]:
+    def _parse_answer(content: str, tile_count: int,
+                      shape: str = "tiles") -> Optional[dict]:
         """Turn the model's raw answer into a structured result.
 
         Tries, in order: strict JSON (format:json), a bare JSON array, a
-        quoted string (text challenge), then a loose int array.
+        quoted string (text challenge), then a loose int array (tiles) or
+        a lone integer (count).
         """
         text = (content or "").strip()
         if not text:
@@ -493,6 +511,10 @@ class OllamaVisionClient:
                             for x in val):
                         return {"type": "tiles",
                                 "indices": [int(x) for x in val]}
+                val = (obj.get("count") or obj.get("number")
+                       or obj.get("total"))
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    return {"type": "count", "count": int(round(val))}
                 val = obj.get("answer") or obj.get("text")
                 if isinstance(val, str) and val.strip():
                     return {"type": "text", "text": val.strip()}
@@ -525,6 +547,12 @@ class OllamaVisionClient:
             nums = [int(x) for x in re.findall(r"\d+", m.group(0))]
             if nums:
                 return {"type": "tiles", "indices": nums}
+
+        # 4) Counting: a lone integer anywhere ("the answer is 3", "3").
+        if shape == "count":
+            digits = re.findall(r"\d+", text)
+            if digits:
+                return {"type": "count", "count": int(digits[0])}
 
         # 4) Quoted string for a text challenge.
         m = _JSON_STRING_RE.search(text)
