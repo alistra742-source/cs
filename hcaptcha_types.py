@@ -139,6 +139,29 @@ _COUNT_WORD_RE = re.compile(
     r"\bhow many\b|\bcount\b|\bnumber of\b|\btotal (number|amount)\b|"
     r"\bselect (the )?(correct )?number\b", re.I)
 
+# Pattern-completion drag rounds ("Put one of the animals into the empty
+# spot to complete the pattern"): a 3x3 icon grid with ONE empty cell and
+# a row of candidate elements; the right candidate completes every row and
+# column. These are image_drag_drop under the hood, but the piece is not a
+# punched silhouette — it is chosen by the PATTERN, so the router flags
+# them and the round solver applies semantic logic instead of the pure
+# geometric DragLocator.
+_PATTERN_PHRASE_RE = re.compile(
+    r"complete the pattern|finish the pattern|"
+    r"empty (spot|space|cell)|blank (spot|space|cell)|"
+    r"missing (spot|space|cell)|"
+    r"fill (the |in )?(the )?(empty|missing|blank) (spot|space|cell)|"
+    r"put (one of )?the .{0,40}? into the (empty|blank|missing) "
+    r"(spot|space|cell)|"
+    r"to (complete|finish) the (pattern|row|sequence|grid)|"
+    r"which (one )?(belongs|goes|fits) in the (empty|blank|missing) "
+    r"(spot|space|cell)", re.I)
+
+
+def is_pattern_prompt(prompt: str) -> bool:
+    """True when the prompt is a pattern-completion drag round."""
+    return bool(_PATTERN_PHRASE_RE.search(prompt or ""))
+
 
 def _bbox_config(payload: dict) -> bool:
     cfg = payload.get("request_config")
@@ -231,6 +254,12 @@ def classify_from_dom(facts: dict, prompt: str = "") -> str:
     # drag-drop challenge (the piece is the draggable).
     if (n("draggables") > 0 or facts.get("move_badge")) and tiles <= 1:
         return DRAG_DROP
+    # Pattern-completion rounds: a 3x3 grid of tiles PLUS a row of
+    # draggable candidates — the DOM shows many tiles, which would
+    # otherwise fall through to binary. The wording disambiguates.
+    if _PATTERN_PHRASE_RE.search(prompt or "") and (
+            n("draggables") > 0 or facts.get("move_badge") or tiles >= 6):
+        return DRAG_DROP
     # A genuine tile grid is the binary family (hCaptcha grids are 9+ tiles;
     # 4 tolerated for odd layouts).
     if tiles >= 4:
@@ -259,7 +288,10 @@ _PROMPT_RULES = (
     (DRAG_DROP, re.compile(
         r"\bdrag\b|where it fits|place where it belongs|puzzle piece|"
         r"complete the puzzle|missing piece|empty space|matching slot|"
-        r"matching outline|move the (piece|element|shape|tile)", re.I)),
+        r"matching outline|move the (piece|element|shape|tile)|"
+        r"complete the pattern|empty (spot|cell)|into the empty "
+        r"(spot|space|cell)|fill the (empty|missing|blank) "
+        r"(spot|space|cell)", re.I)),
     (BINARY, re.compile(
         r"click each image|click (on )?every (image|photo|picture|tile)|"
         r"select all (the )?(images|pictures|photos|tiles)|"
@@ -537,6 +569,46 @@ def category_of(name: str):
         if c in s:
             return label
     return None
+
+
+def resolve_pattern(grid_labels, hole_index, candidates):
+    """Pattern completion: which candidate completes the 3x3 grid?
+
+    ``grid_labels``: 9 labels in reading order; ``grid_labels[hole_index]``
+    is the empty cell (its value is ignored). ``candidates``: list of
+    labels for the candidate elements (reading order). Returns the index
+    INTO ``candidates`` that makes every row and every column contain
+    three distinct labels (a Latin square), or None when no candidate or
+    more than one does. Tries the full Latin-square rule first, then the
+    rows-only rule (some hCaptcha patterns only constrain rows).
+
+    This is the semantic core of "put one of the animals into the empty
+    spot to complete the pattern": it never trusts a guess — ambiguity
+    returns None so the caller falls back to the vision model.
+    """
+    if not isinstance(grid_labels, (list, tuple)) or len(grid_labels) != 9:
+        return None
+    if not isinstance(hole_index, int) or not (0 <= hole_index < 9):
+        return None
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        return None
+    winners_full, winners_rows = [], []
+    for ci, cand in enumerate(candidates):
+        if cand is None:
+            continue
+        labels = list(grid_labels)
+        labels[hole_index] = cand
+        rows = [labels[r * 3:(r + 1) * 3] for r in range(3)]
+        cols = [[labels[r * 3 + c] for r in range(3)] for c in range(3)]
+        if None in labels:
+            continue
+        rows_ok = all(len(set(r)) == 3 for r in rows)
+        if rows_ok and all(len(set(c)) == 3 for c in cols):
+            winners_full.append(ci)
+        elif rows_ok:
+            winners_rows.append(ci)
+    winners = winners_full or winners_rows
+    return winners[0] if len(winners) == 1 else None
 
 
 _SUPERLATIVE_RULES = (

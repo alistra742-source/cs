@@ -19,6 +19,7 @@ the vision model as fallback.
 | `image_drag_drop` | "drag the element to the place where it fits" | press/move/release | unreachable — `DragSolver` matches only Arkose iframes |
 | `multiple_choice` | "select the most accurate description" | one option | unhandled |
 | `counting` | "how many X are in this image?" | one number | **unhandled** — a photo + numeric options was misread as multiple choice |
+| **pattern completion** | "put one of the animals into the empty spot to complete the pattern" | drag candidate → empty cell | **misrouted** — prompt regex missed it and the tile-rich DOM fell through to binary |
 | **mixed binary + point** | "click each image containing X, then click on Y" | tiles then (x, y) | **misrouted** — payload tier saw `area_select` and treated the grid stage as a point round |
 
 The mixed round shares the `image_label_area_select` request type: hCaptcha
@@ -33,6 +34,19 @@ wording + numeric option buttons in the DOM ("How many…", "count the…",
 "number of…"), or from the prompt alone; the answer is graded exactly, so
 the offline counter self-gates to the vision model whenever it is unsure
 and the round is clicked through `_click_number_option`.
+
+Pattern-completion rounds ("put one of the animals into the empty spot to
+complete the pattern") are `image_drag_drop` under the hood, but the
+dragged candidate is chosen by the **pattern**, not by geometry: the
+prompt tier and the DOM tier (pattern wording + draggables / many tiles)
+route them to DRAG_DROP, `is_pattern_prompt()` flags them, and the round
+loop dispatches to `_solve_pattern_round` instead of the geometric
+`_solve_drag_round`. The solver crops the grid cells and candidates from
+the surface screenshot, finds the empty cell as the brightest one
+(near-white hole vs painted tiles), labels everything with the tile
+classifier, and runs the Latin-square resolver — confidence-gated, with
+the vision model as fallback (which answers as a candidate→hole drag and
+can also handle multi-candidate variants the offline logic refuses).
 
 The prompt tier also understands the **select-all** wording variants
 ("select/choose/pick/check/mark all the images/tiles with…") and the
@@ -60,6 +74,8 @@ The prompt tier also understands the **select-all** wording variants
         │  CHOICE     → _solve_choice_round  (hm.click_box)  │
         │  TEXT_ENTRY → _solve_text_round                    │
         │  COUNT      → _solve_count_round (number options)  │
+        │  PATTERN*   → _solve_pattern_round (Latin square)  │
+        │   (* DRAG_DROP flagged by is_pattern_prompt)       │
         └───────────────────────────────────────────────────┘
                        │
         ┌──────────────┴───────────────┐
@@ -132,6 +148,11 @@ The prompt tier also understands the **select-all** wording variants
   understood (server falls back to the vision model) and **`[]`** for a
   legitimately empty round (they exist — clicking nothing and Verify is the
   right answer).
+* `resolve_pattern(grid_labels, hole_index, candidates) →` candidate
+  index completing every row AND column of a 3×3 grid with distinct
+  labels (Latin square; rows-only rule tried second). Returns **`None`**
+  on any ambiguity — a wrong candidate fails the round outright, so the
+  resolver never guesses and the server falls back to the vision model.
 
 ### Offline models (`train_models.py` + `tile_classifier.py`)
 
@@ -207,12 +228,14 @@ a real-weighted `--resume` fine-tune pass lifts the photo transfer further.
 (3–5 objects, named or relational prompt, now including TEMP
 coldest/warmest rounds restricted to animals), drag rounds (punched slot +
 loose piece with a "Move" badge), grid rounds (9 tiles + correct indices,
-incl. affordance rounds with a tool reference), and **count rounds** (2–5
+incl. affordance rounds with a tool reference), **count rounds** (2–5
 separated instances of ONE class, prompt "How many X are in this
-image?", ground-truth count) — and mixes the domains: ~60% of backgrounds
-are real photo crops, ~60% of placed objects are real photo tiles when
-the class has them, so the heatmap models train on photographs, not
-cartoons.
+image?", ground-truth count), and **pattern rounds** (3×3 Latin-square
+animal grid with one empty cell + 3 candidates, landscape canvas with
+~40px cells — the size the tile classifier can label at ~94%) — and
+mixes the domains: ~60% of backgrounds are real photo crops, ~60% of
+placed objects are real photo tiles when the class has them, so the
+heatmap models train on photographs, not cartoons.
 
 ```bash
 pip install torch numpy Pillow
@@ -222,7 +245,8 @@ python realdata.py composites
 # painted base + hybrid challenge rounds:
 python make_dataset.py --per_class 600 --out data_v2/tiles --size 96
 python make_challenges.py --out data_v2/challenges \
-    --n_point 9000 --n_drag 6000 --n_grid 2000 --n_count 4000
+    --n_point 9000 --n_drag 6000 --n_grid 2000 --n_count 4000 \
+    --n_pattern 300
 # data_v2/, data_real/ and image-search/ are gitignored — regenerable,
 # and the photos are third-party stock that must not be committed
 ```
@@ -285,8 +309,9 @@ easier than hybrid real-photo content. The real-photo rows re-appear once
 | point localiser, named target, within 10% | **92%** painted-only | 70% hybrid |
 | relational point, right class / click landed | **64% / 65%** painted-only | 50% / 58% hybrid |
 | **counting, exact count** | **43 / 60 offline + 13 self-gated to vision** | unhandled |
+| **pattern completion, correct candidate** | **40 / 60 offline + 20 self-gated to vision (0 wrong)** | unhandled |
 | drag localiser, both ends within 10% | **60 / 60 (100%)** | 59 / 60 |
-| offline suite (`python test_solver.py`) | **59 (58 + 1 corpus-skip)** | 48/48 |
+| offline suite (`python test_solver.py`) | **65 (64 + 1 corpus-skip)** | 48/48 |
 
 ¹ previous column = the same held-out harness run against the previously
 committed weights in this checkout (the SOLVER.md numbers before this
@@ -323,6 +348,12 @@ path keeps the confidence gate and falls back to the vision model below
   the round outright, so the offline counter gates aggressively to the
   vision model; on cluttered real photos (which the painted-only counter
   has not seen in training) most counts will be gated.
+* Pattern rounds are graded exactly too: the Latin-square resolver
+  refuses ambiguity (never guesses), the offline path needs the tile
+  classifier to label ~40px+ cells, and the DOM probe (lattice clustering
+  of candidate vs grid elements) is conservative — any doubt and the
+  vision model answers the drag instead. Icon styles outside the 60
+  painted classes are vision territory.
 * The alias table is deliberately conservative: nouns that are NOT
   visually defensible at tile scale are left unmapped so the vision model
   (which reads arbitrary prompt text) answers them. The offline models

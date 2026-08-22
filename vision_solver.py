@@ -129,11 +129,25 @@ _SYSTEM_COUNT = (
     '{"count": N} where N is the integer count (e.g. {"count": 3}).'
 )
 
+_SYSTEM_PATTERN = (
+    "You are a precise pattern-completion solver for an hCaptcha drag "
+    "challenge. You are given ONE image containing a grid of icons with "
+    "ONE empty cell and a row of candidate icons. Determine which "
+    "candidate completes the pattern (every row and every column of the "
+    "grid must contain distinct icons — check both directions). Answer "
+    "with ONLY a JSON object: "
+    '{"drag": {"from": [x1, y1], "to": [x2, y2]}} where "from" is the '
+    'CENTRE of the CORRECT candidate icon and "to" is the CENTRE of the '
+    "empty cell, both NORMALISED 0.0-1.0 fractions of the image size "
+    "(origin top-left)."
+)
+
 _SYSTEM_BY_SHAPE = {
     "tiles": _SYSTEM_PROMPT,
     "points": _SYSTEM_POINT,
     "bbox": _SYSTEM_BBOX,
     "drag": _SYSTEM_DRAG,
+    "pattern": _SYSTEM_PATTERN,
     "choice": _SYSTEM_CHOICE,
     "count": _SYSTEM_COUNT,
     "text": _SYSTEM_PROMPT,
@@ -219,6 +233,8 @@ class OllamaVisionClient:
           drag      {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1)
           choice    {"type": "choice", "index": 2}                 (1-based)
           count     {"type": "count",  "count": 3}
+          pattern   {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1;
+                    candidate centre -> empty-cell centre)
           text      {"type": "text",   "text": "abc123"}
           None      model unreachable or answer unparseable
         """
@@ -282,7 +298,8 @@ class OllamaVisionClient:
                 self._log("[Ollama] Empty response from model", level="warn")
                 self.stats["failed"] += 1
                 return None
-            parsed = self._parse_geometry(content, shape, len(images))
+            parse_shape = "drag" if shape == "pattern" else shape
+            parsed = self._parse_geometry(content, parse_shape, len(images))
             if parsed is None and shape in ("tiles", "text", "count"):
                 parsed = self._parse_answer(content, len(images), shape)
             if parsed is None:
@@ -464,7 +481,7 @@ class OllamaVisionClient:
                     "x1": min(x1, x2), "y1": min(y1, y2),
                     "x2": max(x1, x2), "y2": max(y1, y2)}}
 
-        raw_d = first(("drag", "drags", "path", "gesture"))
+        raw_d = first(("drag", "drags", "path", "gesture", "pattern"))
         if isinstance(raw_d, dict):
             f = pt(raw_d.get("from") or raw_d.get("start"))
             t = pt(raw_d.get("to") or raw_d.get("end"))

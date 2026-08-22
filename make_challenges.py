@@ -275,6 +275,87 @@ def make_count_round(rng: random.Random, size: int = 96):
     return img, meta
 
 
+def make_pattern_round(rng: random.Random, size: int = 96):
+    """Pattern-completion drag round: a 3x3 grid of painted icons with ONE
+    empty cell and 3 candidates below. Placing the right candidate makes
+    every row and column hold three distinct labels (Latin square).
+
+    meta: grid (9 labels, None for the hole), hole (0-8), candidates
+    (labels), correct (candidate index), cell_boxes, candidate_boxes
+    (normalised rects) for the offline crop-classify test path."""
+    animals = [c for c in POINT_CLASSES if c in hct.ANIMALS]
+    pool = rng.sample(animals, 3)
+    base = [pool[0], pool[1], pool[2],
+            pool[1], pool[2], pool[0],
+            pool[2], pool[0], pool[1]]
+    # random Latin-square-preserving shuffle: permute rows, then columns
+    rp = list(range(3))
+    rng.shuffle(rp)
+    rows = [[base[r * 3 + c] for c in range(3)] for r in rp]
+    cp = list(range(3))
+    rng.shuffle(cp)
+    rows = [[row[c] for c in cp] for row in rows]
+    flat = [x for row in rows for x in row]
+    hole = rng.randrange(9)
+    correct_label = flat[hole]
+    flat[hole] = None
+    cands = list(pool)
+    rng.shuffle(cands)
+    correct = cands.index(correct_label)
+
+    # landscape canvas like the real UI (grid on top, candidates below) and
+    # ~40px cells: the 64px-input tile classifier labels >=40px painted
+    # tiles at ~94% (25px crops only reach ~52%, which defeats the offline
+    # pattern logic before it starts)
+    W = int(size * 2.0)
+    H = int(W * 1.25)
+    cell = int(W * 0.21)
+    gap = int(W * 0.035)
+    gx0 = int(W * 0.05)
+    gy0 = int(H * 0.05)
+    img = Image.new("RGB", (W, H), (236, 236, 240))
+    cell_boxes = []
+    for i in range(9):
+        r, c = divmod(i, 3)
+        x0 = gx0 + c * (cell + gap)
+        y0 = gy0 + r * (cell + gap)
+        cell_boxes.append({"x": round(x0 / W, 4), "y": round(y0 / H, 4),
+                           "w": round(cell / W, 4),
+                           "h": round(cell / H, 4)})
+        if flat[i] is None:
+            d = ImageDraw.Draw(img)
+            d.rectangle([x0, y0, x0 + cell, y0 + cell],
+                        fill=(250, 250, 252), outline=(168, 170, 180),
+                        width=2)
+            continue
+        tile = md.render(flat[i], cell, rng)
+        img.paste(tile, (x0, y0))
+    cy0 = gy0 + 3 * (cell + gap)
+    cw = cell
+    cand_boxes = []
+    for i, name in enumerate(cands):
+        x0 = gx0 + i * (cw + gap)
+        cand_boxes.append({"x": round(x0 / W, 4),
+                           "y": round(cy0 / H, 4),
+                           "w": round(cw / W, 4),
+                           "h": round(cw / H, 4)})
+        tile = md.render(name, cw, rng)
+        img.paste(tile, (x0, cy0))
+    prompt = ("Put one of the animals into the empty spot to complete the "
+              "pattern")
+    meta = {
+        "type": "pattern",
+        "prompt": prompt,
+        "grid": flat,
+        "hole": hole,
+        "candidates": cands,
+        "correct": correct,
+        "cell_boxes": cell_boxes,
+        "candidate_boxes": cand_boxes,
+    }
+    return img, meta
+
+
 # ── drag rounds ───────────────────────────────────────────────────────────
 
 
@@ -450,6 +531,7 @@ def main():
     ap.add_argument("--n_drag", type=int, default=4000)
     ap.add_argument("--n_grid", type=int, default=1500)
     ap.add_argument("--n_count", type=int, default=500)
+    ap.add_argument("--n_pattern", type=int, default=300)
     ap.add_argument("--size", type=int, default=96)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
@@ -460,7 +542,8 @@ def main():
         for sub, count, fn in (("point", a.n_point, make_point_round),
                                ("drag", a.n_drag, make_drag_round),
                                ("grid", a.n_grid, make_grid_round),
-                               ("count", a.n_count, make_count_round)):
+                               ("count", a.n_count, make_count_round),
+                               ("pattern", a.n_pattern, make_pattern_round)):
             d = os.path.join(a.out, sub)
             os.makedirs(d, exist_ok=True)
             for i in range(count):

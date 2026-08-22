@@ -5,17 +5,20 @@ test_solver.py — offline test suite for the hCaptcha multi-family solver.
 NO browser, NO network, NO model server. Covers:
 
   * challenge-family routing from the /getcaptcha payload, from DOM facts
-    and from prompt wording (incl. the three staged live rounds: the
-    affordance reference grid, the relational point round, the drag round
-    and the counting round — "How many X are in this image?");
+    and from prompt wording (incl. the staged live rounds: the affordance
+    reference grid, the relational point round, the drag round, the
+    counting round — "How many X are in this image?" — and the
+    pattern-completion drag round — "put one of the animals into the
+    empty spot to complete the pattern");
   * vision-answer parsing for every answer shape, including the sloppy
     JSON small models emit (.8 decimals, trailing commas, fenced markdown)
     and integer count answers;
   * normalised->page coordinate mapping/clamping (_denorm);
   * the offline knowledge base (superlatives, tool affordance, traffic
-    light vs red light, empty answers, unknown prompts, and the long-tail
+    light vs red light, empty answers, unknown prompts, the long-tail
     alias table: helicopter→airplane, police car→car, owl→bird,
-    volcano→mountain, watch→clock, ...);
+    volcano→mountain, watch→clock, ... — and the Latin-square pattern
+    resolver for "complete the pattern" rounds);
   * pointer trajectories (no teleport hops, never straight line,
     accelerate-then-decelerate);
   * scoring the trained offline models on HELD-OUT rounds (hybrid
@@ -23,7 +26,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 59 passed (52 when the models are not trained yet).
+Expected: 65 passed (58 when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -178,6 +181,18 @@ class TestRouteDOM(unittest.TestCase):
         self.assertEqual(hct.classify_from_dom(
             f, "How many cars are in this image?"), hct.COUNT)
 
+    def test_dom_pattern_grid_with_draggables(self):
+        # a pattern round shows a 3x3 grid PLUS draggable candidates —
+        # many tiles, which must NOT fall through to binary
+        f = {"tiles": 11, "choices": 0, "inputs": 0, "canvases": 0,
+             "images": 11, "draggables": 3, "move_badge": False}
+        self.assertEqual(hct.classify_from_dom(
+            f, "Put one of the animals into the empty spot to complete "
+               "the pattern"), hct.DRAG_DROP)
+        # same DOM without pattern wording stays binary
+        self.assertEqual(hct.classify_from_dom(
+            f, "Please click each image containing a bus"), hct.BINARY)
+
     def test_dom_point_single_surface(self):
         f = {"tiles": 1, "choices": 0, "inputs": 0, "canvases": 0,
              "images": 1, "draggables": 0, "move_badge": False}
@@ -243,6 +258,19 @@ class TestRoutePrompt(unittest.TestCase):
                 "drag the element on the right to the shape that is most "
                 "similar"):
             self.assertEqual(hct.classify_from_prompt(prompt), hct.DRAG_DROP)
+
+    def test_prompt_pattern_completion(self):
+        p = ("Put one of the animals into the empty spot to complete the "
+             "pattern")
+        self.assertEqual(hct.classify_from_prompt(p), hct.DRAG_DROP)
+        self.assertTrue(hct.is_pattern_prompt(p))
+        self.assertEqual(hct.classify_from_prompt(
+            "Fill the empty cell to finish the pattern"), hct.DRAG_DROP)
+        self.assertTrue(hct.is_pattern_prompt(
+            "Which animal belongs in the blank space?"))
+        # ...but the plain binary grid is NOT a pattern round
+        self.assertFalse(hct.is_pattern_prompt(
+            "Please click each image containing a bus"))
 
     def test_prompt_select_all_variants(self):
         for prompt in (
@@ -356,6 +384,18 @@ class TestParseGeometry(unittest.TestCase):
         self.assertEqual(GEO("3", "choice", 1),
                          {"type": "choice", "index": 3})
 
+    def test_parse_pattern_drag(self):
+        # pattern rounds answer with a candidate->hole drag; the parser
+        # accepts both the "pattern" and "drag" keys
+        got = GEO('{"pattern": {"from": [0.3, 0.8], "to": [0.5, 0.2]}}',
+                  "drag")
+        self.assertEqual(got, {"type": "drag", "from": (0.3, 0.8),
+                               "to": (0.5, 0.2)})
+        got = GEO('{"drag": {"from": [0.3, 0.8], "to": [0.5, 0.2]}}',
+                  "drag")
+        self.assertEqual(got, {"type": "drag", "from": (0.3, 0.8),
+                               "to": (0.5, 0.2)})
+
     def test_parse_drag(self):
         got = GEO('{"drag": {"from": [0.25, 0.5], "to": [0.75, 0.5]}}',
                   "drag")
@@ -458,6 +498,33 @@ class TestKnowledgeBase(unittest.TestCase):
             "Please click each image containing a police car",
             ["bus", "car", "tree"])
         self.assertEqual(idx, [2])
+
+    def test_pattern_latin_square(self):
+        #    cat  dog  [ ]
+        #    dog  elephant cat
+        #    elephant  cat  dog   -> the hole needs "elephant"
+        grid = ["cat", "dog", None,
+                "dog", "elephant", "cat",
+                "elephant", "cat", "dog"]
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["dog", "elephant", "cat"]), 1)
+        # shuffled candidate order is respected
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["elephant", "cat", "dog"]), 0)
+
+    def test_pattern_rows_only_and_ambiguous(self):
+        # rows constrained but columns not: still solvable via rows rule
+        grid = ["cat", "dog", None,
+                "cat", "dog", "elephant",
+                "dog", "elephant", "cat"]
+        self.assertEqual(hct.resolve_pattern(grid, 2,
+                                             ["cat", "elephant", "dog"]), 1)
+        # two candidates both complete it -> refuse to guess
+        self.assertIsNone(hct.resolve_pattern(
+            grid, 2, ["elephant", "elephant", "dog"]))
+        # bad shapes refuse outright
+        self.assertIsNone(hct.resolve_pattern(["cat"], 0, ["cat"]))
+        self.assertIsNone(hct.resolve_pattern(grid, 99, ["cat"]))
 
     def test_jumps_highest(self):
         idx = hct.resolve_semantic(
@@ -682,6 +749,55 @@ class TestModels(unittest.TestCase):
         print("\n  offline count exact: %d/%d (%d self-gated to vision)"
               % (exact, total, gated))
         self.assertGreaterEqual(exact, 40)
+
+    def test_pattern_rounds_offline(self):
+        """Pattern completion end-to-end without a browser: crop the grid
+        cells and candidates from the generated round, classify them with
+        the tile CNN, and resolve the Latin square — the exact path
+        _solve_pattern_round takes when the DOM probe succeeds."""
+        import make_challenges as mc
+        import numpy as np
+        from PIL import Image as PILImage
+        solved = gated = total = 0
+        for i in range(60):
+            rng = random.Random("heldout|pattern|%d" % i)
+            img, meta = mc.make_pattern_round(rng, 96)
+            W, H = img.size
+            total += 1
+            # hole = brightest cell (same heuristic as the server: the
+            # empty cell is near-white; painted tiles are darker)
+            means = []
+            for b in meta["cell_boxes"]:
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                means.append(float(np.asarray(
+                    img.crop((x0, y0, x1, y1)).convert("L")).mean()))
+            hole = int(np.argmax(means))
+            grid = [None] * 9
+            confs = []
+            for i2, b in enumerate(meta["cell_boxes"]):
+                if i2 == hole:
+                    continue
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
+                grid[i2] = g[0]
+                confs.append(g[1])
+            clab, cconf = [], []
+            for b in meta["candidate_boxes"]:
+                x0, y0 = int(b["x"] * W), int(b["y"] * H)
+                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
+                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
+                clab.append(g[0])
+                cconf.append(g[1])
+            win = hct.resolve_pattern(grid, hole, clab)
+            if win is None:
+                gated += 1
+            elif win == meta["correct"]:
+                solved += 1
+        print("\n  offline pattern solved: %d/%d (%d gated to vision)"
+              % (solved, total, gated))
+        self.assertGreaterEqual(solved, 35)
 
     def test_real_photo_tiles(self):
         """Held-out REAL photographs (data_real/val/) the trainer never saw —
