@@ -1588,6 +1588,24 @@ class DiscordAutomation:
         except Exception:
             return False
 
+    async def _page_is_closed(self) -> bool:
+        """Return whether the current page is unavailable without raising."""
+        page = self._page
+        if page is None:
+            return True
+        try:
+            closed = getattr(page, "is_closed", None)
+            if callable(closed):
+                return bool(closed())
+            if closed is not None:
+                return bool(closed)
+            # Camoufox's wrapper may not expose is_closed; a tiny bounded read
+            # distinguishes a live page from a closed CDP target.
+            await asyncio.wait_for(page.evaluate("location.href"), timeout=1.0)
+            return False
+        except Exception:
+            return True
+
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
@@ -1693,6 +1711,7 @@ class DiscordAutomation:
         circuit is pointless — if Discord blocked that exit node, it won't
         unblock on retry."""
         url = "https://discord.com/register"
+        recovered_unavailable_page = False
         # A fresh navigation must not inherit a stale crash flag from a
         # previous page (recovery also resets it — belt and suspenders).
         self._page_crashed = False
@@ -1736,13 +1755,26 @@ class DiscordAutomation:
             # on chrome-error / dead reads, so a slow-but-alive TOR circuit
             # gets to finish loading instead of being killed at 30s.
             elapsed = time.time() - t0
-            if "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower():
+            err_type = type(e).__name__.lower()
+            err_text = str(e).lower()
+            if "timeout" in err_type or "timeout" in err_text:
                 self._log(f"[Nav] Page.goto timeout ({type(e).__name__}) after {elapsed:.1f}s - continuing to render-wait")
-            elif "crashed" in str(e).lower():
+            elif ("targetclosed" in err_type or "target page" in err_text
+                  or "has been closed" in err_text or "context or browser has been closed" in err_text):
+                # The target is already gone. Recover before reading title/url,
+                # otherwise the dashboard receives a misleading '(unknown)'.
+                reason = "page, context, or browser closed during navigation"
+                self._nav_error = reason
+                self._log(f"[Nav] Page.goto TargetClosedError - {reason}", level="warn")
+                recovered_unavailable_page = await self._recover_crashed_page(url, reason)
+                if not recovered_unavailable_page:
+                    self._nav_error = f"{reason} - browser restart failed"
+                    return False
+            elif "crashed" in err_text:
                 # Renderer died mid-commit. Flag it so the render-wait loop
-                # recovers the tab in place instead of polling a corpse 20x.
+                # restarts the browser once instead of polling a corpse.
                 self._page_crashed = True
-                self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering tab on same circuit", level="warn")
+                self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering browser", level="warn")
             else:
                 self._log(f"[Nav] Page.goto error ({type(e).__name__}: {e}) - continuing to render-wait", level="warn")
         # ── Check what we got ──
@@ -1752,6 +1784,24 @@ class DiscordAutomation:
         except Exception:
             page_title = "(unknown)"
             page_url = "(unknown)"
+        if (str(page_title) == "(unknown)" and str(page_url) == "(unknown)"
+                and await self._page_is_closed()):
+            # A page/context closure is definitive, unlike a slow navigation.
+            # Restart before emitting an unknown-title line or entering the
+            # render loop with an object that can no longer answer.
+            if not recovered_unavailable_page:
+                reason = "page closed before navigation state was available"
+                recovered_unavailable_page = await self._recover_crashed_page(url, reason)
+            if not recovered_unavailable_page:
+                self._nav_error = "page closed before navigation state was available"
+                self._log("[Nav] Page closed before state read - rotating circuit", level="warn")
+                return False
+            try:
+                page_title = await asyncio.wait_for(self._page.title(), timeout=3.0)
+                page_url = await asyncio.wait_for(self._page.evaluate("location.href"), timeout=3.0)
+            except Exception:
+                page_title = "(starting after restart)"
+                page_url = url
         if (str(page_title) == "(unknown)" and str(page_url) == "(unknown)"
                 and not self._page_crashed):
             # The hard cap can cancel goto while a slow-but-alive session is
@@ -1914,16 +1964,19 @@ class DiscordAutomation:
                 # renderer crash is usually a transient memory spike, not a
                 # dead proxy), then rotate immediately instead of polling a
                 # corpse 20x and burning a good circuit on a bad diagnosis.
-                if self._page_crashed:
+                page_closed = await self._page_is_closed()
+                if self._page_crashed or page_closed:
+                    reason = ("renderer crashed" if self._page_crashed
+                              else "page, context, or browser closed")
                     if not crash_recovered:
-                        crash_recovered = await self._recover_crashed_page(url)
+                        crash_recovered = await self._recover_crashed_page(url, reason)
                         if crash_recovered:
                             dead_reads = 0
                             blank_nav_since = None
                             last_log = -1.0
                             continue
-                    self._nav_error = "page crashed (browser tab died) - rotating circuit"
-                    self._log("[Nav] Page crashed - tab died, rotating circuit", level="warn")
+                    self._nav_error = f"{reason} - rotating circuit"
+                    self._log(f"[Nav] {reason.capitalize()} - rotating circuit", level="warn")
                     return False
                 if elapsed >= last_log + 3.0:
                     last_log = elapsed
@@ -2154,18 +2207,18 @@ class DiscordAutomation:
         return False
 
 
-    async def _recover_crashed_page(self, url: str) -> bool:
-        """Recover one renderer crash with a fresh browser process.
+    async def _recover_crashed_page(self, url: str,
+                                    reason: str = "renderer crashed") -> bool:
+        """Recover one unavailable page with a fresh browser process.
 
-        A Camoufox page crash can leave the browser transport technically
-        connected while its content process remains unhealthy. Reusing that
-        process by opening another tab can therefore crash again immediately.
-        Restart the complete browser on the same circuit once, then let the
-        worker rotate normally if the replacement also fails.
+        A Camoufox renderer crash or a TargetClosedError can leave the browser
+        transport technically connected while its page/context is unusable.
+        Restarting the complete browser once avoids trying to poll a target
+        that no longer exists; a second failure is left to normal rotation.
         """
         if self._stopped.is_set():
             return False
-        self._log('[Nav] Renderer crashed - restarting browser process once', level='warn')
+        self._log(f'[Nav] {reason} - restarting browser process once', level='warn')
         try:
             await self._relaunch_browser()
             if self._page is None:
