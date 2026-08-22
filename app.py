@@ -1543,14 +1543,29 @@ window.refreshStatus=refreshStatus;
 function logText(logs){
   return logs.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');}).join('\n');
 }
+function compactLogLine(entry){
+  var message=String(entry.message||entry.m||'');
+  var level=String(entry.level||'').toLowerCase();
+  var time=entry.time||'';
+  var browserFailure=/page crashed|targetclosed|target page.*closed|browser restart.*failed|page closed before/i.test(message);
+  if(browserFailure)return time+' Browser page failed — see ALL LOGS for diagnostics.';
+  var important=/\[FAIL\]|\[OK\]|\[ERROR\]|browser launch failed|retries exhausted|all workers stopped|stopped by user|\[diag\]/i.test(message)||level==='error';
+  return important?(time+' '+message):'';
+}
 function renderLogs(box,logs,compact){
   if(!box)return;
   var items=logs||[];
+  var rendered;
   if(compact){
     var cutoff=Date.now()/1000-300;
-    items=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;}).slice(-80);
+    rendered=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;})
+      .map(compactLogLine).filter(Boolean);
+    // Collapse repeated browser-crash summaries while full detail remains in ALL LOGS.
+    rendered=rendered.filter(function(line,index,all){return index===0||line!==all[index-1];}).slice(-30);
+  }else{
+    rendered=items.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');});
   }
-  box.textContent=items.length?logText(items):(compact?'No recent activity.':'No logs yet.');
+  box.textContent=rendered.length?rendered.join('\n'):(compact?'No recent activity.':'No logs yet.');
   box.scrollTop=box.scrollHeight;
 }
 function refreshLogs(){

@@ -14,7 +14,7 @@ lxml>=5.0.0
 # The [geoip] extra enables geo-matching the fingerprint to the proxy's
 # real exit region (geolocation/timezone/locale + WebRTC IP spoofing);
 # without it the engine falls back to plain randomized fingerprints.
-camoufox[geoip]>=0.5.0
+camoufox[geoip]==0.5.5
 
 # Web app (dashboard)
 flask>=3.0.0

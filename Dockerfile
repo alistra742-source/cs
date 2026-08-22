@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libasound2 libcairo2 libpango-1.0-0 libgtk-3-0 \
     libexpat1 libx11-6 libxcb1 libxext6 \
     fonts-liberation libatspi2.0-0 \
+    libgl1 libgl1-mesa-dri mesa-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -19,18 +20,29 @@ COPY requirements.txt ./
 # network blips; retry instead of killing the whole build.
 RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
 
-# Fetch the Camoufox browser binary once at build time so the image is
-# self-contained (engine launches are instant at runtime). Falls back to
-# fetching at first launch if the build has no network.
-RUN python -m camoufox fetch || echo "[Camoufox] fetch skipped - will fetch at first launch"
+# Run the browser and Tor as an unprivileged user. Camoufox's Linux
+# container crash reports identify root browser execution as a failure mode.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && mkdir -p /home/appuser/.cache \
+    && chown -R appuser:appuser /home/appuser /app
 
-# Copy ALL application files
+# Copy application files, then give the runtime account ownership.
 COPY *.py ./
 COPY *.txt ./
 COPY config.json ./
 COPY torrc /etc/tor/torrc
 COPY start.sh ./
-RUN chmod +x start.sh
+RUN chmod +x start.sh && chown -R appuser:appuser /app
+
+USER appuser
+ENV HOME=/home/appuser
+ENV XDG_CACHE_HOME=/home/appuser/.cache
+ENV LIBGL_ALWAYS_SOFTWARE=1
+
+# Fetch the browser only after switching user. The pinned package version
+# invalidates this layer when upgraded, ensuring an old browser base is not
+# silently reused by subsequent application-only deployments.
+RUN python -m camoufox fetch
 
 EXPOSE 8080
 ENV PYTHONUNBUFFERED=1

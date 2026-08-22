@@ -1178,6 +1178,7 @@ class DiscordAutomation:
         # in place once (fresh page, same circuit) then rotates instead of
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
+        self._last_browser_diag = 0.0
         # Engine-owned identity: Camoufox mints a fresh randomized profile
         # per launch — there is no bot-side fingerprint to keep.
         self._fingerprint = {}
@@ -1209,6 +1210,61 @@ class DiscordAutomation:
         import traceback
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         self._log(f"{message} — {tb.rstrip()}", level="error")
+
+    async def _log_browser_diagnostics(self, reason: str,
+                                       exc: Optional[BaseException] = None,
+                                       force: bool = False) -> None:
+        """Add concise runtime evidence for browser crashes to ALL LOGS.
+
+        This avoids guessing whether a repeated page crash came from a proxy,
+        a stale browser build, a root runtime, or a cgroup memory/pid limit.
+        Sensitive connection credentials and account data are deliberately
+        excluded from the report.
+        """
+        now = time.time()
+        if not force and now - self._last_browser_diag < 2.0:
+            return
+        self._last_browser_diag = now
+
+        def _read(path: str, limit: int = 240) -> str:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    return handle.read(limit).strip().replace("\n", "; ")
+            except Exception as read_error:
+                return f"unavailable:{type(read_error).__name__}"
+
+        def _collect() -> dict:
+            try:
+                from importlib.metadata import version
+                camoufox_version = version("camoufox")
+            except Exception:
+                camoufox_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "camoufox")
+            return {
+                "reason": reason,
+                "error_type": type(exc).__name__ if exc is not None else "",
+                "error": str(exc)[:500] if exc is not None else "",
+                "uid": os.getuid() if hasattr(os, "getuid") else None,
+                "engine": ENGINE,
+                "camoufox_package": camoufox_version,
+                "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
+                "page_present": self._page is not None,
+                "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
+                "home": os.environ.get("HOME", ""),
+                "cache_exists": os.path.isdir(cache_dir),
+                "cgroup_memory_current": _read("/sys/fs/cgroup/memory.current"),
+                "cgroup_memory_max": _read("/sys/fs/cgroup/memory.max"),
+                "cgroup_memory_events": _read("/sys/fs/cgroup/memory.events"),
+                "cgroup_pids_current": _read("/sys/fs/cgroup/pids.current"),
+                "cgroup_pids_max": _read("/sys/fs/cgroup/pids.max"),
+                "process_status": _read("/proc/self/status", 1200),
+            }
+
+        try:
+            diagnostics = await asyncio.to_thread(_collect)
+            self._log("[Diag] Browser failure " + json.dumps(diagnostics, sort_keys=True), level="error")
+        except Exception as diag_error:
+            self._log(f"[Diag] Browser failure diagnostics unavailable: {type(diag_error).__name__}: {diag_error}", level="error")
 
     def get_activity_log(self) -> list:
         return self._activity_log
@@ -1427,6 +1483,14 @@ class DiscordAutomation:
     def _on_page_crash(self) -> None:
         self._page_crashed = True
         self._log("[Nav] Page crashed (browser tab died)", level="warn")
+        try:
+            asyncio.get_running_loop().create_task(
+                self._log_browser_diagnostics("renderer-crash-event")
+            )
+        except RuntimeError:
+            # The callback can run while the loop is closing; the navigation
+            # exception path records the same diagnostics in that case.
+            pass
 
     def _on_page_request(self, request) -> None:
         try:
@@ -1774,6 +1838,7 @@ class DiscordAutomation:
                 # Renderer died mid-commit. Flag it so the render-wait loop
                 # restarts the browser once instead of polling a corpse.
                 self._page_crashed = True
+                await self._log_browser_diagnostics("page-goto-crashed", e)
                 self._log(f"[Nav] Page.goto CRASH ({type(e).__name__}: {str(e)[:120]}) - recovering browser", level="warn")
             else:
                 self._log(f"[Nav] Page.goto error ({type(e).__name__}: {e}) - continuing to render-wait", level="warn")
@@ -2235,6 +2300,7 @@ class DiscordAutomation:
             raise
         except Exception as e:
             self._page_crashed = True
+            await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
             self._log(
                 f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})',
                 level='error',
