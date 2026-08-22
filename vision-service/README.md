@@ -56,7 +56,33 @@ are faster when the `/data` volume is attached.
 
 ## API
 
-### Analyze an image
+### Ollama-compatible (for the bot's vision_solver)
+
+The bot speaks Ollama's native API; the gateway proxies it to local Ollama
+with the model forced to `OLLAMA_MODEL` (fixed-model server-side). Both
+endpoints require the API key:
+
+```bash
+# health / model list (the bot probes this before solving)
+curl https://YOUR-SERVICE.up.railway.app/api/tags \
+  -H "Authorization: Bearer $VISION_API_KEY"
+
+# chat (native Ollama payload: messages[], base64 images, format:"json")
+curl -X POST https://YOUR-SERVICE.up.railway.app/api/chat \
+  -H "Authorization: Bearer $VISION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ignored-forced-server-side","messages":[{"role":"user","content":"What is this?","images":["<base64>"]}],"stream":false,"format":"json"}'
+```
+
+Point the bot at this service with `VISION_API_BASE` + `VISION_API_KEY`.
+The bot's configured `OLLAMA_MODEL` name does not need to match — the
+gateway forces the local model.
+
+### Analyze an image (legacy safe endpoint)
+
+Note: `POST /v1/analyze` refuses CAPTCHA / security-challenge prompts
+(its contract is lawful captioning / OCR / visual Q&A). Use the
+Ollama-compatible `/api/chat` above for the bot.
 
 ```bash
 IMAGE=$(base64 < photo.jpg | tr -d '\n')

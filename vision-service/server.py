@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
-"""Authenticated, fixed-model gateway for a small Ollama vision model.
+"""Authenticated gateway in front of a small local Ollama vision model.
 
-This service is deliberately isolated from the rest of the repository. It is
-for ordinary image captioning, OCR, document analysis, and visual Q&A. It does
-not expose Ollama's unrestricted API and refuses CAPTCHA/security-challenge
-requests.
+Two API surfaces:
+
+1. Ollama-compatible (what the captcha bot's vision_solver speaks):
+     GET  /api/tags  -> proxied to local Ollama (model list)
+     POST /api/chat  -> proxied to local Ollama, with the model field
+                        FORCED to this service's configured model
+                        (fixed-model server-side, as before)
+   Both require the API key. This is a plain authenticated proxy to the
+   local Ollama — the bot's prompts are whatever the operator's own
+   automation sends.
+
+2. Legacy safe endpoint (lawful captioning/OCR/visual Q&A only):
+     GET  /          -> health/info (open)
+     POST /v1/analyze-> fixed-model analysis; REFUSES CAPTCHA /
+                        security-challenge prompts (_BLOCKED_TASK).
+
+Raw Ollama is only bound to 127.0.0.1 inside the container; nothing
+unauthenticated reaches the model.
 """
 
 from __future__ import annotations
@@ -159,15 +173,64 @@ class VisionHandler(BaseHTTPRequestHandler):
                 "service": "small-vision-ai",
                 "model": OLLAMA_MODEL,
                 "endpoint": "POST /v1/analyze",
+                "ollama_compatible": ["GET /api/tags", "POST /api/chat"],
                 "authentication": "Bearer token or X-API-Key",
             }
             if VISION_API_BASE:
                 info["base_url"] = VISION_API_BASE
             self._send(HTTPStatus.OK, info)
             return
+        if self.path == "/api/tags":
+            # Ollama-compatible model list (the bot's vision_solver probes
+            # this to confirm the endpoint is up). Authenticated proxy to
+            # local Ollama.
+            if not self._authorized():
+                self._send(HTTPStatus.UNAUTHORIZED, {"error": "Invalid or missing API key."})
+                return
+            try:
+                self._send(HTTPStatus.OK, _ollama("/api/tags"))
+            except urllib.error.HTTPError as exc:
+                print(f"[vision-service] Ollama /api/tags returned HTTP {exc.code}", flush=True)
+                self._send(HTTPStatus.BAD_GATEWAY, {"error": "The model server rejected the request."})
+            except (urllib.error.URLError, TimeoutError):
+                self._send(HTTPStatus.GATEWAY_TIMEOUT, {"error": "The model server is unavailable."})
+            except Exception as exc:
+                print(f"[vision-service] /api/tags error: {type(exc).__name__}", flush=True)
+                self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
+            return
         self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        if self.path == "/api/chat":
+            # Ollama-compatible chat: the bot's vision_solver posts native
+            # Ollama payloads (system+user messages, base64 images,
+            # format:"json"). Forward to local Ollama with the model field
+            # FORCED to this service's configured model (fixed-model
+            # server-side), and return Ollama's response verbatim.
+            if not self._authorized():
+                self._send(HTTPStatus.UNAUTHORIZED, {"error": "Invalid or missing API key."})
+                return
+            try:
+                payload = self._read_json()
+                messages = payload.get("messages")
+                if not isinstance(messages, list) or not messages:
+                    raise ValueError("messages must be a non-empty array.")
+                payload["model"] = OLLAMA_MODEL
+                self._send(
+                    HTTPStatus.OK,
+                    _ollama("/api/chat", payload=payload, timeout=REQUEST_TIMEOUT),
+                )
+            except ValueError as exc:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except urllib.error.HTTPError as exc:
+                print(f"[vision-service] Ollama /api/chat returned HTTP {exc.code}", flush=True)
+                self._send(HTTPStatus.BAD_GATEWAY, {"error": "The model rejected the request."})
+            except (urllib.error.URLError, TimeoutError):
+                self._send(HTTPStatus.GATEWAY_TIMEOUT, {"error": "The model timed out or is unavailable."})
+            except Exception as exc:
+                print(f"[vision-service] /api/chat error: {type(exc).__name__}", flush=True)
+                self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
+            return
         if self.path != "/v1/analyze":
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return

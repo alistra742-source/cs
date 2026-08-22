@@ -1360,6 +1360,47 @@ def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+async def _vision_keepalive(interval: float = 240.0) -> None:
+    """Keep a HOSTED vision endpoint warm so the platform doesn't stop it.
+
+    The bot only calls vision when a captcha appears. Between captchas the
+    service idles — and on Railway's Hobby plan a deployment with no traffic
+    is STOPPED after ~15 minutes. The next captcha then hits a dead edge
+    (TLS reset in <0.1s, not a cold start) and every round fails until
+    someone manually restarts the deploy. A tiny GET / every 4 minutes
+    counts as traffic and keeps the deployment running. Local Ollama
+    (localhost) is skipped — it never idles out.
+    """
+    import vision_solver as _vs
+    base = (_vs.OLLAMA_BASE or "").rstrip("/")
+    if not base:
+        return
+    host = base.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]",
+                "host.docker.internal"):
+        return
+    headers = {}
+    if _vs.VISION_API_KEY:
+        headers["Authorization"] = f"Bearer {_vs.VISION_API_KEY}"
+    was_up: Optional[bool] = None
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=25)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(base + "/", headers=headers) as r:
+                    up = (r.status == 200)
+        except Exception:
+            up = False
+        if was_up is not None and up != was_up:
+            if up:
+                _log(f"[Vision] Endpoint back UP at {base}", level="warn")
+            else:
+                _log(f"[Vision] Endpoint DOWN at {base} — captcha rounds "
+                     "will fail until it answers (check the hosted deploy)",
+                     level="warn")
+        was_up = up
+        await asyncio.sleep(interval)
+
 def main() -> None:
     global _loop
     _load_burned()
@@ -1372,6 +1413,13 @@ def main() -> None:
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=_run_event_loop, args=(_loop,), daemon=True)
     t.start()
+
+    # Keep the hosted vision endpoint from being stopped for inactivity
+    # (no-op when VISION_API_BASE is unset or points at localhost).
+    try:
+        asyncio.run_coroutine_threadsafe(_vision_keepalive(), _loop)
+    except Exception as e:
+        print(f"[app] vision keepalive not started: {e}", flush=True)
 
     # Auto-migrate DB (DATABASE_URL from env)
 
