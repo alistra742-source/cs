@@ -20,10 +20,10 @@ Pipeline (same as the bot):
   6. click those tiles (or type the answer for text challenges), click
      Verify, and poll until hCaptcha mints the token.
 
-It drives any Playwright-compatible ``page`` — the project's Camoufox
-engine (browser_engine.py, anti-detect Firefox with engine-owned
-fingerprints), stock Playwright Chromium/Firefox, or the bot's own live
-page — so the same solver can be reused elsewhere.
+It drives any Playwright-compatible ``page`` — the project's nodriver
+engine (browser_engine.py, undetected driver over a real Google Chrome),
+stock Playwright Chromium/Firefox, or the bot's own live page — so the
+same solver can be reused elsewhere.
 
 CLI usage:
 
@@ -730,8 +730,8 @@ async def _cli_solve(url: str, headless: bool, timeout: float,
 
     pw = await async_playwright().start()
     # `.chromium` is the engine's Playwright-compatible shim — it really
-    # launches Camoufox (anti-detect Firefox) with a fresh randomized
-    # identity per context. See camoufox_engine.py.
+    # launches a REAL Google Chrome (google-chrome-stable) through nodriver
+    # (an undetected CDP driver; no Selenium layer). See nodriver_engine.py.
     browser = await pw.chromium.launch(headless=headless)
     context = await browser.new_context(viewport={"width": 1280, "height": 900},
                                         ignore_https_errors=True)
@@ -773,7 +773,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="solver.py",
         description="Standalone hCaptcha solver (Ollama vision model + "
-                    "Camoufox engine). Solves the image challenge on any page.")
+                    "nodriver/Chrome engine). Solves the image challenge on any page.")
     parser.add_argument("url", nargs="?", help="page URL with an hCaptcha widget")
     parser.add_argument("--check", action="store_true",
                         help="probe the Ollama backend and exit")

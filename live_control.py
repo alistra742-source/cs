@@ -4,8 +4,8 @@ live_control.py — live-control helpers for the dashboard's LIVE tab.
 These are plain module functions (not methods on DiscordAutomation) so the
 dashboard can run them on the bot's asyncio loop without touching the big bot
 modules. They drive the SAME ``bot._page`` the bot uses — the operator and the
-bot share one real Camoufox session, and every action here is a pure read or
-input over that page (no second browser is ever launched).
+bot share one real Chrome (nodriver) session, and every action here is a
+pure read or input over that page (no second browser is ever launched).
 """
 import asyncio
 import base64
@@ -112,9 +112,9 @@ def _dead_page(url: str) -> bool:
     """True when the page is a browser error/blank page (proxy tunnel died,
     site unreachable, or navigation never happened) rather than real content.
 
-    Engine-agnostic: Chromium spells a dead tunnel chrome-error://chromewebdata/,
-    Camoufox (Firefox) spells it about:neterror::e-connection-failed (and
-    friends)."""
+    Engine-agnostic: Chromium (the engine in use) spells a dead tunnel
+    chrome-error://chromewebdata/; about:neterror:: is kept for robustness
+    in case a future engine swap lands on Firefox."""
     u = (url or "").lower()
     if "chrome-error" in u or "neterror" in u or "err_tunnel" in u or "err_" in u:
         return True
@@ -157,9 +157,9 @@ async def live_navigate(bot, url: str) -> dict:
         return meta
     meta = await get_live_state(bot)
     # goto() can 'succeed' straight onto a browser error page (chrome-error://
-    # on Chromium, about:neterror on Camoufox) when the proxy CONNECT tunnel
-    # is dead — treat that as a navigation failure so the caller can rotate
-    # the session.
+    # on Chromium; about:neterror on other engines) when the proxy CONNECT
+    # tunnel is dead — treat that as a navigation failure so the caller can
+    # rotate the session.
     if _dead_page(meta.get("url", "")):
         meta["error"] = "site unreachable (proxy tunnel failed)"
         return meta

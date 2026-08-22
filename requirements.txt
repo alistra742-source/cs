@@ -4,14 +4,11 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Browser engine: Camoufox — a debloated Firefox fork with C++-level
-# fingerprint spoofing and its own built-in Playwright driver
-# (camoufox.async_api). No Chrome, no truedriver. The Camoufox browser
-# build itself is fetched with `python -m camoufox fetch` (Dockerfile).
-# PINNED (not >=): the Firefox base upgrades silently with each release
-# and memory footprint moves with it — re-test the 1 GB container before
-# bumping the pin.
-camoufox==0.5.5
+# Browser engine: nodriver — an undetected, CDP-native driver for a REAL
+# Google Chrome (google-chrome-stable, installed in the Dockerfile). No
+# Selenium/WebDriver layer, no Firefox. The fingerprint is a real user's
+# Chrome; nodriver only strips the automation tells.
+nodriver==0.50.3
 
 # Web app (dashboard)
 flask>=3.0.0

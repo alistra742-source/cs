@@ -390,7 +390,7 @@ class ProxyPool:
         blacklisted in ~3s instead of burning an 8s goto + a browser launch.
         Tests against Discord directly (HTTPS) — NOT ipify.org, which was
         the original lie (residential proxies pass HTTP ipify effortlessly
-        but fail the moment Camoufox tries discord.com).
+        but fail the moment Chrome tries discord.com).
         """
         if not proxy or not proxy.get("host") or not proxy.get("port"):
             return False
@@ -432,7 +432,7 @@ class ProxyPool:
 
         Testing against ipify.org via HTTP was a lie — residential proxies
         that pass an HTTP handshake to a lightweight API routinely fail when
-        the Camoufox browser tries HTTPS to discord.com. Now each probe
+        the Chrome browser tries HTTPS to discord.com. Now each probe
         issues a real HTTPS GET to discord.com through the proxy and reads
         the resolved IP so the UI shows what IP each session routes through.
 

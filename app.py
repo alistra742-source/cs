@@ -729,9 +729,10 @@ async def _start_all_async(cfg: dict) -> None:
             _worker_tasks[wid] = task
 
         # A 530-session TLS sweep at the default 250-way concurrency can use
-        # most of the 1 GB container while Camoufox is also hydrating React.
-        # Run optional pool-wide validation only after browser work is idle;
-        # the active worker still probes its chosen session before every use.
+        # most of the 1 GB container while real Chrome is also hydrating
+        # React. Run optional pool-wide validation only after browser work
+        # is idle; the active worker still probes its chosen session before
+        # every use.
         asyncio.create_task(_deferred_proxy_sweep(n_sessions), name="deferred-proxy-sweep")
         asyncio.create_task(_proxy_validate_loop(), name="proxy-validation-summary")
 

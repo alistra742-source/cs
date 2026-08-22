@@ -1349,9 +1349,10 @@ async def capture_page_screenshot(page, log=None,
 
 # ── Browser-error URL detection (engine-agnostic) ──────────────────────
 # A dead proxy / DNS failure lands the tab on the browser's built-in error
-# page. Chromium spells it chrome-error://chromewebdata/; Camoufox (Firefox)
-# spells it about:neterror::e-connection-failed (and friends). Both are
-# DEFINITIVE "this circuit cannot reach Discord at all" signals — rotate.
+# page. The engine is real Chrome, so the direct form is
+# chrome-error://chromewebdata/; about:neterror:: is kept for robustness
+# in case a future engine swap lands on Firefox. Both are DEFINITIVE
+# "this circuit cannot reach Discord at all" signals — rotate.
 _BROWSER_ERROR_URL_MARKERS = (
     "chrome-error://",
     "about:neterror",
@@ -1369,9 +1370,9 @@ def _is_browser_error_url(url: str) -> bool:
 # ═══════════════════════════════════════════════════════════════
 
 # Pointer realism is provided by human_mouse.py (manual cubic-bezier glide,
-# settle, and human dwell on down/up) for the challenge interactions that need
-# it, and by plain page.mouse clicks elsewhere. Camoufox's humanize layer
-# drives page.mouse with its own bezier trajectories on top of that.
+# settle, and human dwell on down/up) for the challenge interactions that
+# need it, and by plain page.mouse clicks elsewhere. Those clicks ride on
+# nodriver's CDP Input.dispatchMouseEvent — real Chrome input events.
 
 class DiscordAutomation:
     def __init__(self, headless: bool = False, email: str = "",
@@ -1451,9 +1452,9 @@ class DiscordAutomation:
         # instead of rotating circuits (which cannot fix memory pressure).
         self._oom_kills_at_launch = 0
         self._oom_crash_times: list = []
-        # Camoufox owns the identity: a fresh temporary profile per launch and
-        # a freshly randomized fingerprint per context (engine-owned) —
-        # there is no bot-side fingerprint to keep.
+        # Real Chrome owns the identity: a fresh temporary profile per launch
+        # (nodriver mints a temp user-data-dir) — there is no bot-side
+        # fingerprint to keep or randomize.
         self._fingerprint = {}
 
     def _log(self, message: str, level: str = "info") -> None:
@@ -1509,17 +1510,17 @@ class DiscordAutomation:
         def _collect() -> dict:
             try:
                 from importlib.metadata import version
-                camoufox_version = version("camoufox")
+                nodriver_version = version("nodriver")
             except Exception:
-                camoufox_version = "unknown"
-            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "camoufox")
+                nodriver_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "nodriver")
             return {
                 "reason": reason,
                 "error_type": type(exc).__name__ if exc is not None else "",
                 "error": str(exc)[:500] if exc is not None else "",
                 "uid": os.getuid() if hasattr(os, "getuid") else None,
                 "engine": ENGINE,
-                "camoufox_package": camoufox_version,
+                "nodriver_package": nodriver_version,
                 "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
                 "page_present": self._page is not None,
                 "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
@@ -1558,10 +1559,11 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (Camoufox applies it at firefox
-        launch — a context-level proxy would be rejected when the browser
-        already has one). Returns the Playwright-style {server, username,
-        password} dict (or None for TOR/direct)."""
+        """The proxy rides on browser launch (nodriver applies it as Chrome
+        --proxy-server/--proxy-user/--proxy-pass launch flags — a
+        context-level proxy would be rejected when the browser already has
+        one). Returns the Playwright-style {server, username, password} dict
+        (or None for TOR/direct)."""
         if not (self.proxy and isinstance(self.proxy, dict)):
             return None
         p = self.proxy
@@ -1640,9 +1642,9 @@ class DiscordAutomation:
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
-        # Camoufox mints a FRESH randomized identity per launch (OS, screen,
-        # GPU, fonts, UA, TLS) and another one per context — identity is
-        # engine-owned; there is nothing for the bot to pin or randomize.
+        # Real Chrome IS the identity: genuine Chrome JS/TLS/HTTP2
+        # fingerprints, real fonts, real capabilities — nothing for the bot
+        # to pin, mint, or randomize.
         self._ua = ""
         self._fingerprint = {}
         self._log(f"[Engine] Fresh {ENGINE} context requested")
@@ -1657,21 +1659,14 @@ class DiscordAutomation:
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 
-        # Self-identifying memory profile: if this line is ABSENT from the
-        # log, the deployed image predates the memory fixes (pre-spawn off,
-        # single-process content) and the OOMs it shows are the old,
-        # un-optimized Firefox — rebuild before concluding 1 GB is too
-        # small. Prints exactly which footprint reductions are active.
-        try:
-            import camoufox_engine as _ce
-            _e10s_off = _ce._low_memory_mode()
-            _prelimit = _ce._MEMORY_SAFE_PREFS.get("dom.ipc.processPrelimit")
-        except Exception:
-            _e10s_off, _prelimit = LOW_MEMORY_MODE, "?"
+        # Self-identifying engine line: if this is ABSENT, the deployed
+        # image predates the nodriver/Chrome switch (or the OOM-aware
+        # recovery) — rebuild before drawing conclusions from its OOMs.
+        # Headless real-Chrome is the lightest engine we've shipped, and
+        # cgroup OOM attribution (see _cgroup_oom_kills) is always on.
         self._log(
-            f"[Engine] memory profile: single-process-content={'on' if _e10s_off else 'off'} "
-            f"(e10s off), pre-spawned-content-processes={_prelimit}, "
-            f"60Hz, capped image/cache memory, LOW_MEMORY_MODE={'on' if LOW_MEMORY_MODE else 'off'}"
+            f"[Engine] {ENGINE} on real Google Chrome (google-chrome-stable), "
+            f"headless={self.headless}, LOW_MEMORY_MODE={'on' if LOW_MEMORY_MODE else 'off'}"
         )
 
         # Use a smaller renderer surface in a 1 GB container. This keeps
@@ -1699,9 +1694,9 @@ class DiscordAutomation:
             self._log("[TOR] Using TOR SOCKS5 proxy...")
             if _tor_newnym():
                 self._log("[TOR] New identity requested")
-            # Camoufox already rides the TOR proxy from browser launch — a
-            # context-level proxy would be rejected by Playwright when the
-            # browser was launched with one.
+            # Chrome already rides the TOR proxy from browser launch — a
+            # context-level proxy would be rejected when the browser was
+            # launched with one.
             await asyncio.sleep(1)
         elif getattr(self, "_direct", False):
             self._log("[Proxy] Direct connection - no proxy and TOR unavailable")
@@ -1735,8 +1730,9 @@ class DiscordAutomation:
         self._attach_rqdata_capture()
         self._attach_crash_listener()
 
-        # Identity spoofing (incl. navigator.webdriver) is engine-owned inside
-        # the Camoufox browser build — apply_cdp_stealth is a contract no-op.
+        # Automation-tell stripping (incl. navigator.webdriver) is done by
+        # nodriver itself at the CDP level — apply_cdp_stealth is a contract
+        # no-op.
         await apply_cdp_stealth(self._context, self._page)
 
         # Baseline for OOM attribution: a renderer crash with a HIGHER cgroup
@@ -1987,9 +1983,9 @@ class DiscordAutomation:
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
-        The Camoufox engine mints a fresh fingerprint per context, so a
-        relaunch/context rebuild is already a new identity. Reset local
-        state so the next launch starts from a clean context."""
+        Real Chrome with a fresh temp profile is already a new identity on
+        every relaunch. Reset local state so the next launch starts from a
+        clean context."""
         self._fingerprint = {}
         self._ua = ""
         self._log(f"[Engine] {ENGINE} context will be recreated on next launch")
@@ -2200,15 +2196,15 @@ class DiscordAutomation:
         self._log('[Nav] Page: title="' + str(page_title)[:80] + '" url=' + str(page_url)[:80])
 
         # ── Dead proxy (cannot reach Discord at all) ──
-        # A browser error page (chrome-error:// on Chromium, about:neterror
-        # on Camoufox/Firefox) is a REAL dead signal (DNS/connection
-        # failure). about:blank is NOT dead: a slow TOR/residential circuit
-        # can still be committing the navigation when the goto cap fires, so
-        # a blank tab means "still loading" here, not "dead". Dead sessions
-        # surface an error page within seconds; blank-but-alive sessions just
-        # need the render-wait loop below (which re-issues the goto if the
-        # tab stays blank). Bouncing on about:blank is what made the bot
-        # "fail instantly without waiting" on slow circuits.
+        # A browser error page (chrome-error:// on Chrome; about:neterror on
+        # other engines) is a REAL dead signal (DNS/connection failure).
+        # about:blank is NOT dead: a slow TOR/residential circuit can still
+        # be committing the navigation when the goto cap fires, so a blank
+        # tab means "still loading" here, not "dead". Dead sessions surface
+        # an error page within seconds; blank-but-alive sessions just need
+        # the render-wait loop below (which re-issues the goto if the tab
+        # stays blank). Bouncing on about:blank is what made the bot "fail
+        # instantly without waiting" on slow circuits.
         if _is_browser_error_url(page_url):
             proxy_label = "PROXY SESSION" if self.proxy else "TOR CIRCUIT"
             self._nav_error = f"{proxy_label.lower()} dead (browser error page: {page_url[:60]})"
@@ -2618,8 +2614,8 @@ class DiscordAutomation:
         is_oom = oom_since_launch > 0
 
         # Track OOM crashes in a 5-minute window. Three of them means the
-        # container cap is simply too small for Camoufox + Discord — a hot
-        # retry loop would just burn proxy sessions faster.
+        # container cap is simply too small for real Chrome + Discord — a
+        # hot retry loop would just burn proxy sessions faster.
         if is_oom:
             now = time.time()
             self._oom_crash_times = [t for t in self._oom_crash_times if now - t < 300]
@@ -2627,7 +2623,7 @@ class DiscordAutomation:
             if len(self._oom_crash_times) >= 3:
                 self._log(
                     f"[Mem] {len(self._oom_crash_times)} cgroup OOM kills of the browser in the "
-                    f"last 5 minutes — the container memory limit is too small for Camoufox + "
+                    f"last 5 minutes — the container memory limit is too small for real Chrome + "
                     f"Discord (cgroup oom_kill={oom_now}). Reclaiming, then backing off 60s. "
                     "Raise the container memory limit (2 GB recommended) to stop this.",
                     level="error")
@@ -2898,10 +2894,10 @@ class DiscordAutomation:
     # ── Cloudflare Turnstile ─────────────────────────────────────────────
     # Discord sits behind Cloudflare, and a Turnstile captcha can gate
     # navigation / form submit / mail verification. The widget is clicked
-    # with a real, humanized locator click on the Camoufox page (the engine's
-    # humanize layer drives the pointer — never a synthetic JS event), then
-    # we confirm the challenge cleared via cf_clearance or the widget
-    # leaving the DOM.
+    # with a real, humanized locator click on the Chrome page (nodriver
+    # drives the pointer with CDP input events — never a synthetic JS
+    # event), then we confirm the challenge cleared via cf_clearance or the
+    # widget leaving the DOM.
     _TURNSTILE_SELECTORS = (
         'iframe[src*="challenges.cloudflare.com"]',
         'iframe[src*="turnstile"]',
@@ -2933,15 +2929,15 @@ class DiscordAutomation:
     async def _solve_turnstile_if_present(self) -> bool:
         """Bypass a Cloudflare Turnstile widget with a humanized click.
 
-        Clicks the widget checkbox with a real locator click on the Camoufox
+        Clicks the widget checkbox with a real locator click on the Chrome
         page, then confirms the challenge cleared via the cf_clearance
         cookie or the widget frame disappearing."""
         try:
             if not await self._detect_turnstile():
                 return False
             self._log("[Turnstile] Widget present - clicking it...")
-            # Humanized click on the widget checkbox (Camoufox drives the
-            # pointer with its humanize layer — never a synthetic JS event).
+            # Humanized click on the widget checkbox (nodriver drives the
+            # pointer with CDP input events — never a synthetic JS event).
             clicked = False
             for sel in self._TURNSTILE_SELECTORS:
                 try:
@@ -4917,9 +4913,9 @@ class DiscordAutomation:
 
             # ── Custom dropdown: open the menu, then pick the option ──
             # Discord re-renders the form while credentials are being written
-            # (React controlled inputs) and Camoufox's humanized cursor moves
-            # slowly, so a single Playwright click can hang on 'performing
-            # click action' for the full 30s default even though the element
+            # (React controlled inputs) and a humanized cursor moves
+            # slowly, so a single click can hang on 'performing click
+            # action' for the full 30s default even though the element
             # resolved visible+stable — the exact stall from the field logs.
             # Rule: SHORT click timeouts + verify the menu actually opened +
             # layered fallbacks (coordinate click -> trusted locator click
@@ -4954,7 +4950,7 @@ class DiscordAutomation:
                         self._log(f"[DOB] open click {label}: {str(e)[:150]}", level="warn")
                 elif open_method == "coords":
                     # Trusted input at the control's center — engine-
-                    # humanized by Camoufox (bezier travel), no
+                    # engine-driven (real CDP input), with no
                     # actionability re-checks to stall on.
                     try:
                         await ctrl.scroll_into_view_if_needed(timeout=3000)
@@ -5320,7 +5316,7 @@ class DiscordAutomation:
     async def _type_humanly(self, sel: str, val: str) -> bool:
         """Type one field like a real person instead of pasting it.
 
-        Real click focuses the input (Camoufox humanizes the cursor path),
+        Real click focuses the input (real Chrome cursor via nodriver),
         then character-by-character keyboard input with variable rhythm,
         one mid-field "thinking" pause, and an occasional typo corrected
         with backspace. Returns True only when the field holds `val` —
