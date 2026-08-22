@@ -1,4 +1,4 @@
-"""Functional browser settings for the Playwright Chromium driver.
+"""Functional browser settings for the truedriver engine.
 
 This module deliberately keeps identity modification out of page JavaScript.
 It supplies only stable container/runtime flags and standard context options.

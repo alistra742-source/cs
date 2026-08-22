@@ -186,7 +186,22 @@ _TOS_TARGET_JS = r"""() => {
     const ordered = tosOnes.concat(rest.reverse());
     const best = ordered[0];
     try { best.el.setAttribute('data-tos-target', '1'); } catch (e) {}
-    return { x: best.x, y: best.y, tos: best.tos ? 1 : 0, tag: (best.el && best.el.tagName || '').toLowerCase() };
+    // Discord toggles the box when its <label> / the row text is clicked too —
+    // clicking the label (which often wraps or neighbours the box) is the most
+    // reliable toggle and lands on a larger target. Prefer the label centre,
+    // falling back to the box centre.
+    let lx = best.x, ly = best.y;
+    try {
+        const lab = best.el.closest('label') || best.el.parentElement;
+        if (lab) {
+            const lr = lab.getBoundingClientRect();
+            if (lr && lr.width >= 8 && lr.height >= 8) {
+                lx = lr.left + lr.width / 2;
+                ly = lr.top + lr.height / 2;
+            }
+        }
+    } catch (e) {}
+    return { x: best.x, y: best.y, lx: lx, ly: ly, tos: best.tos ? 1 : 0, tag: (best.el && best.el.tagName || '').toLowerCase() };
 }"""
 
 # JS-dispatch fallback for the ToS box: dispatches pointer/mouse events ON
@@ -1102,12 +1117,10 @@ LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 # Human Behavior Simulation
 # ═══════════════════════════════════════════════════════════════
 
-# Mouse humanization is ENGINE-OWNED: Camoufox launches with humanize=True,
-# so every trusted mouse move / click already travels a human-like bezier
-# trajectory (max ~1.5s) natively — no custom bezier shim and NO artificial
-# per-step sleep delays. The old truedriver-era human_mouse_move() (manual
-# quadratic bezier + sleeps) is gone; every click in this file is a real
-# page.mouse click that the engine humanizes for free.
+# Pointer realism is provided by human_mouse.py (manual cubic-bezier glide,
+# settle, and human dwell on down/up) for the challenge interactions that need
+# it, and by plain page.mouse clicks elsewhere. The truedriver facade maps
+# page.mouse to native CDP Input.dispatchMouseEvent.
 
 class DiscordAutomation:
     def __init__(self, headless: bool = False, email: str = "",
@@ -1181,8 +1194,8 @@ class DiscordAutomation:
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
         self._last_browser_diag = 0.0
-        # Engine-owned identity: Camoufox mints a fresh randomized profile
-        # per launch — there is no bot-side fingerprint to keep.
+        # truedriver launches Chrome with a fresh temporary profile per launch
+        # — there is no bot-side fingerprint to keep.
         self._fingerprint = {}
 
     def _log(self, message: str, level: str = "info") -> None:
@@ -1238,17 +1251,17 @@ class DiscordAutomation:
         def _collect() -> dict:
             try:
                 from importlib.metadata import version
-                camoufox_version = version("camoufox")
+                truedriver_version = version("truedriver")
             except Exception:
-                camoufox_version = "unknown"
-            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "camoufox")
+                truedriver_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "truedriver")
             return {
                 "reason": reason,
                 "error_type": type(exc).__name__ if exc is not None else "",
                 "error": str(exc)[:500] if exc is not None else "",
                 "uid": os.getuid() if hasattr(os, "getuid") else None,
                 "engine": ENGINE,
-                "camoufox_package": camoufox_version,
+                "truedriver_package": truedriver_version,
                 "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
                 "page_present": self._page is not None,
                 "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
@@ -1272,7 +1285,7 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (Camoufox applies it at launch
+        """The proxy rides on browser launch (truedriver applies it at launch
         — a context-level proxy would either be ignored or rejected).
         Returns the Playwright-style {server, username, password} dict
         (or None for TOR/direct)."""
@@ -1396,7 +1409,7 @@ class DiscordAutomation:
             self._log("[TOR] Using TOR SOCKS5 proxy...")
             if _tor_newnym():
                 self._log("[TOR] New identity requested")
-            # Camoufox already rides the TOR proxy from browser launch — a
+            # truedriver already rides the TOR proxy from browser launch — a
             # context-level proxy would be rejected by Playwright when the
             # browser was launched with one.
             await asyncio.sleep(1)
@@ -1664,7 +1677,7 @@ class DiscordAutomation:
                 return bool(closed())
             if closed is not None:
                 return bool(closed)
-            # Camoufox's wrapper may not expose is_closed; a tiny bounded read
+            # truedriver's wrapper may not expose is_closed; a tiny bounded read
             # distinguishes a live page from a closed CDP target.
             await asyncio.wait_for(page.evaluate("location.href"), timeout=1.0)
             return False
@@ -2284,7 +2297,7 @@ class DiscordAutomation:
                                     reason: str = "renderer crashed") -> bool:
         """Recover one unavailable page with a fresh browser process.
 
-        A Camoufox renderer crash or a TargetClosedError can leave the browser
+        A truedriver renderer crash or a TargetClosedError can leave the browser
         transport technically connected while its page/context is unusable.
         Restarting the complete browser once avoids trying to poll a target
         that no longer exists; a second failure is left to normal rotation.
@@ -2539,7 +2552,7 @@ class DiscordAutomation:
     # ── Cloudflare Turnstile ─────────────────────────────────────────────
     # Discord sits behind Cloudflare, and a Turnstile captcha can gate
     # navigation / form submit / mail verification. The widget is clicked
-    # with a real, humanized locator click on the Camoufox page (the engine's
+    # with a real, humanized locator click on the truedriver page (the engine's
     # humanize layer drives the pointer — never a synthetic JS event), then
     # we confirm the challenge cleared via cf_clearance or the widget
     # leaving the DOM.
@@ -2574,14 +2587,14 @@ class DiscordAutomation:
     async def _solve_turnstile_if_present(self) -> bool:
         """Bypass a Cloudflare Turnstile widget with a humanized click.
 
-        Clicks the widget checkbox with a real locator click on the Camoufox
+        Clicks the widget checkbox with a real locator click on the truedriver
         page, then confirms the challenge cleared via the cf_clearance
         cookie or the widget frame disappearing."""
         try:
             if not await self._detect_turnstile():
                 return False
             self._log("[Turnstile] Widget present - clicking it...")
-            # Humanized click on the widget checkbox (Camoufox drives the
+            # Humanized click on the widget checkbox (truedriver drives the
             # pointer with its humanize layer — never a synthetic JS event).
             clicked = False
             for sel in self._TURNSTILE_SELECTORS:
@@ -4551,7 +4564,7 @@ class DiscordAutomation:
 
             # ── Custom dropdown: open the menu, then pick the option ──
             # Discord re-renders the form while credentials are being written
-            # (React controlled inputs) and Camoufox's humanized cursor moves
+            # (React controlled inputs) and truedriver's humanized cursor moves
             # slowly, so a single Playwright click can hang on 'performing
             # click action' for the full 30s default even though the element
             # resolved visible+stable — the exact stall from the field logs.
@@ -4588,7 +4601,7 @@ class DiscordAutomation:
                         self._log(f"[DOB] open click {label}: {str(e)[:150]}", level="warn")
                 elif open_method == "coords":
                     # Trusted input at the control's center — engine-
-                    # humanized by Camoufox (bezier, no added delay), no
+                    # humanized by truedriver (bezier, no added delay), no
                     # actionability re-checks to stall on.
                     try:
                         await ctrl.scroll_into_view_if_needed(timeout=3000)
@@ -4954,7 +4967,7 @@ class DiscordAutomation:
     async def _type_humanly(self, sel: str, val: str) -> bool:
         """Type one field like a real person instead of pasting it.
 
-        Real click focuses the input (Camoufox humanizes the cursor path),
+        Real click focuses the input (truedriver humanizes the cursor path),
         then character-by-character keyboard input with variable rhythm,
         one mid-field "thinking" pause, and an occasional typo corrected
         with backspace. Returns True only when the field holds `val` —
@@ -5049,7 +5062,7 @@ class DiscordAutomation:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0 or not (await loc.first.is_visible()):
                 return False
-            # Camoufox fill() APPENDS to a non-empty field instead of
+            # truedriver fill() APPENDS to a non-empty field instead of
             # replacing (probed on the engine: re-filling a filled input
             # yields old+new concatenated - the "email shows the address
             # twice/mangled" corruption). Clear FIRST, then write, then
@@ -5444,7 +5457,12 @@ class DiscordAutomation:
                         try:
                             target = await self._page.evaluate(_TOS_TARGET_JS)
                             if target:
-                                await self._page.mouse.click(target["x"], target["y"])
+                                cx = target.get("lx", target["x"])
+                                cy = target.get("ly", target["y"])
+                                try:
+                                    await hm.click(self._page, cx, cy)
+                                except Exception:
+                                    await self._page.mouse.click(cx, cy)
                                 self._log("[Form] Re-checked ToS checkbox on retry")
                         except Exception as e:
                             self._log_exception("[Form] ToS re-check on retry failed", e)
@@ -5854,7 +5872,9 @@ class DiscordAutomation:
                 # renders the ToS box differently in some layouts (styled
                 # div without role/data-state, button element, etc.) — dump
                 # the real DOM so the next failure is diagnosable instead of
-                # a silent skip.
+                # a silent skip. After the position fallback we continue to
+                # the next pass (target is None — never fall through to the
+                # coordinate click below, which would hit a None target).
                 try:
                     dump = await self._page.evaluate("""() => {
                         const seen = new Set();
@@ -5924,7 +5944,7 @@ class DiscordAutomation:
                 if not fb:
                     break
                 try:
-                    await self._page.mouse.click(fb["x"], fb["y"])
+                    await hm.click(self._page, fb["x"], fb["y"])
                     clicked += 1
                     self._log(
                         f"[Form] ToS clicked via position fallback (tag={fb.get('tag')}, "
@@ -5941,13 +5961,23 @@ class DiscordAutomation:
                 except Exception:
                     pass
                 await asyncio.sleep(0.25)
-            # 1) trusted mouse click at the box's center
+                continue
+            # 1) trusted (humanized) mouse click at the box/label centre.
+            #    Prefer the label/row point returned by _TOS_TARGET_JS —
+            #    clicking the label toggles the box and lands on a bigger,
+            #    more reliable target.
+            cx = target.get("lx", target["x"])
+            cy = target.get("ly", target["y"])
             try:
-                await self._page.mouse.click(target["x"], target["y"])
+                await hm.click(self._page, cx, cy)
                 clicked += 1
             except Exception:
-                pass
-            await asyncio.sleep(0.25)
+                try:
+                    await self._page.mouse.click(cx, cy)
+                    clicked += 1
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
             if await self._tos_checked_count() > 0 or await self._tos_continue_enabled():
                 break
             # 2) JS dispatch on the element itself (a transparent overlay or
