@@ -2155,47 +2155,37 @@ class DiscordAutomation:
 
 
     async def _recover_crashed_page(self, url: str) -> bool:
-        """Resurrect a crashed tab. If the browser died, relaunch it."""
-        self._log('[Nav] Recovering crashed tab...', level='warn')
-        browser_dead = False
-        if self._browser is None:
-            browser_dead = True
-        else:
-            try:
-                browser_dead = not await self._browser.is_connected()
-            except Exception:
-                browser_dead = True
-        if browser_dead:
-            self._log('[Nav] Browser died - relaunching', level='warn')
-            try:
-                await self._relaunch_browser()
-                if self._page is None:
-                    return False
-                await asyncio.wait_for(self._page.goto(url, wait_until='domcontentloaded', timeout=30000), timeout=33.0)
-                await asyncio.sleep(0.5)
-                self._log('[Nav] Browser relaunch OK', level='info')
-                return True
-            except Exception as e:
-                self._log(f'[Nav] Browser relaunch failed: {e}', level='error')
-                return False
+        """Recover one renderer crash with a fresh browser process.
+
+        A Camoufox page crash can leave the browser transport technically
+        connected while its content process remains unhealthy. Reusing that
+        process by opening another tab can therefore crash again immediately.
+        Restart the complete browser on the same circuit once, then let the
+        worker rotate normally if the replacement also fails.
+        """
+        if self._stopped.is_set():
+            return False
+        self._log('[Nav] Renderer crashed - restarting browser process once', level='warn')
         try:
-            if self._context is None:
-                self._log('[Nav] No context', level='error')
-                return False
-            if self._page is not None:
-                try:
-                    await self._page.close()
-                except Exception:
-                    pass
-            self._page = await self._context.new_page()
-            self._attach_rqdata_capture()
-            self._attach_crash_listener()
-            await asyncio.wait_for(self._page.goto(url, wait_until='domcontentloaded', timeout=30000), timeout=33.0)
+            await self._relaunch_browser()
+            if self._page is None:
+                raise RuntimeError('browser restart produced no page')
+            self._page_crashed = False
+            await asyncio.wait_for(
+                self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
+                timeout=33.0,
+            )
             await asyncio.sleep(0.5)
-            self._log('[Nav] Crash recovery OK', level='info')
+            self._log('[Nav] Browser restart after renderer crash completed', level='info')
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self._log(f'[Nav] Recovery failed ({type(e).__name__}: {e})', level='error')
+            self._page_crashed = True
+            self._log(
+                f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})',
+                level='error',
+            )
             return False
     async def capture_screenshot(self) -> str:
         if not self._page:

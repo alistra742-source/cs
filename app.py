@@ -86,6 +86,9 @@ def load_config(path: str = _config_path) -> dict:
                         config[key] = saved[key]
         except Exception:
             pass
+    # This deployment is intentionally single-worker. Ignore any legacy
+    # value saved in config.json so status and runtime always agree.
+    config["worker_count"] = WORKER_COUNT
     config["web_port"] = int(os.environ.get("PORT", config.get("web_port", 8080)))
     return config
 
@@ -1287,8 +1290,6 @@ def handle_config():
         cfg = load_config()
         if 'headless' in data:
             cfg['headless'] = bool(data['headless'])
-        if 'worker_count' in data:
-            cfg['worker_count'] = int(data['worker_count'])
         if 'mail_domains' in data:
             domains = [str(d).strip().lower() for d in data['mail_domains'] if str(d).strip()]
             cfg['mail_domains'] = domains or ["glasswhitehub.com"]
@@ -1381,12 +1382,18 @@ input,select{padding:9px 12px;border-radius:10px;border:1px solid #26262b;backgr
   color:#e7e7ea;width:100%;font-size:13px}
 label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacing:1px;
   text-transform:uppercase}
-.log-box{background:#060608;border:1px solid #26262b;border-radius:10px;
-  font-family:'JetBrains Mono','Courier New',monospace;font-size:11px;line-height:1.55;padding:12px;
-  max-height:340px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:#8a8a92}
-.log-box .warn{color:#fbbf24}.log-box .err{color:#f87171}.log-box .ok{color:#34d399}
-#screenshot{width:100%;border-radius:10px;border:1px solid #26262b;margin-top:8px;
-  max-height:380px;object-fit:contain;background:#1a1a1e}
+.log-box,.all-logs-box{background:#060608;border:1px solid #26262b;border-radius:10px;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px;font-weight:400;
+  line-height:1.55;padding:12px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;color:#fff}
+.log-box{max-height:340px}
+#logOverlay{display:none;position:fixed;inset:0;z-index:300;padding:18px;background:rgba(0,0,0,.72);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+#logOverlay.on{display:flex}
+.logs-modal{width:min(980px,100%);height:min(720px,calc(100vh - 36px));display:flex;flex-direction:column;gap:12px;padding:16px;background:#131316;border:1px solid #34343a;border-radius:16px;box-shadow:0 26px 80px rgba(0,0,0,.62)}
+.logs-head{display:flex;align-items:center;gap:12px}
+.logs-head h2{font-size:15px;font-weight:700;color:#fff;letter-spacing:.2px}
+.logs-close{margin-left:auto;padding:7px 12px;border-radius:9px;border:1px solid #5a2323;background:#2a1212;color:#fff;cursor:pointer;font-size:13px;font-weight:700;line-height:1}
+.all-logs-box{flex:1;min-height:0;max-height:none}
+@media(max-width:640px){#logOverlay{padding:10px}.logs-modal{height:calc(100vh - 20px);padding:12px;border-radius:13px}.log-box,.all-logs-box{font-size:13px}}
 .badge{display:inline-block;font-size:10px;padding:3px 10px;border-radius:99px;
   font-family:'JetBrains Mono','Courier New',monospace;letter-spacing:1px}
 .badge-ok{background:rgba(52,211,153,.15);color:#34d399}
@@ -1405,7 +1412,6 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <nav id="tabNav">
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
-<button data-tab="settings" onclick="showTab('settings')">Settings</button>
 </nav>
 
 <div id="tabmain">
@@ -1455,22 +1461,14 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 </div>
 
-<div id="tabsettings" class="hide">
-<div class="card">
-<h3>Settings</h3>
-<label>Headless</label>
-<div class="flex mb">
-<button id="hlOn" onclick="setHeadless(true)">ON</button>
-<button id="hlOff" onclick="setHeadless(false)">OFF</button>
-</div>
-<label>Workers</label>
-<select id="workerCount" onchange="saveConfig()">
-<option value="1">1</option>
-<option value="2">2</option>
-<option value="3">3</option>
-<option value="4">4</option>
-</select>
-</div>
+<div id="logOverlay" role="dialog" aria-modal="true" aria-labelledby="allLogsTitle">
+  <div class="logs-modal">
+    <div class="logs-head">
+      <h2 id="allLogsTitle">ALL LOGS</h2>
+      <button class="logs-close" type="button" onclick="closeAllLogs()" aria-label="Close all logs">X</button>
+    </div>
+    <div id="allLogsBox" class="all-logs-box">Loading logs...</div>
+  </div>
 </div>
 
 <script>
@@ -1489,7 +1487,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens','settings'];
+  var ids=['main','tokens'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -1523,25 +1521,6 @@ function stopBot(){
 window.startBot=startBot;
 window.stopBot=stopBot;
 
-function setHeadless(on){
-  api('/config',{body:{headless:on}}).then(function(){
-    $('hlOn').classList.toggle('primary',on);
-    $('hlOff').classList.toggle('primary',!on);
-    toast('Saved');
-  }).catch(function(e){toast('Error: '+e.message)});
-}
-window.setHeadless=setHeadless;
-
-function saveConfig(){
-  api('/config',{
-    body:{
-      headless:true,
-      workerCount:parseInt($('workerCount').value,10)
-    }
-  }).then(function(){toast('Saved')}).catch(function(e){toast('Error: '+e.message)});
-}
-window.saveConfig=saveConfig;
-
 function refreshStatus(){
   fetch('/status').then(function(r){return r.json()}).then(function(s){
     try{
@@ -1556,33 +1535,30 @@ function refreshStatus(){
         $('proxyUsed').textContent=s.proxies.used||0;
         $('proxyInvalid').textContent=s.proxies.invalid||0;
       }
-      if(s&&s.headless!==undefined){
-        $('hlOn').classList.toggle('primary',!!s.headless);
-        $('hlOff').classList.toggle('primary',!s.headless);
-      }
-      if(s&&s.workerCount){
-        $('workerCount').value=s.workerCount;
-      }
     }catch(e){}
   }).catch(function(){});
 }
 window.refreshStatus=refreshStatus;
 
+function logText(logs){
+  return logs.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');}).join('\n');
+}
+function renderLogs(box,logs,compact){
+  if(!box)return;
+  var items=logs||[];
+  if(compact){
+    var cutoff=Date.now()/1000-300;
+    items=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;}).slice(-80);
+  }
+  box.textContent=items.length?logText(items):(compact?'No recent activity.':'No logs yet.');
+  box.scrollTop=box.scrollHeight;
+}
 function refreshLogs(){
   fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
-    try{
-      if(d&&d.logs){
-        var box=$('logBox');
-        // strip ancient lines so the UI shows only fresh activity
-        var logs=(d.all_logs||d.logs);
-        var cutoff=Date.now()/1000-300;
-        var fresh=logs.filter(function(l){return(l.timestamp||l.time||0)>=cutoff});
-        box.textContent=fresh.length?fresh.slice(-80).map(function(l){
-          return (l.time||'') + ' ' + (l.message||l.m||'');
-        }).join('\n'):'No recent activity.';
-        box.scrollTop=box.scrollHeight;
-      }
-    }catch(e){}
+    var logs=(d&&d.all_logs||d&&d.logs||[]);
+    renderLogs($('logBox'),logs,true);
+    var overlay=$('logOverlay');
+    if(overlay&&overlay.classList.contains('on'))renderLogs($('allLogsBox'),logs,false);
   }).catch(function(){});
 }
 window.refreshLogs=refreshLogs;
@@ -1616,19 +1592,27 @@ function refreshProxies(){
 window.refreshProxies=refreshProxies;
 
 function viewAllLogs(){
+  var overlay=$('logOverlay');
+  if(!overlay)return;
+  overlay.classList.add('on');
+  $('allLogsBox').textContent='Loading logs...';
   fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
-    var logs=(d&&d.all_logs||d&&d.logs||[]);
-    var text=logs.map(function(l){return(l.time||'')+' '+(l.message||l.m||'')}).join('\n');
-    var w=window.open('','_blank','width=900,height=600');
-    if(!w){alert('Popup blocked'); return;}
-    w.document.write('<html><head><title>Logs</title></head>');
-    w.document.write('<body style="background:#000;color:#0f0;font-family:monospace;font-size:11px;padding:14px;white-space:pre-wrap;word-break:break-all">');
-    w.document.write(text.replace(/[<>&]/g,function(c){return({'<':'&lt;','>':'&gt;','&':'&amp;'})[c]}));
-    w.document.write('</body></html>');
-    w.document.close();
-  }).catch(function(e){alert('Error: '+e.message);});
+    renderLogs($('allLogsBox'),(d&&d.all_logs||d&&d.logs||[]),false);
+  }).catch(function(){
+    $('allLogsBox').textContent='Unable to load logs.';
+  });
+}
+function closeAllLogs(){
+  var overlay=$('logOverlay');
+  if(overlay)overlay.classList.remove('on');
 }
 window.viewAllLogs=viewAllLogs;
+window.closeAllLogs=closeAllLogs;
+(function(){
+  var overlay=$('logOverlay');
+  if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAllLogs();});
+})();
 
 // Init
 refreshStatus();
