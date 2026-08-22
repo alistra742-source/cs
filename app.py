@@ -1496,6 +1496,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <div class="log-box" id="logBox">Waiting for logs...</div>
 <div class="flex mt">
 <button onclick="viewAllLogs()">ALL LOGS</button>
+<button onclick="copyLogs()">COPY LOGS</button>
 </div>
 </div>
 </div>
@@ -1670,6 +1671,26 @@ function closeAllLogs(){
 }
 window.viewAllLogs=viewAllLogs;
 window.closeAllLogs=closeAllLogs;
+
+function copyLogs(){
+  fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
+    var logs=(d&&d.all_logs||d&&d.logs||[]);
+    var text=logs.map(function(l){return(l.time||'')+' '+(l.message||l.m||'')}).join('\n');
+    function done(){toast('Logs copied to clipboard');}
+    function fallback(t,cb){
+      var ta=document.createElement('textarea');
+      ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      try{document.execCommand('copy');cb();}
+      catch(e){alert('Copy failed - use ALL LOGS instead');}
+      document.body.removeChild(ta);
+    }
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done).catch(function(){fallback(text,done);});
+    }else{fallback(text,done);}
+  }).catch(function(e){alert('Error: '+e.message);});
+}
+window.copyLogs=copyLogs;
 (function(){
   var overlay=$('logOverlay');
   if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
