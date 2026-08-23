@@ -138,6 +138,9 @@ class TrainerEngine:
     def __init__(self):
         self._lock = threading.RLock()
         self.running = False
+        # Browser setup may take a while. Keep that phase observable so the
+        # dashboard does not appear stuck in IDLE while Chrome is launching.
+        self.preparing = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._one_shot = False
@@ -253,6 +256,29 @@ class TrainerEngine:
             self._add_log("Queued one real hCaptcha demo cycle.")
             return {"ok": True, "message": "Real demo cycle queued"}
 
+    def begin_launch(self) -> dict:
+        """Record that the dashboard has queued browser setup."""
+        with self._lock:
+            if self.preparing or self.running or (self._thread and self._thread.is_alive()) or (self._external_task and not self._external_task.done()):
+                return {"ok": False, "message": "Runner already starting or running"}
+            self.preparing = True
+            self.current_stage = "starting_browser"
+            self.status_text = "Opening the live demo browser…"
+            self._add_log("Dashboard requested live demo browser setup.")
+            return {"ok": True, "message": "Opening live demo browser…"}
+
+    def launch_failed(self, message: str) -> None:
+        """Return the dashboard to a useful state after setup fails."""
+        with self._lock:
+            self.preparing = False
+            self.current_stage = "error"
+            self.status_text = str(message or "Could not start the live demo browser.")
+        self._add_log(f"Live demo browser setup failed: {message}")
+
+    def is_preparing(self) -> bool:
+        with self._lock:
+            return self.preparing
+
     def start_external(self, page, speed: float = 2.0,
                        one_shot: bool = False) -> dict:
         """Run against the app's live page so the operator can take over.
@@ -268,6 +294,7 @@ class TrainerEngine:
             if (self.running or (self._thread and self._thread.is_alive())
                     or (self._external_task and not self._external_task.done())):
                 return {"ok": False, "message": "Runner already running or stopping"}
+            self.preparing = False
             self.speed = max(0.5, float(speed))
             self.running = True
             self._one_shot = bool(one_shot)
@@ -285,7 +312,8 @@ class TrainerEngine:
     def is_busy(self) -> bool:
         with self._lock:
             return bool(
-                self.running
+                self.preparing
+                or self.running
                 or (self._thread and self._thread.is_alive())
                 or (self._external_task and not self._external_task.done())
             )
@@ -324,6 +352,7 @@ class TrainerEngine:
         with self._lock:
             return {
                 "running": self.running,
+                "preparing": self.preparing,
                 "speed": self.speed,
                 "stage": self.current_stage,
                 "status_text": self.status_text,
@@ -1163,6 +1192,7 @@ class TrainerEngine:
                     pass
             with self._lock:
                 self.running = False
+                self.preparing = False
                 self._external_page = None
                 self._external_task = None
                 if self.current_stage not in {"error", "timeout"}:

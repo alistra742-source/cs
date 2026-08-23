@@ -1047,7 +1047,8 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
 
 async def _start_real_demo_runner(speed: float, one_shot: bool = False) -> dict:
     """Attach the trainer to B1's browser on the app asyncio loop."""
-    if trainer.trainer_engine.is_busy():
+    if (trainer.trainer_engine.is_busy()
+            and not trainer.trainer_engine.is_preparing()):
         return {"ok": False, "message": "Real demo runner already running or stopping"}
     cfg = load_config()
     browser = await _start_real_demo_browser("B1", cfg)
@@ -1465,10 +1466,27 @@ def handle_trainer_start():
         speed = float(data.get('speed', 2.0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "message": "speed must be a number"}), 400
-    result = _run_in_loop(_start_real_demo_runner(speed, one_shot=False))
-    if result is None:
+    queued = trainer.trainer_engine.begin_launch()
+    if not queued.get("ok"):
+        return jsonify(queued), 409
+    if not _loop:
+        trainer.trainer_engine.launch_failed("Event loop is unavailable.")
         return jsonify({"ok": False, "message": "event loop unavailable"}), 503
-    return jsonify(result)
+
+    async def launch_runner():
+        result = await _start_real_demo_runner(speed, one_shot=False)
+        if not result.get("ok"):
+            trainer.trainer_engine.launch_failed(result.get("message", "Could not start live demo."))
+        return result
+
+    # Do not hold the HTTP request open while Chrome starts. The status
+    # endpoint immediately reports STARTING and the UI continues polling it.
+    try:
+        asyncio.run_coroutine_threadsafe(launch_runner(), _loop)
+    except Exception as exc:
+        trainer.trainer_engine.launch_failed(f"Could not queue browser setup: {exc}")
+        return jsonify({"ok": False, "message": "could not queue browser setup"}), 503
+    return jsonify(queued), 202
 
 @app.route('/trainer/stop', methods=['POST'])
 def handle_trainer_stop():
@@ -2061,6 +2079,7 @@ function startTrainer(){
   api('/trainer/start', {body: {speed: speed}}).then(function(r){return r.json();})
     .then(function(d){
       toast(d.message||'Real demo runner started');
+      $('btnTrainerStart').disabled=true;
       refreshTrainer();
     }).catch(function(e){toast('Error: '+e.message);});
 }
@@ -2179,13 +2198,14 @@ function refreshTrainer(){
       $('statCycles').textContent = s.total_cycles || 0;
       $('statSpeed').textContent = trainerState.speed.toFixed(1) + 's';
       $('qCountBadge').textContent = (s.questions && s.questions.length) || 0;
-      $('btnTrainerStart').disabled = !!s.running;
+      $('btnTrainerStart').disabled = !!s.running || !!s.preparing;
       $('btnTrainerStop').disabled = !s.running;
+      var active = !!s.running || !!s.preparing;
       var badge = $('trainerStatusBadge');
-      badge.className = s.running ? 'badge badge-ok' : 'badge badge-warn';
-      badge.textContent = s.running ? 'REAL BROWSER ACTIVE' : 'IDLE';
+      badge.className = active ? 'badge badge-ok' : 'badge badge-warn';
+      badge.textContent = s.preparing ? 'STARTING BROWSER' : (s.running ? 'REAL BROWSER ACTIVE' : 'IDLE');
       var dot = $('trainerStageDot');
-      dot.className = s.running ? 'stage-dot active' : 'stage-dot';
+      dot.className = active ? 'stage-dot active' : 'stage-dot';
       $('trainerStageText').textContent = s.status_text || 'Ready to open the official hCaptcha demo.';
       if(s.form){
         $('demoFormName').value = s.form.name || '';
