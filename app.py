@@ -974,6 +974,79 @@ async def _close_live_browser(wid: str) -> bool:
     state["last_shot_b64"] = ""
     return True
 
+
+async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
+    """Prepare B1's shared LIVE browser for the official hCaptcha demo.
+
+    The demo runner intentionally uses a direct connection.  It does not
+    rotate proxies, use TOR, or borrow the Discord signup worker's transport;
+    this is a small, transparent QA flow against hCaptcha's public demo.
+    """
+    state = _workers.get(wid) or _init_worker(wid)
+    _workers[wid] = state
+    if state.get("status") in ("starting", "running"):
+        return {"error": "worker is busy with another browser task"}
+    if state.get("launching"):
+        return {"error": "browser is still launching"}
+
+    state["launching"] = True
+    try:
+        bot = state.get("bot")
+        if bot is None:
+            bot = DiscordAutomation(
+                headless=bool(cfg.get("headless", True)),
+                worker_id=wid,
+                domain=DEFAULT_MAIL_DOMAIN,
+            )
+            state["bot"] = bot
+        try:
+            alive = await bot.is_alive()
+        except Exception:
+            alive = False
+        if not alive:
+            bot.proxy = None
+            bot._direct = True
+            _log(f"[{wid}] [Demo] Launching direct real Chrome for {trainer.TARGET_DEMO_URL}")
+            await asyncio.wait_for(bot.initialize(), timeout=90)
+        elif not getattr(bot, "_direct", False) or bot.proxy:
+            # A parked signup browser may have a proxy attached.  Rebuild it
+            # directly before using it for the public demo.
+            if not await bot.switch_direct():
+                return {"error": "could not switch the shared browser to direct mode"}
+        st = await live_control.live_navigate(bot, trainer.TARGET_DEMO_URL)
+        if st.get("error"):
+            return st
+        state["status"] = "demo"
+        state["step"] = "official hCaptcha demo"
+        state["proxy"] = "direct"
+        if st.get("screenshot"):
+            state["last_shot_b64"] = st["screenshot"]
+        return st
+    except Exception as exc:
+        _log(f"[{wid}] [Demo] Browser setup failed: {type(exc).__name__}: {exc}", level="error")
+        return {"error": f"real demo browser failed: {exc}"}
+    finally:
+        state["launching"] = False
+
+
+async def _start_real_demo_runner(speed: float, one_shot: bool = False) -> dict:
+    """Attach the trainer to B1's browser on the app asyncio loop."""
+    if trainer.trainer_engine.is_busy():
+        return {"ok": False, "message": "Real demo runner already running or stopping"}
+    cfg = load_config()
+    browser = await _start_real_demo_browser("B1", cfg)
+    if browser.get("error"):
+        return {"ok": False, "message": browser["error"], "browser": browser}
+    state = _workers.get("B1") or _init_worker("B1")
+    bot = state.get("bot")
+    result = trainer.trainer_engine.start_external(
+        getattr(bot, "_page", None), speed=speed, one_shot=one_shot,
+    )
+    if result.get("ok"):
+        state["status"] = "demo"
+        state["step"] = "official hCaptcha demo"
+    return {**result, "browser": browser}
+
 # ── Flask app ─────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -1207,6 +1280,8 @@ def handle_browser_action():
     if st is None:
         return jsonify({"connected": False, "worker_id": wid,
                         "error": "event loop unavailable"}), 503
+    if st.get("screenshot"):
+        s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
 @app.route('/browser/start', methods=['POST'])
@@ -1367,9 +1442,14 @@ def handle_trainer_status():
 @app.route('/trainer/start', methods=['POST'])
 def handle_trainer_start():
     data = request.get_json(silent=True) or {}
-    speed = float(data.get('speed', 2.0))
-    res = trainer.trainer_engine.start(speed=speed)
-    return jsonify(res)
+    try:
+        speed = float(data.get('speed', 2.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "speed must be a number"}), 400
+    result = _run_in_loop(_start_real_demo_runner(speed, one_shot=False))
+    if result is None:
+        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
+    return jsonify(result)
 
 @app.route('/trainer/stop', methods=['POST'])
 def handle_trainer_stop():
@@ -1377,7 +1457,12 @@ def handle_trainer_stop():
 
 @app.route('/trainer/step', methods=['POST'])
 def handle_trainer_step():
-    return jsonify(trainer.trainer_engine.step())
+    result = _run_in_loop(_start_real_demo_runner(
+        trainer.trainer_engine.speed, one_shot=True,
+    ))
+    if result is None:
+        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
+    return jsonify(result)
 
 @app.route('/trainer/clear', methods=['POST'])
 def handle_trainer_clear():
@@ -1388,15 +1473,14 @@ def handle_trainer_questions():
     st = trainer.trainer_engine.get_state()
     return jsonify(st.get('questions', []))
 
-@app.route('/trainer/interactive/new', methods=['GET', 'POST'])
-def handle_trainer_interactive_new():
-    return jsonify(trainer.trainer_engine.get_new_interactive())
-
-@app.route('/trainer/interactive/verify', methods=['POST'])
-def handle_trainer_interactive_verify():
+@app.route('/trainer/speed', methods=['POST'])
+def handle_trainer_speed():
     data = request.get_json(silent=True) or {}
-    selected = data.get('selected', [])
-    return jsonify(trainer.trainer_engine.verify_interactive(selected))
+    try:
+        speed = float(data.get('speed', 2.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "speed must be a number"}), 400
+    return jsonify(trainer.trainer_engine.set_speed(speed))
 
 
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -1543,7 +1627,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1e;
   border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999;box-shadow:0 12px 30px rgba(0,0,0,.6)}
 
-/* Trainer Tab & hCaptcha Modal Layout */
+/* Live official-demo dashboard layout */
 .trainer-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px;align-items:start}
 @media(max-width:820px){.trainer-grid{grid-template-columns:1fr}}
 
@@ -1570,46 +1654,13 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 .stage-dot.active{background:#34d399;box-shadow:0 0 10px #34d399;animation:pulseDot 1.2s infinite}
 @keyframes pulseDot{0%{opacity:.4}50%{opacity:1}100%{opacity:.4}}
 
-/* Simulated Form & Checkbox Stage */
+/* Real official-demo status card */
 .demo-form-stage{background:#101116;border:1px solid #262835;border-radius:10px;padding:14px}
 .demo-input-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
 @media(max-width:500px){.demo-input-row{grid-template-columns:1fr}}
 .demo-input-box{background:#181920;border:1px solid #2a2c3a;border-radius:8px;padding:7px 10px;font-size:12px;color:#d4d4d8;font-family:'JetBrains Mono',monospace}
-
-/* Realistic hCaptcha Checkbox Widget */
-.hcaptcha-checkbox-card{background:#1e2029;border:1px solid #36394a;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;max-width:320px;cursor:pointer;user-select:none;margin-top:10px;box-shadow:0 4px 12px rgba(0,0,0,.3);transition:.15s}
-.hcaptcha-checkbox-card:hover{border-color:#4b4f66;background:#232530}
-.hcaptcha-cb-left{display:flex;align-items:center;gap:12px}
-.hcaptcha-box{width:26px;height:26px;border:2px solid #5a5f78;border-radius:4px;background:#15161c;display:flex;align-items:center;justify-content:center;transition:.15s;color:#34d399;font-size:14px;font-weight:700}
-.hcaptcha-box.checked{background:#059669;border-color:#34d399;color:#fff}
-.hcaptcha-box.loading{border-color:#34d399;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;color:transparent}
-@keyframes spin{to{transform:rotate(360deg)}}
-.hcaptcha-label{font-size:13px;font-weight:600;color:#e2e8f0;font-family:-apple-system,sans-serif}
-.hcaptcha-cb-right{display:flex;flex-direction:column;align-items:center}
-.hcaptcha-logo-txt{font-size:10px;font-weight:700;color:#34d399;letter-spacing:1px;font-family:'JetBrains Mono',monospace}
-.hcaptcha-sub-txt{font-size:8px;color:#71717a;letter-spacing:.3px}
-
-/* Interactive Demo Modal Overlay */
-#demoCaptchaOverlay{display:none;position:fixed;inset:0;z-index:350;padding:16px;background:rgba(0,0,0,.78);backdrop-filter:blur(5px);align-items:center;justify-content:center}
-#demoCaptchaOverlay.on{display:flex}
-.hcaptcha-interactive-modal{width:min(420px,100%);background:#191a24;border:1px solid #373b50;border-radius:14px;box-shadow:0 28px 80px rgba(0,0,0,.8);display:flex;flex-direction:column;overflow:hidden}
-.int-head{background:#232635;border-bottom:1px solid #34384e;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-.int-head-text h4{font-size:14px;font-weight:700;color:#fff;margin-bottom:3px}
-.int-head-text p{font-size:11px;color:#94a3b8}
-.int-ref-thumb{width:46px;height:46px;border-radius:6px;border:1px solid #34d399;object-fit:cover;display:none}
-.int-body{padding:14px;background:#13141c}
-.int-grid{display:grid;grid-template-columns:repeat(3, 1fr);gap:6px}
-.int-tile{position:relative;aspect-ratio:1;border-radius:6px;overflow:hidden;border:2px solid transparent;cursor:pointer;background:#0d0e14;user-select:none}
-.int-tile img{width:100%;height:100%;object-fit:cover;display:block}
-.int-tile:hover{border-color:#475569}
-.int-tile.selected{border-color:#34d399;box-shadow:0 0 0 1px #34d399}
-.int-tile-check{display:none;position:absolute;top:4px;right:4px;width:20px;height:20px;background:#059669;color:#fff;border-radius:50%;align-items:center;justify-content:center;font-size:11px;font-weight:700}
-.int-tile.selected .int-tile-check{display:flex}
-.int-foot{background:#191a24;border-top:1px solid #272a3b;padding:10px 14px;display:flex;align-items:center;justify-content:space-between}
-.int-foot-icons{font-size:16px;display:flex;gap:12px;color:#8a8a92;cursor:pointer}
-.int-actions{display:flex;gap:8px}
-.btn-int-verify{background:#059669;border:1px solid #34d399;color:#fff;font-size:12px;font-weight:700;padding:8px 16px;border-radius:7px;cursor:pointer}
-.btn-int-solve{background:#1f2937;border:1px solid #374151;color:#93c5fd;font-size:11px;font-weight:600;padding:8px 12px;border-radius:7px;cursor:pointer}
+.demo-link{color:#34d399;text-decoration:none;word-break:break-all}
+.demo-note{color:#94a3b8;font-size:11px;line-height:1.55;margin-top:10px}
 </style></head><body>
 
 <h1>EY3 <span style="font-size:11px;color:#8a8a92;border:1px solid #26262b;border-radius:99px;padding:4px 10px;font-weight:500;letter-spacing:2px">TOKEN FORGE</span></h1>
@@ -1619,7 +1670,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <nav id="tabNav">
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
-<button data-tab="trainer" onclick="showTab('trainer')">Trainer</button>
+<button data-tab="trainer" onclick="showTab('trainer')">Live Demo</button>
 </nav>
 
 <div id="tabmain">
@@ -1671,28 +1722,26 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════
-     TRAINER TAB: Automated Challenge Harvester & Demo Modal
+     TRAINER TAB: REAL OFFICIAL DEMO (HUMAN-IN-THE-LOOP)
      ═══════════════════════════════════════════════════════════ -->
 <div id="tabtrainer" class="hide">
-  <!-- Top Stat Cards -->
   <div class="row mb">
-    <div class="col stat"><div class="n" id="statFarmed">0</div><div class="l">Farmed Challenges</div></div>
-    <div class="col stat"><div class="n" id="statBypassed">0</div><div class="l">Instant Tokens</div></div>
-    <div class="col stat"><div class="n" id="statCycles">0</div><div class="l">Total Cycles</div></div>
-    <div class="col stat"><div class="n" id="statSpeed">2.0s</div><div class="l">Interval Delay</div></div>
+    <div class="col stat"><div class="n" id="statCaptured">0</div><div class="l">Captured Challenges</div></div>
+    <div class="col stat"><div class="n" id="statBypassed">0</div><div class="l">Completed Checks</div></div>
+    <div class="col stat"><div class="n" id="statCycles">0</div><div class="l">Demo Cycles</div></div>
+    <div class="col stat"><div class="n" id="statSpeed">2.0s</div><div class="l">Poll Delay</div></div>
   </div>
 
-  <!-- Control & Actions Card -->
   <div class="card">
     <div class="flex" style="justify-content:space-between;margin-bottom:12px">
-      <h3 style="margin:0">hCaptcha Harvester & Demo Controls</h3>
-      <span id="trainerStatusBadge" class="badge badge-ok">IDLE</span>
+      <h3 style="margin:0">Real hCaptcha Demo Controls</h3>
+      <span id="trainerStatusBadge" class="badge badge-warn">IDLE</span>
     </div>
     <div class="flex">
-      <button class="primary" id="btnTrainerStart" onclick="startTrainer()">▶ START FARMING</button>
+      <button class="primary" id="btnTrainerStart" onclick="startTrainer()">▶ START REAL DEMO</button>
       <button class="danger" id="btnTrainerStop" onclick="stopTrainer()" disabled>⏸ STOP</button>
-      <button id="btnTrainerStep" onclick="stepTrainer()">⏭ FARM 1 CHALLENGE</button>
-      <button id="btnOpenDemoModal" onclick="openInteractiveModal()">🎲 POPUP DEMO MODAL</button>
+      <button id="btnTrainerStep" onclick="stepTrainer()">⏭ RUN ONCE</button>
+      <button onclick="openLive()">👁 OPEN LIVE BROWSER</button>
       <select id="trainerSpeedSelect" style="width:auto;min-width:130px" onchange="updateTrainerSpeed(this.value)">
         <option value="1.0">Fast (1.0s)</option>
         <option value="2.0" selected>Normal (2.0s)</option>
@@ -1700,72 +1749,60 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
       </select>
       <button onclick="clearTrainerQuestions()">🗑 Clear</button>
     </div>
+    <div class="demo-note">
+      The runner uses a real Chrome tab and the official demo below. It fills the optional field,
+      clicks the real checkbox, captures a real challenge, and waits for you to complete it.
+      Open LIVE BROWSER to interact with that same tab. It never fabricates a challenge,
+      creates a token, or selects challenge answers.
+    </div>
   </div>
 
-  <!-- Live Stage Banner -->
   <div class="stage-banner">
     <span class="stage-dot" id="trainerStageDot"></span>
-    <span id="trainerStageText">Trainer ready. Click START FARMING to harvest challenges.</span>
+    <span id="trainerStageText">Ready to open the official hCaptcha demo.</span>
   </div>
 
-  <!-- Main 2-Column Grid -->
   <div class="trainer-grid">
-    <!-- Left Column: Modal Screen & Demo Site Form -->
     <div>
       <div class="card" style="margin-bottom:12px">
         <div class="flex" style="justify-content:space-between;margin-bottom:10px">
-          <h3 style="margin:0">Latest Challenge (Modal ONLY)</h3>
+          <h3 style="margin:0">Latest Real Challenge</h3>
           <button class="btn-copy-q" id="btnCopyLatest" onclick="copyLatestQuestion()" style="display:none">📋 Copy Question</button>
         </div>
         <div class="trainer-ss-box">
           <div id="trainerPlaceholder" class="trainer-ph">
-            Start farming to harvest challenges.<br>Takes screenshot of modal ONLY.
+            Start the real demo runner.<br>The challenge iframe screenshot will appear here.
           </div>
-          <img id="trainerModalImg" style="display:none" alt="hCaptcha Challenge Modal Screenshot">
+          <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
         </div>
       </div>
 
       <div class="card">
-        <h3>Simulated Demo Site (Google / Demo Auto-Fill)</h3>
+        <h3>Official hCaptcha Demo</h3>
         <div class="demo-form-stage">
-          <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET: https://accounts.hcaptcha.com/demo</div>
-          <div class="demo-input-row">
+          <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET</div>
+          <a class="demo-link" href="https://accounts.hcaptcha.com/demo" target="_blank" rel="noopener">https://accounts.hcaptcha.com/demo</a>
+          <div class="demo-input-row" style="margin-top:12px">
             <div>
-              <label>Name (1-2 words)</label>
-              <input class="demo-input-box" id="demoFormName" readonly placeholder="Auto-fills 1-2 words">
+              <label>Generated sample</label>
+              <input class="demo-input-box" id="demoFormComment" readonly placeholder="Filled in the real demo">
             </div>
             <div>
-              <label>Email</label>
-              <input class="demo-input-box" id="demoFormEmail" readonly placeholder="demo@example.com">
+              <label>Current runner value</label>
+              <input class="demo-input-box" id="demoFormName" readonly placeholder="Waiting for runner">
             </div>
           </div>
-          <div style="margin-bottom:8px">
-            <label>Comment / Words (1-2 words)</label>
-            <input class="demo-input-box" id="demoFormComment" readonly placeholder="Auto-fills 1-2 words">
-          </div>
-
-          <!-- Realistic Checkbox Widget -->
-          <div class="hcaptcha-checkbox-card" id="demoCheckboxWidget" onclick="onCheckboxWidgetClick()">
-            <div class="hcaptcha-cb-left">
-              <div class="hcaptcha-box" id="demoCheckboxBox">
-                <span id="demoCheckboxIcon"></span>
-              </div>
-              <div class="hcaptcha-label" id="demoCheckboxLabel">I am human</div>
-            </div>
-            <div class="hcaptcha-cb-right">
-              <div class="hcaptcha-logo-txt">hCaptcha</div>
-              <div class="hcaptcha-sub-txt">Privacy · Terms</div>
-            </div>
-          </div>
+          <label>Browser form field</label>
+          <input class="demo-input-box" id="demoFormEmail" readonly placeholder="The official page has one optional field">
+          <div class="demo-note">Checkbox interaction and challenge rendering happen in Chrome, not in this dashboard.</div>
         </div>
       </div>
     </div>
 
-    <!-- Right Column: Farmed Questions List -->
     <div>
       <div class="card">
         <div class="flex" style="justify-content:space-between;margin-bottom:10px">
-          <h3 style="margin:0">Farmed Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
+          <h3 style="margin:0">Captured Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
           <div class="flex" style="gap:6px">
             <button class="btn-copy-q" onclick="copyAllQuestions()">📋 Copy All</button>
             <button class="btn-copy-q" onclick="exportQuestionsJson()">⬇️ JSON</button>
@@ -1773,7 +1810,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
         </div>
         <div class="q-list-wrap" id="trainerQuestionsList">
           <div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">
-            No questions farmed yet.<br>Click START FARMING or FARM 1 CHALLENGE.
+            No real challenge captured yet.<br>Start the runner to open the official demo.
           </div>
         </div>
       </div>
@@ -1788,38 +1825,6 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
       <button class="logs-close" type="button" onclick="closeAllLogs()" aria-label="Close all logs">X</button>
     </div>
     <div id="allLogsBox" class="all-logs-box">Loading logs...</div>
-  </div>
-</div>
-
-<!-- ═══════════════════════════════════════════════════════════
-     INTERACTIVE DEMO MODAL (Works directly on your screen)
-     ═══════════════════════════════════════════════════════════ -->
-<div id="demoCaptchaOverlay" role="dialog" aria-modal="true" aria-labelledby="intModalTitle">
-  <div class="hcaptcha-interactive-modal">
-    <div class="int-head">
-      <div class="int-head-text">
-        <h4 id="intModalTitle">Select all matching items</h4>
-        <p id="intModalSub">Click verify once there are none left</p>
-      </div>
-      <img id="intRefThumb" class="int-ref-thumb" alt="Reference">
-      <button style="margin-left:auto;background:none;border:none;color:#94a3b8;font-size:18px;cursor:pointer;padding:4px 8px" onclick="closeInteractiveModal()" aria-label="Close">✕</button>
-    </div>
-    <div class="int-body">
-      <div class="int-grid" id="intTilesGrid">
-        <!-- 9 Tiles injected here -->
-      </div>
-    </div>
-    <div class="int-foot">
-      <div class="int-foot-icons">
-        <span title="Reload challenge" onclick="loadNewInteractiveChallenge()">🔄</span>
-        <span title="Audio challenge" onclick="toast('Audio challenge requested')">🎧</span>
-        <span title="Info" onclick="toast('hCaptcha Interactive Challenge Demo')">ℹ️</span>
-      </div>
-      <div class="int-actions">
-        <button class="btn-int-solve" type="button" onclick="autoSolveInteractive()">AUTO SOLVE</button>
-        <button class="btn-int-verify" id="btnIntVerify" type="button" onclick="verifyInteractiveChallenge()">VERIFY</button>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -2014,7 +2019,7 @@ function fallbackCopy(text,cb){
 }
 
 // ═══════════════════════════════════════════════════════════
-// TRAINER / HARVESTER JAVASCRIPT LOGIC
+// REAL OFFICIAL-DEMO RUNNER UI
 // ═══════════════════════════════════════════════════════════
 var trainerState = {
   running: false,
@@ -2027,37 +2032,36 @@ function startTrainer(){
   var speed = parseFloat($('trainerSpeedSelect').value) || 2.0;
   api('/trainer/start', {body: {speed: speed}}).then(function(r){return r.json();})
     .then(function(d){
-      toast(d.message||'Trainer started');
+      toast(d.message||'Real demo runner started');
       refreshTrainer();
     }).catch(function(e){toast('Error: '+e.message);});
 }
 function stopTrainer(){
   api('/trainer/stop').then(function(r){return r.json();})
     .then(function(d){
-      toast(d.message||'Trainer stopped');
+      toast(d.message||'Real demo runner stopped');
       refreshTrainer();
     }).catch(function(e){toast('Error: '+e.message);});
 }
 function stepTrainer(){
-  toast('Harvesting 1 challenge...');
+  toast('Opening the real hCaptcha demo once...');
   api('/trainer/step').then(function(r){return r.json();})
     .then(function(d){
+      toast(d.message||'Real demo cycle queued');
       refreshTrainer();
     }).catch(function(e){toast('Error: '+e.message);});
 }
 function clearTrainerQuestions(){
   api('/trainer/clear').then(function(r){return r.json();})
     .then(function(d){
-      toast('Questions cleared');
+      toast('Captured questions cleared');
       refreshTrainer();
     }).catch(function(e){toast('Error: '+e.message);});
 }
 function updateTrainerSpeed(val){
   var speed = parseFloat(val) || 2.0;
   $('statSpeed').textContent = speed.toFixed(1) + 's';
-  if(trainerState.running){
-    api('/trainer/start', {body: {speed: speed}}).catch(function(){});
-  }
+  api('/trainer/speed', {body: {speed: speed}}).catch(function(){});
 }
 window.startTrainer = startTrainer;
 window.stopTrainer = stopTrainer;
@@ -2083,7 +2087,7 @@ function copyAllQuestions(){
     return;
   }
   var fullText = trainerState.questions.map(function(q, i){
-    return (i+1) + '. ' + (q.question || q.full_prompt);
+    return (i+1) + '. ' + (q.question || q.full_prompt || '');
   }).join('\n');
   copyToClipboard(fullText, 'Copied ' + trainerState.questions.length + ' questions to clipboard');
 }
@@ -2097,42 +2101,41 @@ function exportQuestionsJson(){
   var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(trainerState.questions, null, 2));
   var dlAnchor = document.createElement('a');
   dlAnchor.setAttribute("href", dataStr);
-  dlAnchor.setAttribute("download", "hcaptcha_farmed_questions.json");
+  dlAnchor.setAttribute("download", "hcaptcha_demo_questions.json");
   document.body.appendChild(dlAnchor);
   dlAnchor.click();
   dlAnchor.remove();
-  toast('Exported questions JSON');
+  toast('Exported captured questions JSON');
 }
 window.exportQuestionsJson = exportQuestionsJson;
 
 function renderQuestionsList(questions){
   var wrap = $('trainerQuestionsList');
   if(!wrap) return;
+  wrap.textContent = '';
   if(!questions || !questions.length){
-    wrap.innerHTML = '<div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">No questions farmed yet.<br>Click START FARMING or FARM 1 CHALLENGE.</div>';
+    var empty = document.createElement('div');
+    empty.style.cssText = 'color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace';
+    empty.textContent = 'No real challenge captured yet.\nStart the runner to open the official demo.';
+    wrap.appendChild(empty);
     return;
   }
-  var html = '';
-  // Show in order, with newest highlighted
   questions.forEach(function(q, idx){
-    var num = (idx + 1);
-    var qTitle = q.question || q.full_prompt || 'Challenge Question';
-    var safeText = qTitle.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-    var badgeType = q.type || 'GRID';
-    html += '<div class="q-row">' +
-      '<div class="q-num">' + num + '.</div>' +
-      '<div class="q-body">' +
-        '<div class="q-title">' + qTitle + '</div>' +
-        '<div class="q-meta">' +
-          '<span class="badge-tag">' + badgeType + '</span>' +
-          '<span>' + (q.time||'') + '</span>' +
-          (q.full_prompt && q.full_prompt !== qTitle ? '<span style="color:#64748b">· ' + q.full_prompt + '</span>' : '') +
-        '</div>' +
-      '</div>' +
-      '<button class="btn-copy-q" onclick="copySingleQuestion(\'' + safeText + '\', this)">📋 Copy</button>' +
-    '</div>';
+    var row = document.createElement('div'); row.className = 'q-row';
+    var num = document.createElement('div'); num.className = 'q-num'; num.textContent = (idx + 1) + '.';
+    var body = document.createElement('div'); body.className = 'q-body';
+    var title = document.createElement('div'); title.className = 'q-title';
+    title.textContent = q.question || q.full_prompt || 'Challenge prompt unavailable';
+    var meta = document.createElement('div'); meta.className = 'q-meta';
+    var tag = document.createElement('span'); tag.className = 'badge-tag'; tag.textContent = q.type || 'REAL HCAPTCHA';
+    var time = document.createElement('span'); time.textContent = q.time || '';
+    meta.appendChild(tag); meta.appendChild(time);
+    if(q.url){ var url = document.createElement('span'); url.style.color='#64748b'; url.textContent = '· ' + q.url; meta.appendChild(url); }
+    body.appendChild(title); body.appendChild(meta);
+    var btn = document.createElement('button'); btn.className = 'btn-copy-q'; btn.textContent = '📋 Copy';
+    btn.addEventListener('click', function(){copySingleQuestion(title.textContent, btn);});
+    row.appendChild(num); row.appendChild(body); row.appendChild(btn); wrap.appendChild(row);
   });
-  wrap.innerHTML = html;
   wrap.scrollTop = wrap.scrollHeight;
 }
 
@@ -2142,64 +2145,25 @@ function refreshTrainer(){
       trainerState.running = !!s.running;
       trainerState.questions = s.questions || [];
       trainerState.latestQuestion = s.latest_question || '';
-      
-      // Update Stat Numbers
-      $('statFarmed').textContent = s.farmed_count || 0;
+      trainerState.speed = parseFloat(s.speed) || trainerState.speed;
+      $('statCaptured').textContent = s.captured_count || 0;
       $('statBypassed').textContent = s.pass_count || 0;
       $('statCycles').textContent = s.total_cycles || 0;
+      $('statSpeed').textContent = trainerState.speed.toFixed(1) + 's';
       $('qCountBadge').textContent = (s.questions && s.questions.length) || 0;
-      
-      // Buttons state
       $('btnTrainerStart').disabled = !!s.running;
       $('btnTrainerStop').disabled = !s.running;
-      
-      // Status badge
       var badge = $('trainerStatusBadge');
-      if(s.running){
-        badge.className = 'badge badge-ok';
-        badge.textContent = 'FARMING LOOP';
-      }else{
-        badge.className = 'badge badge-warn';
-        badge.textContent = 'IDLE';
-      }
-      
-      // Stage Dot & Banner
+      badge.className = s.running ? 'badge badge-ok' : 'badge badge-warn';
+      badge.textContent = s.running ? 'REAL BROWSER ACTIVE' : 'IDLE';
       var dot = $('trainerStageDot');
-      if(s.running){
-        dot.className = 'stage-dot active';
-      }else{
-        dot.className = 'stage-dot';
-      }
-      $('trainerStageText').textContent = s.status_text || 'Trainer ready.';
-      
-      // Auto-filled Demo Form inputs
+      dot.className = s.running ? 'stage-dot active' : 'stage-dot';
+      $('trainerStageText').textContent = s.status_text || 'Ready to open the official hCaptcha demo.';
       if(s.form){
         $('demoFormName').value = s.form.name || '';
-        $('demoFormEmail').value = s.form.email || '';
-        $('demoFormComment').value = s.form.comment || '';
+        $('demoFormEmail').value = s.form.field || '';
+        $('demoFormComment').value = s.form.comment || s.form.field || '';
       }
-      
-      // Simulated Checkbox state
-      var cbBox = $('demoCheckboxBox');
-      var cbLabel = $('demoCheckboxLabel');
-      if(s.stage === 'clicking_checkbox' || s.stage === 'challenge_loaded'){
-        cbBox.className = 'hcaptcha-box loading';
-        cbLabel.textContent = 'Verifying...';
-      } else if(s.stage === 'instant_pass'){
-        cbBox.className = 'hcaptcha-box checked';
-        cbBox.textContent = '✓';
-        cbLabel.textContent = 'Verified (Token)';
-      } else if(s.stage === 'captured'){
-        cbBox.className = 'hcaptcha-box';
-        cbBox.textContent = '';
-        cbLabel.textContent = 'Challenge Loaded';
-      } else {
-        cbBox.className = 'hcaptcha-box';
-        cbBox.textContent = '';
-        cbLabel.textContent = 'I am human';
-      }
-      
-      // Modal ONLY Screenshot image
       var img = $('trainerModalImg');
       var ph = $('trainerPlaceholder');
       var btnCopyLatest = $('btnCopyLatest');
@@ -2209,152 +2173,15 @@ function refreshTrainer(){
         if(ph) ph.style.display = 'none';
         if(btnCopyLatest) btnCopyLatest.style.display = 'inline-block';
       } else {
+        img.removeAttribute('src');
         img.style.display = 'none';
         if(ph) ph.style.display = 'block';
         if(btnCopyLatest) btnCopyLatest.style.display = 'none';
       }
-      
-      // Farmed Questions List
       renderQuestionsList(s.questions);
     }).catch(function(){});
 }
 window.refreshTrainer = refreshTrainer;
-
-// ═══════════════════════════════════════════════════════════
-// INTERACTIVE MODAL COMPONENT (Works in screen)
-// ═══════════════════════════════════════════════════════════
-var activeInteractive = null;
-var selectedTiles = new Set();
-
-function openInteractiveModal(){
-  var overlay = $('demoCaptchaOverlay');
-  if(!overlay) return;
-  overlay.classList.add('on');
-  loadNewInteractiveChallenge();
-}
-function closeInteractiveModal(){
-  var overlay = $('demoCaptchaOverlay');
-  if(overlay) overlay.classList.remove('on');
-}
-window.openInteractiveModal = openInteractiveModal;
-window.closeInteractiveModal = closeInteractiveModal;
-
-function onCheckboxWidgetClick(){
-  var cbBox = $('demoCheckboxBox');
-  var cbLabel = $('demoCheckboxLabel');
-  cbBox.className = 'hcaptcha-box loading';
-  cbLabel.textContent = 'Loading challenge...';
-  setTimeout(function(){
-    cbBox.className = 'hcaptcha-box';
-    cbLabel.textContent = 'I am human';
-    openInteractiveModal();
-  }, 400);
-}
-window.onCheckboxWidgetClick = onCheckboxWidgetClick;
-
-function loadNewInteractiveChallenge(){
-  selectedTiles.clear();
-  var grid = $('intTilesGrid');
-  grid.innerHTML = '<div style="grid-column:1/span 3;color:#8a8a92;font-size:12px;padding:30px;text-align:center">Loading challenge tiles...</div>';
-  
-  fetch('/trainer/interactive/new?t=' + Date.now()).then(function(r){return r.json();})
-    .then(function(d){
-      activeInteractive = d;
-      $('intModalTitle').textContent = d.short_question || 'Select all matching items';
-      $('intModalSub').textContent = d.prompt || 'Click verify once there are none left';
-      
-      var refImg = $('intRefThumb');
-      if(d.reference_image){
-        refImg.src = d.reference_image;
-        refImg.style.display = 'block';
-      } else {
-        refImg.style.display = 'none';
-      }
-      
-      var html = '';
-      (d.tiles || []).forEach(function(t){
-        html += '<div class="int-tile" id="intTile_' + t.index + '" onclick="toggleTileSelect(' + t.index + ')">' +
-          '<img src="' + t.image + '" alt="' + t.name + '">' +
-          '<div class="int-tile-check">✓</div>' +
-        '</div>';
-      });
-      grid.innerHTML = html;
-    }).catch(function(){
-      grid.innerHTML = '<div style="grid-column:1/span 3;color:#f87171;font-size:12px;padding:20px;text-align:center">Failed to load challenge</div>';
-    });
-}
-window.loadNewInteractiveChallenge = loadNewInteractiveChallenge;
-
-function toggleTileSelect(index){
-  var el = $('intTile_' + index);
-  if(!el) return;
-  if(selectedTiles.has(index)){
-    selectedTiles.delete(index);
-    el.classList.remove('selected');
-  } else {
-    selectedTiles.add(index);
-    el.classList.add('selected');
-  }
-}
-window.toggleTileSelect = toggleTileSelect;
-
-function verifyInteractiveChallenge(){
-  if(!activeInteractive){
-    toast('No active challenge');
-    return;
-  }
-  var selectedArr = Array.from(selectedTiles);
-  api('/trainer/interactive/verify', {body: {selected: selectedArr}}).then(function(r){return r.json();})
-    .then(function(res){
-      if(res.passed){
-        toast('✓ VERIFIED! Human token: ' + (res.token ? res.token.slice(0, 16) + '...' : 'PASS'));
-        var cbBox = $('demoCheckboxBox');
-        var cbLabel = $('demoCheckboxLabel');
-        if(cbBox){cbBox.className = 'hcaptcha-box checked'; cbBox.textContent = '✓';}
-        if(cbLabel){cbLabel.textContent = 'Verified!';}
-        setTimeout(function(){
-          closeInteractiveModal();
-        }, 900);
-      } else {
-        toast('❌ Incorrect selection. Try again or auto-solve!');
-        // Shake modal
-        var m = document.querySelector('.hcaptcha-interactive-modal');
-        if(m){
-          m.style.transform = 'translateX(6px)';
-          setTimeout(function(){m.style.transform='translateX(-6px)';}, 80);
-          setTimeout(function(){m.style.transform='translateX(4px)';}, 160);
-          setTimeout(function(){m.style.transform='none';}, 240);
-        }
-      }
-    }).catch(function(e){toast('Verification error: ' + e.message);});
-}
-window.verifyInteractiveChallenge = verifyInteractiveChallenge;
-
-function autoSolveInteractive(){
-  if(!activeInteractive || !activeInteractive.tiles) return;
-  selectedTiles.clear();
-  activeInteractive.tiles.forEach(function(t){
-    var el = $('intTile_' + t.index);
-    if(t.is_target){
-      selectedTiles.add(t.index);
-      if(el) el.classList.add('selected');
-    } else {
-      if(el) el.classList.remove('selected');
-    }
-  });
-  toast('Auto-selected matching target tiles! Click VERIFY.');
-}
-window.autoSolveInteractive = autoSolveInteractive;
-
-(function(){
-  var overlay=$('logOverlay');
-  if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
-  var demoOverlay=$('demoCaptchaOverlay');
-  if(demoOverlay)demoOverlay.addEventListener('click',function(e){if(e.target===demoOverlay)closeInteractiveModal();});
-  document.addEventListener('keydown',function(e){
-    if(e.key==='Escape'){closeAllLogs();closeInteractiveModal();}
-  });
-})();
 
 // Init
 refreshStatus();

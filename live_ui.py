@@ -20,18 +20,18 @@ LIVE_INJECTION = r'''
   <div class="live-modal">
     <div class="live-head">
       <div id="liveTitle" class="live-title"><b>LIVE</b> CAMERA</div>
-      <div id="liveState" class="live-state">Waiting for generator</div>
+      <div id="liveState" class="live-state">Waiting for browser</div>
       <button class="live-close" type="button" onclick="closeLive()" aria-label="Close live camera">CLOSE</button>
     </div>
     <div class="live-frame">
-      <div id="livePlaceholder" class="live-placeholder">Start the generator to view its camera.</div>
-      <img id="liveImage" alt="Latest generator camera frame">
+      <div id="livePlaceholder" class="live-placeholder">Start the browser runner to view its camera.</div>
+      <img id="liveImage" alt="Latest real Chrome camera frame">
     </div>
-    <div class="live-foot">Full-page camera — refreshes every 3 seconds. Scroll the frame to see the whole page.</div>
+    <div class="live-foot">Real Chrome camera — refreshes every 3 seconds. During the demo, click the frame to send a manual click to Chrome.</div>
   </div>
 </div>
 <script>
-var LC={worker:'B1',timer:null};
+var LC={worker:'B1',timer:null,interactive:false};
 
 function lcSetStatus(message){
   var el=document.getElementById('liveState');
@@ -43,18 +43,40 @@ function lcShowPlaceholder(message){
   if(img)img.style.display='none';
   if(ph){ph.textContent=message;ph.style.display='flex';}
 }
-function lcLoadFrame(){
+function lcSetImage(src){
   var img=document.getElementById('liveImage');
   var ph=document.getElementById('livePlaceholder');
-  if(!img)return;
+  if(!img||!src)return;
   img.onload=function(){
     img.style.display='block';
     if(ph)ph.style.display='none';
   };
-  img.onerror=function(){
-    lcShowPlaceholder('Waiting for the first camera frame.');
-  };
-  img.src='/latest?worker='+encodeURIComponent(LC.worker)+'&t='+Date.now();
+  img.onerror=function(){lcShowPlaceholder('Waiting for the first camera frame.');};
+  img.src=src.indexOf('data:image/')===0?src:'data:image/png;base64,'+src;
+}
+function lcLoadFrame(){
+  fetch('/browser/state?worker='+encodeURIComponent(LC.worker)+'&t='+Date.now())
+    .then(function(r){if(!r.ok)throw new Error('browser state unavailable');return r.json();})
+    .then(function(st){
+      if(st&&st.screenshot)lcSetImage(st.screenshot);
+      else if(!st||!st.connected)lcShowPlaceholder('Waiting for the first camera frame.');
+    })
+    .catch(function(){lcShowPlaceholder('Waiting for the first camera frame.');});
+}
+function lcSendManualClick(event){
+  if(!LC.interactive)return;
+  var img=document.getElementById('liveImage');
+  if(!img||!img.naturalWidth||!img.naturalHeight)return;
+  var rect=img.getBoundingClientRect();
+  if(!rect.width||!rect.height)return;
+  var x=(event.clientX-rect.left)*(img.naturalWidth/rect.width);
+  var y=(event.clientY-rect.top)*(img.naturalHeight/rect.height);
+  fetch('/browser/action?worker='+encodeURIComponent(LC.worker),{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'click',x:x,y:y})
+  }).then(function(r){return r.json();}).then(function(st){
+    if(st&&st.screenshot)lcSetImage(st.screenshot);
+  }).catch(function(){lcSetStatus('Manual click failed');});
 }
 function lcRefresh(){
   var overlay=document.getElementById('liveOverlay');
@@ -65,9 +87,13 @@ function lcRefresh(){
       var workers=data.workers||[];
       var worker=workers.find(function(w){return w.id===LC.worker;})||{};
       var state=worker.status||'idle';
-      lcSetStatus(state==='running'||state==='starting'?'Live · '+state:'Camera · '+state);
+      LC.interactive=(state==='demo');
+      var liveImg=document.getElementById('liveImage');
+      if(liveImg)liveImg.style.cursor=LC.interactive?'crosshair':'default';
+      lcSetStatus(state==='running'||state==='starting'?'Live · '+state:
+        (state==='demo'?'Demo · click the frame to interact':'Camera · '+state));
       if(state==='idle'||state==='stopped'){
-        lcShowPlaceholder('Start the generator to view its camera.');
+        lcShowPlaceholder('Start the browser runner to view its camera.');
       }else{
         lcLoadFrame();
       }
@@ -92,6 +118,8 @@ window.closeLive=closeLive;
 (function(){
   var overlay=document.getElementById('liveOverlay');
   if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeLive();});
+  var img=document.getElementById('liveImage');
+  if(img)img.addEventListener('click',lcSendManualClick);
   document.addEventListener('keydown',function(e){if(e.key==='Escape')closeLive();});
 })();
 </script>
