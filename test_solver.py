@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 86 collected (78 passed + 8 skipped when the models are not trained yet).
+Expected: 96 collected (88 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -41,7 +41,13 @@ import unittest
 
 import hcaptcha_types as hct
 import human_mouse as hm
-from vision_solver import OllamaVisionClient
+from vision_solver import (
+    OllamaVisionClient,
+    is_tiny_vlm,
+    parse_yesno,
+    shrink_image,
+    tile_yes_question,
+)
 
 MODELS_DIR = os.environ.get(
     "SOLVER_MODELS_DIR", os.path.join(os.path.dirname(
@@ -585,6 +591,140 @@ class TestParseGeometry(unittest.TestCase):
         fenced_p = '```json\n{"points": [[0.12, 0.88]]}\n```'
         self.assertEqual(GEO(fenced_p, "points"),
                          {"type": "points", "points": [(0.12, 0.88)]})
+
+    def test_parse_loose_tile_numbers(self):
+        pa = OllamaVisionClient._parse_answer
+        self.assertEqual(pa("1 3 5", 9, "tiles"),
+                         {"type": "tiles", "indices": [1, 3, 5]})
+        self.assertEqual(pa("tiles 1, 3 and 5", 9, "tiles"),
+                         {"type": "tiles", "indices": [1, 3, 5]})
+        self.assertEqual(pa("I see 9 tiles, pick 1 and 3", 9, "tiles"),
+                         {"type": "tiles", "indices": [1, 3]})
+        # still a count when the shape says so
+        self.assertEqual(pa("1 3 5", 1, "count"),
+                         {"type": "count", "count": 1})
+
+
+# ── SmolVLM2-256M helpers (the model this stack actually runs) ────────────
+
+
+class TestSmolVlmHelpers(unittest.TestCase):
+
+    def test_is_tiny_vlm(self):
+        self.assertTrue(is_tiny_vlm("ahmadwaqar/smolvlm2-256m-video:q8_0"))
+        self.assertTrue(is_tiny_vlm("SmolVLM2-256M"))
+        self.assertTrue(is_tiny_vlm("smol-vlm"))
+        self.assertFalse(is_tiny_vlm("qwen3-vl:2b"))
+        self.assertFalse(is_tiny_vlm("llama3.2-vision:11b"))
+        self.assertFalse(is_tiny_vlm(""))
+
+    def test_parse_yesno(self):
+        self.assertIs(parse_yesno("yes"), True)
+        self.assertIs(parse_yesno("Yes."), True)
+        self.assertIs(parse_yesno("yep, a table"), True)
+        self.assertIs(parse_yesno("no"), False)
+        self.assertIs(parse_yesno("No balloon here"), False)
+        self.assertIs(parse_yesno("nope"), False)
+        # echoed instruction must not score as "no"
+        self.assertIs(parse_yesno("Answer yes or no."), None)
+        self.assertIs(parse_yesno(
+            "Does this photo show a table? Answer yes or no. yes"), True)
+        self.assertIs(parse_yesno(""), None)
+        self.assertIs(parse_yesno("maybe a deck"), None)
+
+    def test_tile_yes_question_setdown(self):
+        live = ("Find places safe for setting down the item "
+                "in the reference")
+        q = tile_yes_question(live)
+        self.assertIn("nightstand", q.lower())
+        self.assertIn("balloon", q.lower())
+        self.assertIn("yes or no", q.lower())
+        self.assertNotIn(live.lower(), q.lower())
+        qref = tile_yes_question(live, has_ref=True)
+        self.assertIn("first image is the item", qref.lower())
+
+    def test_tile_yes_question_generic(self):
+        q = tile_yes_question("Please click each image containing a boat")
+        self.assertIn("boat", q.lower())
+        self.assertIn("yes or no", q.lower())
+
+    def test_shrink_image_downscales(self):
+        self.assertEqual(shrink_image(b""), b"")
+        self.assertEqual(shrink_image(b"not-an-image"), b"not-an-image")
+        try:
+            import io
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        im = Image.new("RGB", (800, 600), (10, 20, 30))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        out = shrink_image(buf.getvalue(), max_side=64)
+        got = Image.open(io.BytesIO(out))
+        self.assertLessEqual(max(got.size), 64)
+        self.assertEqual(got.format, "JPEG")
+
+
+class TestSmolVlmSolve(unittest.IsolatedAsyncioTestCase):
+
+    async def test_tiny_model_asks_one_tile_at_a_time(self):
+        client = OllamaVisionClient(
+            base="http://vision.invalid",
+            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
+        )
+        replies = ["yes", "no", "Yes, a bench.", "nope"]
+        calls = []
+
+        async def fake_chat(system, content, images, timeout, *,
+                            want_json, num_predict):
+            calls.append({
+                "n": len(images), "json": want_json,
+                "npred": num_predict, "q": content,
+            })
+            self.assertFalse(want_json)
+            self.assertLessEqual(len(images), 2)
+            self.assertLessEqual(num_predict, 16)
+            return replies.pop(0)
+
+        client._chat = fake_chat
+        png = b"\x89PNG\r\n\x1a\n"
+        got = await client.solve(
+            "Find places safe for setting down the item in the reference",
+            [png, png, png, png], shape="tiles", examples=[png])
+        self.assertEqual(got, {"type": "tiles", "indices": [1, 3]})
+        self.assertEqual(len(calls), 4)
+        self.assertIn("nightstand", calls[0]["q"].lower())
+
+    async def test_tiny_model_all_errors_returns_none(self):
+        client = OllamaVisionClient(
+            base="http://vision.invalid",
+            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
+        )
+
+        async def boom(*a, **k):
+            return None
+
+        client._chat = boom
+        got = await client.solve("select boats", [b"a", b"b", b"c"])
+        self.assertIsNone(got)
+        self.assertEqual(client.stats["failed"], 1)
+
+    async def test_large_vlm_still_batches_tiles(self):
+        client = OllamaVisionClient(
+            base="http://vision.invalid", model="qwen3-vl:2b")
+        calls = []
+
+        async def fake_chat(system, content, images, timeout, *,
+                            want_json, num_predict):
+            calls.append(images)
+            self.assertTrue(want_json)
+            return '{"tiles": [2, 4]}'
+
+        client._chat = fake_chat
+        got = await client.solve("select boats", [b"a", b"b", b"c", b"d"])
+        self.assertEqual(got, {"type": "tiles", "indices": [2, 4]})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 4)
 
 
 # ── _denorm mapping ───────────────────────────────────────────────────────

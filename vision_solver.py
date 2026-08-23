@@ -21,28 +21,25 @@ Configuration (env vars):
   VISION_API_KEY   Bearer token for authenticated vision endpoints
                    (optional — added as ``Authorization: Bearer <key>``
                    header to every request when set).
-  OLLAMA_MODEL     vision model to use (default qwen3-vl:2b)
-  OLLAMA_TIMEOUT   per-request timeout in seconds (default 180)
+  OLLAMA_MODEL     vision model to use
+                   (default ahmadwaqar/smolvlm2-256m-video:q8_0)
+  OLLAMA_TIMEOUT   per-request timeout in seconds (default 30 — SmolVLM2
+                   is tiny; a 180s wait expires the challenge)
+  OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
+  OLLAMA_IMAGE_SIDE    max image side in px sent to tiny VLMs (default 256)
   VISION_CHECK_TIMEOUT  reachability-probe timeout in seconds (default 60 —
                         hosted endpoints cold-start on first request)
 
-Model recommendation (small, better than Moondream):
+The default is SmolVLM2-256M (the model this stack actually runs). It is
+a 256M SigLIP+SmolLM2 VLM: ~279 MB, ~2k–8k context, good at short visual
+yes/no, bad at 9-image JSON contracts. For that model the client asks
+ONE tile at a time ("yes or no") and never waits 180s. Larger VLMs
+(qwen3-vl:2b, …) still get the multi-image JSON path when OLLAMA_MODEL
+is set to them.
 
-  qwen3-vl:2b       1.9 GB  ← default; newest Qwen vision model, far stronger
-                             object recognition + OCR than Moondream, handles
-                             multiple images in one prompt. Needs Ollama ≥ 0.12.7.
-  qwen2.5vl:3b      3.2 GB  ← most proven small vision model; a bit more
-                             accurate on hard grids if you have the room.
-  granite3.2-vision:2b  2.4 GB  ← document/OCR-focused alternative.
-
-There is no Ollama vision model under ~1 GB that is actually BETTER than
-Moondream (Moondream itself is 1.7 GB) — qwen3-vl:2b at 1.9 GB is the
-smallest model that clears that bar.
-
-The client talks to Ollama's native HTTP API (POST /api/chat) with the
-``format: json`` flag so answers come back structured, and falls back to
-loose parsing when a model ignores the flag. Only aiohttp is used — no new
-dependencies.
+The client talks to Ollama's native HTTP API (POST /api/chat). Tiny
+models skip ``format: json`` (it hangs or empties them) and fall back to
+loose parsing. Only aiohttp is used — no new dependencies.
 """
 
 from __future__ import annotations
@@ -64,12 +61,103 @@ _OLLAMA_BASE_LEGACY = os.environ.get("OLLAMA_BASE", "").rstrip("/")
 OLLAMA_BASE = VISION_API_BASE or _OLLAMA_BASE_LEGACY or "http://localhost:11434"
 
 VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:2b").strip()
-OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
+_DEFAULT_MODEL = "ahmadwaqar/smolvlm2-256m-video:q8_0"
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", _DEFAULT_MODEL).strip()
+OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
 # Reachability probe timeout (seconds). Hosted endpoints (Railway etc.)
 # COLD-START on the first request after sleeping — the wake-up itself can
 # take 30-90s, so a 10s probe marks a healthy service permanently down.
 VISION_CHECK_TIMEOUT = float(os.environ.get("VISION_CHECK_TIMEOUT", "60"))
+_SMOL_TILE_TIMEOUT = float(os.environ.get("OLLAMA_TILE_TIMEOUT", "12"))
+_SMOL_MAX_SIDE = int(os.environ.get("OLLAMA_IMAGE_SIDE", "256"))
+
+
+def is_tiny_vlm(name: str) -> bool:
+    """True for SmolVLM2-class models that cannot do 9-image JSON."""
+    n = (name or "").lower()
+    return any(k in n for k in (
+        "smolvlm", "smol-vlm", "smol_vlm", "256m", "500m-video",
+    ))
+
+
+def shrink_image(data: bytes, max_side: int = _SMOL_MAX_SIDE) -> bytes:
+    """Downscale a PNG/JPEG to a JPEG the 256M projector can chew."""
+    if not data:
+        return data
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        im.thumbnail((max(32, int(max_side)), max(32, int(max_side))))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=75, optimize=True)
+        out = buf.getvalue()
+        return out or data
+    except Exception:
+        return data
+
+
+_YES_WORDS = ("yes", "y", "yeah", "yep", "yup", "true", "match", "matching")
+_NO_WORDS = ("no", "n", "nope", "nah", "false", "none")
+
+
+def parse_yesno(text: str):
+    """Map a tiny-VLM reply to True/False/None.
+
+    SmolVLM2 often echoes the question (\"… Answer yes or no.\"). Strip
+    that instruction and read the first/last token so an echoed prompt
+    is not scored as a \"no\".
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    t = re.sub(r"\banswer(?:\s+with)?\s+yes\s+or\s+no\b[.?!:;]*", " ", t)
+    t = re.sub(r"\byes\s*/\s*no\b", " ", t)
+    t = re.sub(r"\byes\s+or\s+no\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return None
+    first = re.split(r"[\s,.;:!?]+", t, maxsplit=1)[0]
+    if first in _YES_WORDS:
+        return True
+    if first in _NO_WORDS:
+        return False
+    head = t[:40]
+    has_yes = bool(re.search(r"\byes\b", head))
+    has_no = bool(re.search(r"\bno\b", head))
+    if has_yes and not has_no:
+        return True
+    if has_no and not has_yes:
+        return False
+    words = re.findall(r"[a-z]+", t)
+    if words:
+        if words[-1] in _YES_WORDS:
+            return True
+        if words[-1] in _NO_WORDS:
+            return False
+    return None
+
+
+def tile_yes_question(prompt: str, has_ref: bool = False) -> str:
+    """One-sentence yes/no the 256M model can actually answer."""
+    p = (prompt or "").strip()
+    try:
+        import hcaptcha_types as hct
+        if hct.is_setdown_prompt(p):
+            q = ("Does this photo show a table, nightstand, bench, wooden "
+                 "deck, counter or shelf a mug could sit on? Not a balloon, "
+                 "ball, leaf or sky. Answer yes or no.")
+            if has_ref:
+                return ("First image is the item. Second is a tile. " + q)
+            return q
+    except Exception:
+        pass
+    q = ("Does this image match the task: %s? "
+         "Answer only yes or no." % p[:160])
+    if has_ref:
+        return "First image is the example. Second is a tile. " + q
+    return q
+
 
 # Instruct the model to answer in reading order: image 1 = top-left tile,
 # then left→right, top→bottom. JSON-only output (no markdown, no prose).
@@ -216,6 +304,21 @@ _SYSTEM_BY_SHAPE = {
     "text": _SYSTEM_PROMPT,
 }
 
+# SmolVLM2 cannot follow the long JSON contracts above. Keep these to
+# one or two sentences; the per-tile path asks yes/no instead.
+_SMOL_SYSTEM = {
+    "tiles": "Look at the photo. Answer the question with yes or no only.",
+    "points": 'Look at the photo. Reply {"points": [[x, y]]} with x,y between 0 and 1.',
+    "bbox": 'Look at the photo. Reply {"bbox": {"x1":a,"y1":b,"x2":c,"y2":d}} 0 to 1.',
+    "drag": 'Look at the photo. Reply {"drag": {"from": [x,y], "to": [x,y]}} 0 to 1.',
+    "pattern": 'Look at the photo. Reply {"drag": {"from": [x,y], "to": [x,y]}} 0 to 1.',
+    "tower": 'Look at the wooden towers. Reply {"drag": {"from": [x,y], "to": [x,y]}} onto the short stack. 0 to 1.',
+    "stack": 'Reply {"drags": [[sx,sy,tx,ty], ...]} in 0-100 percent.',
+    "choice": 'Reply {"choice": N} with the option number.',
+    "count": 'How many? Reply {"count": N}.',
+    "text": "Read the characters. Reply with only the text.",
+}
+
 _JSON_ARRAY_RE = re.compile(r"\[\s*(?:\d+\s*(?:,\s*\d+\s*)*)?\]")
 _JSON_STRING_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
@@ -232,7 +335,7 @@ class OllamaVisionClient:
                  base: str = OLLAMA_BASE, model: str = OLLAMA_MODEL):
         self._log = log or (lambda msg, level="info": None)
         self.base = base.rstrip("/")
-        self.model = model or "qwen3-vl:2b"
+        self.model = model or _DEFAULT_MODEL
         self._api_key = VISION_API_KEY
         self.stats = {"calls": 0, "ok": 0, "failed": 0}
         # Machine-readable result of the latest reachability probe.  Keep the
@@ -341,6 +444,79 @@ class OllamaVisionClient:
                       level="error")
             return False, []
 
+    async def _chat(self, system: str, content: str, images: List[bytes],
+                    timeout: float, *, want_json: bool,
+                    num_predict: int) -> Optional[str]:
+        """One /api/chat turn. Returns the raw message content or None."""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": content,
+                    "images": [base64.b64encode(b).decode("ascii")
+                               for b in images if b],
+                },
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "num_predict": int(num_predict),
+            },
+            "keep_alive": "10m",
+        }
+        if want_json:
+            payload["format"] = "json"
+        try:
+            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
+                async with s.post(f"{self.base}/api/chat", json=payload,
+                                  headers=await self._headers()) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        self._log(
+                            f"[Ollama] Solve rejected (HTTP {r.status}): {body[:200]}",
+                            level="warn")
+                        return None
+                    data = await r.json()
+            return ((data or {}).get("message") or {}).get("content") or ""
+        except Exception as e:
+            self._log(f"[Ollama] Solve error: {e}", level="error")
+            return None
+
+    async def _solve_tiles_smol(self, prompt: str, images: List[bytes],
+                                examples: List[bytes],
+                                timeout: float) -> Optional[dict]:
+        """Ask SmolVLM2 yes/no on each tile. 9-at-once JSON 504s this model."""
+        ref = shrink_image(examples[0]) if examples else None
+        q = tile_yes_question(prompt, has_ref=bool(ref))
+        system = _SMOL_SYSTEM["tiles"]
+        per = min(_SMOL_TILE_TIMEOUT, max(6.0, timeout))
+        hits = []
+        answered = 0
+        for i, raw in enumerate(images, 1):
+            tile = shrink_image(raw)
+            bundle = [b for b in ((ref, tile) if ref else (tile,)) if b]
+            content = await self._chat(
+                system, q, bundle, per, want_json=False, num_predict=16)
+            if content is None:
+                self._log(f"[Ollama] tile {i}/{len(images)} -> error",
+                          level="debug")
+                continue
+            answered += 1
+            yn = parse_yesno(content)
+            self._log(f"[Ollama] tile {i}/{len(images)} -> "
+                      f"{content[:40]!r} yes={yn}", level="debug")
+            if yn is True:
+                hits.append(i)
+        if answered == 0:
+            return None
+        self._log(f"[Ollama] SmolVLM2 per-tile yes: {hits} "
+                  f"({answered}/{len(images)} answered)")
+        return {"type": "tiles", "indices": hits}
+
     async def solve(self, prompt: str, images: List[bytes],
                     shape: str = "tiles", examples: Optional[List[bytes]] = None,
                     timeout: float = OLLAMA_TIMEOUT) -> Optional[dict]:
@@ -352,6 +528,9 @@ class OllamaVisionClient:
         canvas; for "choice" the reference image(s). ``examples`` are the
         prompt-header reference images (the "item shown"): they are
         PREPENDED to the message and the text explains which is which.
+
+        SmolVLM2 (the default) answers tile grids one image at a time.
+        Larger VLMs still get one multi-image JSON call.
 
         Returns, by shape:
 
@@ -373,79 +552,71 @@ class OllamaVisionClient:
             return None
         if not images:
             return None
-        # Log solving with si vision (vision service / vision_solver)
         import time
-        self._log(f"{time.strftime('%b %d %H:%M:%S.000 [info]')} solving with si vision")
+        tiny = is_tiny_vlm(self.model)
+        self._log(f"{time.strftime('%b %d %H:%M:%S.000 [info]')} "
+                  f"solving with si vision ({self.model}"
+                  f"{', per-tile' if tiny and shape == 'tiles' else ''})")
         self.stats["calls"] += 1
         examples = list(examples or [])
-        system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)
-        if examples:
-            content = (
-                f"REFERENCE IMAGES: the first {len(examples)} image(s) come "
-                "from the challenge header and SHOW WHAT TO LOOK FOR — they "
-                "are examples, NOT answer choices.\n"
-                f"ANSWER SURFACES: the remaining {len(images)} image(s) are "
-                "what you answer on (tiles in reading order, or the big "
-                "canvas).\n"
-                f"CHALLENGE TASK: {prompt}\n\n"
-                "Answer with the JSON object only.")
-        else:
-            content = (f"CHALLENGE TASK: {prompt}\n\n"
-                       f"There are {len(images)} image(s). "
-                       "Answer with the JSON object only.")
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": content,
-                    "images": [base64.b64encode(b).decode("ascii")
-                               for b in list(examples) + list(images)],
-                },
-            ],
-            "stream": False,
-            "format": "json",
-            "options": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "num_predict": 256,
-            },
-            "keep_alive": "10m",
-        }
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(f"{self.base}/api/chat", json=payload,
-                                  headers=await self._headers()) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        self._log(
-                            f"[Ollama] Solve rejected (HTTP {r.status}): {body[:200]}",
-                            level="warn")
-                        self.stats["failed"] += 1
-                        return None
-                    data = await r.json()
-            content = ((data or {}).get("message") or {}).get("content") or ""
-            if not content:
-                self._log("[Ollama] Empty response from model", level="warn")
-                self.stats["failed"] += 1
-                return None
-            parse_shape = "drag" if shape in ("pattern", "tower") else shape
-            parsed = self._parse_geometry(content, parse_shape, len(images))
-            if parsed is None and shape in ("tiles", "text", "count", "stack"):
-                parsed = self._parse_answer(content, len(images), shape)
-            if parsed is None:
-                self._log(f"[Ollama] Unparseable model answer: {content[:160]}",
-                          level="warn")
-                self.stats["failed"] += 1
-                return None
-            self.stats["ok"] += 1
-            return parsed
-        except Exception as e:
-            self._log(f"[Ollama] Solve error: {e}", level="error")
+        if tiny and shape == "tiles" and len(images) >= 2:
+            got = await self._solve_tiles_smol(prompt, images, examples, timeout)
+            if got is not None:
+                self.stats["ok"] += 1
+                return got
             self.stats["failed"] += 1
             return None
+        if tiny:
+            system = _SMOL_SYSTEM.get(shape, _SMOL_SYSTEM["tiles"])
+            imgs = [shrink_image(b) for b in list(examples) + list(images)]
+            if examples:
+                content = (f"First {len(examples)} image(s) are the example. "
+                           f"Then the answer image. Task: {prompt}")
+            else:
+                content = prompt
+            # format:json hangs or empties 256M models — parse loosely.
+            want_json = False
+            npred = 48
+        else:
+            system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)
+            imgs = list(examples) + list(images)
+            if examples:
+                content = (
+                    f"REFERENCE IMAGES: the first {len(examples)} image(s) come "
+                    "from the challenge header and SHOW WHAT TO LOOK FOR — they "
+                    "are examples, NOT answer choices.\n"
+                    f"ANSWER SURFACES: the remaining {len(images)} image(s) are "
+                    "what you answer on (tiles in reading order, or the big "
+                    "canvas).\n"
+                    f"CHALLENGE TASK: {prompt}\n\n"
+                    "Answer with the JSON object only.")
+            else:
+                content = (f"CHALLENGE TASK: {prompt}\n\n"
+                           f"There are {len(images)} image(s). "
+                           "Answer with the JSON object only.")
+            want_json = True
+            npred = 256
+        content_out = await self._chat(
+            system, content, imgs, timeout,
+            want_json=want_json, num_predict=npred)
+        if content_out is None:
+            self.stats["failed"] += 1
+            return None
+        if not content_out:
+            self._log("[Ollama] Empty response from model", level="warn")
+            self.stats["failed"] += 1
+            return None
+        parse_shape = "drag" if shape in ("pattern", "tower") else shape
+        parsed = self._parse_geometry(content_out, parse_shape, len(images))
+        if parsed is None and shape in ("tiles", "text", "count", "stack"):
+            parsed = self._parse_answer(content_out, len(images), shape)
+        if parsed is None:
+            self._log(f"[Ollama] Unparseable model answer: {content_out[:160]}",
+                      level="warn")
+            self.stats["failed"] += 1
+            return None
+        self.stats["ok"] += 1
+        return parsed
 
     # ── geometry answer parsing (points / bbox / drag / choice) ──────────
 
@@ -786,19 +957,56 @@ class OllamaVisionClient:
             if digits:
                 return {"type": "count", "count": int(digits[0])}
 
-        # 4) Quoted string for a text challenge.
+        # 5) Loose tile numbers: "1 3 5", "tiles 1, 3 and 5". Must run
+        # BEFORE the text fallback — "1 3 5" is a 5-char line with no
+        # brackets and used to be misread as a text challenge.
+        if shape == "tiles":
+            loose = OllamaVisionClient._parse_loose_tiles(text, tile_count)
+            if loose is not None:
+                return loose
+
+        # 6) Quoted string for a text challenge.
         m = _JSON_STRING_RE.search(text)
         if m:
             val = m.group(1).strip()
             if val and not val.startswith("{"):
                 return {"type": "text", "text": val}
 
-        # 5) Loose: a bare line of short tokens (text challenge fallback).
+        # 7) Loose: a bare line of short tokens (text challenge fallback).
         line = text.strip().strip('"').strip()
         if line and len(line) <= 32 and not any(c in line for c in "{}[]"):
             return {"type": "text", "text": line}
 
         return None
+
+    @staticmethod
+    def _parse_loose_tiles(text: str, tile_count: int) -> Optional[dict]:
+        """Pull 1-based tile numbers out of prose.
+
+        Accepts ``1 3 5``, ``tiles 1, 3 and 5``, ``pick 2, 4``. A cue
+        word (tiles/select/pick/…) keeps the grid size out of
+        ``I see 9 tiles, pick 1 and 3``.
+        """
+        t = (text or "").strip()
+        if not t:
+            return None
+        cap = max(int(tile_count or 0), 12)
+        cue = re.search(
+            r"(?:tiles?|indices|indexes|select(?:ed)?|pick(?:ed)?|"
+            r"choose|chosen|answers?)\s*[:#=-]?\s*(.+)$",
+            t, re.I | re.S)
+        blob = cue.group(1) if cue else t
+        nums = [int(x) for x in re.findall(r"\d+", blob)]
+        nums = [n for n in nums if 1 <= n <= cap]
+        out: List[int] = []
+        seen = set()
+        for n in nums:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        if not out:
+            return None
+        return {"type": "tiles", "indices": out}
 
 
 async def _self_test() -> None:

@@ -17,7 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
     DEFAULT_OLLAMA_MODEL=ahmadwaqar/smolvlm2-256m-video:q8_0 \
     OLLAMA_CONTEXT_LENGTH=1024 \
     OLLAMA_KEEP_ALIVE=10m \
-    OLLAMA_REQUEST_TIMEOUT=180 \
+    OLLAMA_REQUEST_TIMEOUT=45 \
     MAX_IMAGE_BYTES=10485760
 
 # Railway manages the persistent /data mount from the service's Volume UI.

@@ -3999,7 +3999,7 @@ class DiscordAutomation:
             # vision model (local Ollama or remote VISION_API_BASE endpoint)
             # which tiles match, clicks them + Verify, and hCaptcha itself
             # mints the token. See vision_solver.py for the recommended
-            # model (qwen3-vl:2b).
+            # model (ahmadwaqar/smolvlm2-256m-video:q8_0).
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -4655,7 +4655,7 @@ class DiscordAutomation:
         never picks up the piece. NEVER uses DragLocator (punched-slot
         geometry is the wrong puzzle). Offline wood-mask heuristic
         first; a SHORT vision ``shape="tower"`` call is last resort
-        (the hosted model 504s if we wait the default 180s).
+        (a long 504 expires the challenge).
         """
         shot, box = await self._tower_frame_shot(frame)
         if not shot or not box:
@@ -6978,3 +6978,4 @@ async def run_discord_automation():
 
 if __name__ == "__main__":
     asyncio.run(run_discord_automation())
+rd_automation())

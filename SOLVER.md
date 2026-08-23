@@ -62,7 +62,7 @@ The round loop dispatches to `_solve_tower_round` — **not**
 piece is often a separate DOM node beside the photo), takes a Move-badge
 hint from the DOM, then finds warm/wood columns and drops onto the
 shortest stack or the largest internal gap. Vision (`shape="tower"`) is
-a 18s last resort only — a 180s 504 expires the challenge.
+a 18s last resort only — a long 504 expires the challenge.
 
 Set-down / spatial-reference grids ("Find places safe for setting down
 the item in the reference") are a **binary tile grid with a header
@@ -74,9 +74,12 @@ and skips balloons, balls, leaves, and building facades. No matching
 surface returns `None` so the vision model answers — an empty Verify
 almost never wins this family. The wording is tight on purpose:
 `"place where it fits"` is a drag puzzle and bare `"in the reference"`
-matches every affordance grid. The vision `tiles` system prompt tells
-the model to look at the header mug first and pick every surface it
-could rest on.
+matches every affordance grid. The default vision model is
+**SmolVLM2-256M** (`ahmadwaqar/smolvlm2-256m-video:q8_0`): it cannot
+do a 9-image JSON contract (that 504s in ~180s), so the client asks
+**one tile at a time** ("is this a table/nightstand/bench/deck?") at
+256 px / 12s / no `format: json`. Offline surfaces stay the first path
+— a 256M yes/no on a tennis-ball-on-deck photo is unreliable.
 
 This is how the long tail of the ~1000-prompt catalog is covered:
 **routing + aliases + the 60-class CNN + vision**, not a 1000-class
@@ -131,8 +134,8 @@ toggle them off).
         └──────────────┬───────────────┘
                        │ fallback
         ┌──────────────┴───────────────┐
-        │ vision model (vision_solver) │  per-shape system prompts,
-        │  Ollama / OpenAI-compatible   │  strict JSON-repair parsing
+        │ vision model (vision_solver) │  SmolVLM2: per-tile yes/no;
+        │  Ollama / OpenAI-compatible   │  larger VLMs: JSON + repair
         └──────────────────────────────┘
                        │
               human_mouse.py on every
@@ -380,7 +383,10 @@ metrics). The models directory IS committed (~2.7 MB total).
 |---|---|---|
 | `VISION_API_BASE` | vision endpoint (Ollama-compatible) | `http://localhost:11434` |
 | `VISION_API_KEY` | Bearer token for the endpoint | — |
-| `OLLAMA_MODEL` | vision model name | `qwen3-vl:2b` |
+| `OLLAMA_MODEL` | vision model name | `ahmadwaqar/smolvlm2-256m-video:q8_0` |
+| `OLLAMA_TIMEOUT` | per-solve timeout (seconds) | `30` |
+| `OLLAMA_TILE_TIMEOUT` | per-tile yes/no timeout for tiny VLMs | `12` |
+| `OLLAMA_IMAGE_SIDE` | max image side (px) sent to tiny VLMs | `256` |
 | `SOLVER_CNN_MIN_CONF` | mean per-tile confidence to trust the offline grid path | `0.62` |
 | `SOLVER_MODELS_DIR` | where the `.pt`/`.json` live | `./models` |
 | `FULLPAGE_SHOTS` | whole scrollable page camera frames (default: full browser-view frames with the register form revealed when out of sight) | `0` |

@@ -56,7 +56,9 @@ VISION_API_BASE = (
     or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     or ""
 ).rstrip("/")
-REQUEST_TIMEOUT = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "180"))
+# SmolVLM2 yes/no is a few seconds. 180s pins the worker after the bot
+# has already moved on (the old 9-image JSON path 504'd here).
+REQUEST_TIMEOUT = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "45"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "8"))
 MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "4000"))

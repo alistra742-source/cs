@@ -35,9 +35,11 @@ CLI usage:
 
 Configuration (env vars, same as the bot):
 
-    OLLAMA_BASE     Ollama server (default http://localhost:11434)
-    OLLAMA_MODEL    vision model (default qwen3-vl:2b)
-    OLLAMA_TIMEOUT  per-solve timeout seconds (default 180)
+    VISION_API_BASE vision endpoint (default http://localhost:11434)
+    OLLAMA_BASE     legacy alias for VISION_API_BASE
+    OLLAMA_MODEL    vision model (default ahmadwaqar/smolvlm2-256m-video:q8_0)
+    OLLAMA_TIMEOUT  per-solve timeout seconds (default 30)
+    OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
 """
 
 from __future__ import annotations
@@ -797,9 +799,10 @@ async def _cli_solve(url: str, headless: bool, timeout: float,
     vision = OllamaVisionClient()
     ok, models = await vision.check()
     if not ok:
-        print("[solver] WARNING: Ollama server unreachable — the solve will "
+        print("[solver] WARNING: vision server unreachable — the solve will "
               "fail. Start Ollama and pull a vision model "
-              "(recommended: qwen3-vl:2b), or set OLLAMA_BASE.", flush=True)
+              "(recommended: ahmadwaqar/smolvlm2-256m-video:q8_0), "
+              "or set VISION_API_BASE.", flush=True)
     elif vision.model not in models:
         print(f"[solver] WARNING: model {vision.model} not pulled — "
               f"run: ollama pull {vision.model}", flush=True)
