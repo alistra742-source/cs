@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 102 collected (94 passed + 8 skipped when the models are not trained yet).
+Expected: 100 collected (92 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
