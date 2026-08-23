@@ -6979,4 +6979,3 @@ async def run_discord_automation():
 
 if __name__ == "__main__":
     asyncio.run(run_discord_automation())
-rd_automation())
