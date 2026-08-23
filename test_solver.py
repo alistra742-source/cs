@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 100 collected (92 passed + 8 skipped when the models are not trained yet).
+Expected: 102 collected (94 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -1352,6 +1352,23 @@ class TestLivePointer(unittest.TestCase):
         self.assertEqual(rec["kind"], "click")
         self.assertEqual(rec["x"], 1.2)
         self.assertIn("t", rec)
+        rec2 = lc.pointer_entry(
+            "click", x=10, y=20, selector='input[name="email"]',
+            js='document.querySelector("input[name=\\"email\\"]")',
+            is_input=True)
+        self.assertEqual(rec2["selector"], 'input[name="email"]')
+        self.assertTrue(rec2["is_input"])
+        self.assertIn("querySelector", rec2["js"])
+        self.assertIn('input[name="email"]', lc.format_click_log(
+            10, 20, 'input[name="email"]'))
+        hit = lc.sanitize_hit(
+            {"selector": "#x", "js": 'document.querySelector("#x")',
+             "is_input": 1})
+        self.assertEqual(hit["selector"], "#x")
+        self.assertTrue(hit["is_input"])
+        dump = lc.format_pointer_dump([rec2])
+        self.assertIn("selector:", dump)
+        self.assertIn("js:", dump)
 
 
 class TestMouseMovePoints(unittest.TestCase):
@@ -1392,15 +1409,41 @@ class TestPerformLiveAction(unittest.IsolatedAsyncioTestCase):
             async def up(self, button="left"):
                 self.ops.append(("up", self.x, self.y))
 
+        class FakeKeyboard:
+            def __init__(self):
+                self.typed = []
+
+            async def type(self, text, delay=0):
+                self.typed.append(str(text))
+
+            async def press(self, key):
+                self.typed.append("key:" + str(key))
+
         class FakePage:
             def __init__(self):
                 self.mouse = FakeMouse()
+                self.keyboard = FakeKeyboard()
+
+            async def evaluate(self, js, arg=None):
+                return {
+                    "selector": 'input[name="email"]',
+                    "js": 'document.querySelector("input[name=\\"email\\"]")',
+                    "is_input": 1,
+                }
 
         page = FakePage()
         rec = await lc.perform_live_action(page, {"action": "click", "x": 40, "y": 80})
         self.assertEqual(rec["kind"], "click")
         self.assertEqual(rec["x"], 40.0)
         self.assertTrue(any(op[0] == "click" for op in page.mouse.ops))
+        self.assertEqual(rec.get("selector"), 'input[name="email"]')
+        self.assertTrue(rec.get("is_input"))
+
+        page = FakePage()
+        typed = await lc.perform_live_action(
+            page, {"action": "type", "text": "hello"})
+        self.assertEqual(typed["kind"], "type")
+        self.assertEqual(page.keyboard.typed, ["hello"])
 
         page = FakePage()
         rec = await lc.perform_live_action(

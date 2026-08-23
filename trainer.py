@@ -313,6 +313,7 @@ class TrainerEngine:
             self.latest_screenshot = ""
             self.latest_question = ""
             self.latest_challenge = {}
+            self.pointer_log.clear()
             self._add_log("Captured question list cleared.")
             return {"ok": True, "message": "Captured questions cleared"}
 
@@ -350,10 +351,14 @@ class TrainerEngine:
             if len(self.pointer_log) > 40:
                 self.pointer_log = self.pointer_log[-40:]
         if kind == "click":
+            sel = str(entry.get("selector") or "").strip()
+            extra = f" {sel}" if sel else ""
             self._add_log(
                 f"Operator click at ({float(entry.get('x', 0)):.0f},"
-                f"{float(entry.get('y', 0)):.0f})."
+                f"{float(entry.get('y', 0)):.0f}).{extra}"
             )
+            if entry.get("js"):
+                self._add_log(f"Operator js: {entry.get('js')}")
         elif kind == "drag":
             self._add_log(
                 f"Operator drag ({float(entry.get('x1', 0)):.0f},"

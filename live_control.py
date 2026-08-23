@@ -12,6 +12,7 @@ a challenge-iframe screenshot is captured whenever hCaptcha is showing one.
 """
 import asyncio
 import base64
+import json
 import math
 import time
 from typing import Optional
@@ -43,8 +44,10 @@ def parse_xy(action: dict, xkey: str = "x", ykey: str = "y") -> tuple:
     return x, y
 
 
-def format_click_log(x: float, y: float) -> str:
-    return f"click at ({x:.0f}, {y:.0f})"
+def format_click_log(x: float, y: float, selector: str = "") -> str:
+    base = f"click at ({x:.0f}, {y:.0f})"
+    sel = str(selector or "").strip()
+    return f"{base}  {sel}" if sel else base
 
 
 def format_drag_log(x1: float, y1: float, x2: float, y2: float) -> str:
@@ -59,15 +62,180 @@ def is_challenge_frame_url(url: str) -> bool:
     return "hcaptcha-challenge" in u or "frame=challenge" in u
 
 
-def pointer_entry(kind: str, **coords) -> dict:
-    """One logged pointer event (JSON-safe)."""
+def pointer_entry(kind: str, **fields) -> dict:
+    """One logged pointer event (JSON-safe).
+
+    Numeric x/y stay rounded floats. Strings (selector, js) and bools
+    (is_input) are kept so the LIVE field can show what was clicked.
+    """
     out = {"kind": str(kind), "t": time.strftime("%H:%M:%S"), "ts": time.time()}
-    for key, value in coords.items():
-        try:
-            out[key] = round(float(value), 1)
-        except (TypeError, ValueError):
+    for key, value in fields.items():
+        if value is None:
             continue
+        if isinstance(value, bool):
+            out[key] = value
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                out[key] = round(float(value), 1)
+                continue
+            except (TypeError, ValueError):
+                pass
+        text = str(value).strip()
+        if text:
+            out[key] = text[:500]
     return out
+
+
+def sanitize_hit(raw) -> dict:
+    """Keep only the useful fields from a page.evaluate hit describe."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("selector", "js", "click_js", "tag", "type", "name",
+                "text", "src"):
+        val = raw.get(key)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text:
+            out[key] = text[:500]
+    if raw.get("is_input") in (True, 1, "1", "true", "True"):
+        out["is_input"] = True
+    if raw.get("iframe") in (True, 1, "1", "true", "True"):
+        out["iframe"] = True
+    return out
+
+
+def format_hit_field(entry: dict) -> str:
+    """Text for the LIVE 'what I clicked' field."""
+    entry = entry or {}
+    kind = str(entry.get("kind") or "click")
+    lines = []
+    if kind == "drag":
+        lines.append(format_drag_log(
+            entry.get("x1", 0), entry.get("y1", 0),
+            entry.get("x2", 0), entry.get("y2", 0)))
+    else:
+        lines.append(format_click_log(
+            entry.get("x", 0), entry.get("y", 0),
+            entry.get("selector") or ""))
+    if entry.get("selector"):
+        lines.append(f"selector: {entry['selector']}")
+    if entry.get("js"):
+        lines.append(f"js: {entry['js']}")
+    if entry.get("click_js"):
+        lines.append(f"click: {entry['click_js']}")
+    if entry.get("tag"):
+        extra = entry.get("type") or entry.get("name") or ""
+        lines.append(f"tag: {entry['tag']}" + (f" {extra}" if extra else ""))
+    if entry.get("text"):
+        lines.append(f"text: {entry['text']}")
+    return "\n".join(lines)
+
+
+def format_pointer_dump(items) -> str:
+    """Copy-all text: every logged click/drag with selector + js."""
+    rows = []
+    for entry in list(items or []):
+        if not isinstance(entry, dict):
+            continue
+        block = format_hit_field(entry)
+        t = entry.get("t") or ""
+        rows.append(f"{t} {block}".strip() if t else block)
+    return "\n\n".join(rows)
+
+
+# elementFromPoint + a short CSS path. Cross-origin iframes only report
+# the iframe itself (we cannot read into hCaptcha from the parent).
+HIT_AT_JS = r"""([xy]) => {
+    const x = Number(xy && xy[0]), y = Number(xy && xy[1]);
+    const root = document;
+    const el = (root.elementFromPoint && root.elementFromPoint(x, y)) || null;
+    if (!el) return JSON.stringify({});
+    const cssEscape = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const cssPath = (node) => {
+        if (!node || node.nodeType !== 1) return '';
+        if (node.id && /^[A-Za-z][\w-]*$/.test(node.id)
+                && document.querySelectorAll('#' + node.id).length === 1) {
+            return '#' + node.id;
+        }
+        const parts = [];
+        let cur = node;
+        while (cur && cur.nodeType === 1 && cur !== document.documentElement
+                && parts.length < 6) {
+            let part = (cur.tagName || '').toLowerCase();
+            if (cur.id && /^[A-Za-z][\w-]*$/.test(cur.id)) {
+                parts.unshift(part + '#' + cur.id);
+                break;
+            }
+            const name = cur.getAttribute && cur.getAttribute('name');
+            const aria = cur.getAttribute && cur.getAttribute('aria-label');
+            const typ = cur.getAttribute && cur.getAttribute('type');
+            if (name) part += '[name="' + cssEscape(name) + '"]';
+            else if (aria) part += '[aria-label="' + cssEscape(aria).slice(0, 40) + '"]';
+            else if (typ) part += '[type="' + cssEscape(typ) + '"]';
+            else if (cur.classList && cur.classList.length) {
+                const cls = [];
+                for (let i = 0; i < cur.classList.length && cls.length < 2; i++) {
+                    const c = cur.classList[i];
+                    if (c && !c.includes(':') && !c.startsWith('_') && /^[A-Za-z][\w-]*$/.test(c))
+                        cls.push(c);
+                }
+                if (cls.length) part += '.' + cls.join('.');
+            }
+            const parent = cur.parentElement;
+            if (parent) {
+                const same = [];
+                for (let i = 0; i < parent.children.length; i++) {
+                    if (parent.children[i].tagName === cur.tagName) same.push(parent.children[i]);
+                }
+                if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+            }
+            parts.unshift(part);
+            cur = parent;
+        }
+        return parts.join(' > ');
+    };
+    const sel = cssPath(el);
+    const tag = (el.tagName || '').toLowerCase();
+    const typ = (el.getAttribute && el.getAttribute('type')) || el.type || '';
+    const name = (el.getAttribute && el.getAttribute('name')) || el.name || '';
+    const text = String((el.innerText || el.value || el.getAttribute && el.getAttribute('aria-label') || '') || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 80);
+    const isInput = !!(el.matches && el.matches(
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]'));
+    const js = sel ? ('document.querySelector(' + JSON.stringify(sel) + ')') : '';
+    return JSON.stringify({
+        selector: sel,
+        js: js,
+        click_js: js ? (js + ' && ' + js + '.click()') : '',
+        tag: tag,
+        type: typ,
+        name: name,
+        text: text,
+        src: (tag === 'iframe' && el.src) ? String(el.src).slice(0, 180) : '',
+        is_input: isInput ? 1 : 0,
+        iframe: tag === 'iframe' ? 1 : 0
+    });
+}"""
+
+
+async def describe_element_at(page, x: float, y: float) -> dict:
+    """CSS selector + JS snippet for the node under page-space (x, y)."""
+    if page is None:
+        return {}
+    try:
+        raw = await asyncio.wait_for(
+            page.evaluate(HIT_AT_JS, [float(x), float(y)]), timeout=3.0)
+    except Exception:
+        return {}
+    return sanitize_hit(raw)
 
 
 def _record_pointer(bot, entry: dict) -> None:
@@ -488,7 +656,11 @@ async def perform_live_action(page, action: dict) -> dict:
     if kind == "click":
         x, y = parse_xy(action)
         await _live_click(page, x, y)
-        return pointer_entry("click", x=x, y=y)
+        rec = pointer_entry("click", x=x, y=y)
+        hit = await describe_element_at(page, x, y)
+        if hit:
+            rec.update(hit)
+        return rec
     if kind == "drag":
         x1, y1 = parse_xy(action, "x1", "y1")
         if "x1" not in action and "x" in action:
@@ -548,7 +720,10 @@ async def live_action(bot, action: dict) -> dict:
         _record_pointer(bot, rec)
         _push_trainer_pointer(rec)
         if rec.get("kind") == "click":
-            _live_log(bot, format_click_log(rec.get("x", 0), rec.get("y", 0)))
+            _live_log(bot, format_click_log(
+                rec.get("x", 0), rec.get("y", 0), rec.get("selector") or ""))
+            if rec.get("js"):
+                _live_log(bot, f"js {rec.get('js')}")
         elif rec.get("kind") == "drag":
             _live_log(bot, format_drag_log(
                 rec.get("x1", 0), rec.get("y1", 0),

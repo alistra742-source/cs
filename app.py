@@ -2188,7 +2188,7 @@ function refreshTrainer(){
         }else{
           ptr.textContent = items.slice(-6).map(function(p){
             var t = p.t ? p.t + ' ' : '';
-            if(p.kind === 'click') return t + 'click ' + Math.round(p.x||0) + ', ' + Math.round(p.y||0);
+            if(p.kind === 'click') return t + 'click ' + Math.round(p.x||0) + ', ' + Math.round(p.y||0) + (p.selector ? ' ' + p.selector : '');
             if(p.kind === 'drag') return t + 'drag ' + Math.round(p.x1||0) + ',' + Math.round(p.y1||0) + ' -> ' + Math.round(p.x2||0) + ',' + Math.round(p.y2||0);
             return t + (p.kind || '');
           }).join('  |  ');
