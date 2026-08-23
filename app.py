@@ -1771,7 +1771,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
         </div>
         <div class="trainer-ss-box">
           <div id="trainerPlaceholder" class="trainer-ph">
-            Start the real demo runner.<br>The challenge iframe screenshot will appear here.
+            Start the real demo runner.<br>A live Chrome screenshot refreshes here every 3 seconds.
           </div>
           <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
         </div>
@@ -2168,7 +2168,7 @@ function refreshTrainer(){
       var ph = $('trainerPlaceholder');
       var btnCopyLatest = $('btnCopyLatest');
       if(s.latest_screenshot){
-        img.src = s.latest_screenshot;
+        if(img.src !== s.latest_screenshot) img.src = s.latest_screenshot;
         img.style.display = 'block';
         if(ph) ph.style.display = 'none';
         if(btnCopyLatest) btnCopyLatest.style.display = 'inline-block';
@@ -2196,7 +2196,7 @@ setInterval(function(){
   if(tabTrainer && !tabTrainer.classList.contains('hide')){
     refreshTrainer();
   }
-}, 1800);
+}, 3000);
 </script>
 </body></html>
 '''

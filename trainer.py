@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # This is hCaptcha's public demo page, not a locally rendered approximation.
 TARGET_DEMO_URL = "https://accounts.hcaptcha.com/demo"
+# How often the dashboard challenge pane gets a fresh Chrome frame.
+SCREENSHOT_INTERVAL_S = 3.0
 
 # The demo currently exposes one optional text field, but these fallbacks make
 # the runner tolerant of harmless markup changes on the official page.
@@ -323,6 +325,7 @@ class TrainerEngine:
                 "logs": list(self.logs[-20:]),
                 "target_url": TARGET_DEMO_URL,
                 "human_in_the_loop": True,
+                "screenshot_interval": SCREENSHOT_INTERVAL_S,
             }
 
     # ── Browser helpers ───────────────────────────────────────────────────
@@ -577,6 +580,44 @@ class TrainerEngine:
             image = "data:image/png;base64," + base64.b64encode(shot).decode("ascii")
         return image, question, full_text
 
+    async def _grab_demo_png(self, page) -> bytes:
+        """Prefer the challenge iframe; fall back to the whole demo tab."""
+        if page is None:
+            return b""
+        iframe, frame = await self._find_frame(page, CHALLENGE_IFRAME_SELECTOR)
+        for target in (iframe, frame, page):
+            if target is None:
+                continue
+            try:
+                shot = await target.screenshot(timeout=8000)
+                if shot:
+                    return shot
+            except Exception:
+                continue
+        return b""
+
+    def _store_screenshot(self, png: bytes) -> None:
+        if not png:
+            return
+        image = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        with self._lock:
+            self.latest_screenshot = image
+
+    async def _publish_live_frame(self, page) -> None:
+        """Push one real Chrome frame into the trainer pane."""
+        try:
+            self._store_screenshot(await self._grab_demo_png(page))
+        except Exception:
+            return
+
+    async def _screenshot_loop(self, page) -> None:
+        """Keep the trainer screenshot fresh every 3 seconds."""
+        while not self._stopped():
+            await self._publish_live_frame(page)
+            deadline = time.monotonic() + SCREENSHOT_INTERVAL_S
+            while time.monotonic() < deadline and not self._stopped():
+                await asyncio.sleep(0.2)
+
     async def _record_challenge(self, image: str, question: str, full_text: str) -> None:
         with self._lock:
             q_id = len(self.questions) + 1
@@ -703,8 +744,14 @@ class TrainerEngine:
 
     async def _run_attached_async(self) -> None:
         """Run cycles on the app-owned page without closing its browser."""
+        shot_task = None
         try:
             self._add_log("Shared LIVE browser is ready for the official demo.")
+            if self._page is not None:
+                shot_task = asyncio.create_task(
+                    self._screenshot_loop(self._page),
+                    name="hcaptcha-demo-screenshots",
+                )
             while not self._stopped():
                 result = await self._do_real_cycle()
                 if self._one_shot or result == "stopped":
@@ -716,6 +763,12 @@ class TrainerEngine:
             self._add_log(f"Attached demo runner error: {type(exc).__name__}: {exc}")
             self._set_state("error", "Live demo runner stopped; see logs.")
         finally:
+            if shot_task is not None:
+                shot_task.cancel()
+                try:
+                    await shot_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             with self._lock:
                 self.running = False
                 self._external_page = None
@@ -759,6 +812,12 @@ class TrainerEngine:
             self._add_log(f"Live demo runner error: {type(exc).__name__}: {exc}")
             self._set_state("error", "Live demo runner stopped because Chrome failed; see logs.")
         finally:
+            if shot_task is not None:
+                shot_task.cancel()
+                try:
+                    await shot_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             try:
                 if self._context is not None:
                     await self._context.close()
