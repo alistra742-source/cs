@@ -1708,7 +1708,7 @@ class DiscordAutomation:
         # firefox launch — a proxy passed later to new_context() would be
         # rejected and traffic would go direct.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
         self._browser = await self._playwright.chromium.launch(
@@ -1744,6 +1744,9 @@ class DiscordAutomation:
             host_ip = await asyncio.to_thread(self._resolve_proxy_ip, p.get("host", ""))
             ip_part = f" IP={host_ip}," if host_ip else ""
             self._log(f"Proxy: {server} ({ip_part} auth={'yes' if p.get('username') else 'no'})")
+        elif getattr(self, "_direct", False):
+            self._tor_enabled = False
+            self._log("[Proxy] Direct connection - no proxy")
         elif _tor_check():
             self._tor_enabled = True
             self._log("[TOR] Using TOR SOCKS5 proxy...")
@@ -1753,8 +1756,6 @@ class DiscordAutomation:
             # context-level proxy would be rejected when the browser was
             # launched with one.
             await asyncio.sleep(1)
-        elif getattr(self, "_direct", False):
-            self._log("[Proxy] Direct connection - no proxy and TOR unavailable")
         else:
             self._log("[TOR] [FATAL] TOR SOCKS5 (127.0.0.1:9050) NOT reachable - TOR-only mode requires TOR running on this instance", level="error")
             self._tor_enabled = False

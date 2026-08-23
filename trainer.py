@@ -1,582 +1,803 @@
-"""
-trainer.py — hCaptcha Challenge Harvester & Demo Modal Engine.
+"""Live hCaptcha demo runner.
 
-Automates navigating to the hCaptcha demo form (e.g. Google / accounts.hcaptcha.com demo),
-autofilling form fields instantly with 1-2 words, triggering the hCaptcha checkbox/modal,
-handling instant pass / bypass token loops (re-running until a challenge modal appears),
-capturing screenshots of the challenge modal ONLY, extracting the prompt questions into
-a numbered list with copy-to-clipboard functionality, and continuously looping/farming.
+This module deliberately does *not* manufacture challenges, issue tokens, or
+solve CAPTCHA challenges.  It drives the official hCaptcha demo in a real
+Chrome tab, fills its optional sample field, clicks the real checkbox, and
+then pauses when hCaptcha asks for a human.  The actual challenge iframe is
+captured and its visible prompt is copied into the dashboard so an operator
+can inspect it and complete the check manually.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import io
-import os
 import random
+import re
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
 
-import hcaptcha_types as hct
-import make_challenges as mc
-import make_dataset as md
-import realdata
-
-# ── 1-2 Word Form Generators ──
-
-FIRST_NAMES = [
-    "Alex", "Jordan", "Taylor", "Morgan", "Sam", "Chris", "Riley", "Casey",
-    "Logan", "Avery", "Jamie", "Dakota", "Reese", "Skyler", "Jesse", "Rowan",
-    "Devon", "Harper", "Finley", "Kai", "Sage", "River", "Emerson", "Peyton"
-]
-
-LAST_NAMES = [
-    "Vance", "Frost", "Sterling", "Cross", "Stone", "Hayes", "Drake", "Rivers",
-    "Mercer", "Black", "Fox", "Ray", "Knight", "Cole", "Shaw", "Rowe", "Winter",
-    "Vaughn", "Holt", "Nash", "Gage", "Knox", "Chase", "Graves", "Steele"
-]
-
-COMMENTS_POOL = [
-    "Hello demo", "Quick test", "Matrix token", "Submit verify", "System check",
-    "Alpha test", "Beta build", "Speed run", "Data harvest", "Human check",
-    "Fast verify", "Form submit", "Ready now", "Live demo", "Green signal",
-    "Next round", "Solver sync", "Input words", "Task done", "Echo stream"
-]
-
+# This is hCaptcha's public demo page, not a locally rendered approximation.
 TARGET_DEMO_URL = "https://accounts.hcaptcha.com/demo"
 
+# The demo currently exposes one optional text field, but these fallbacks make
+# the runner tolerant of harmless markup changes on the official page.
+FORM_FIELD_SELECTORS = (
+    'input[type="text"]',
+    'input:not([type])',
+    'textarea',
+)
+WIDGET_IFRAME_SELECTOR = (
+    'iframe[title*="hCaptcha"], '
+    'iframe[src*="hcaptcha.com"]'
+)
+CHALLENGE_IFRAME_SELECTOR = (
+    'iframe[title*="hCaptcha challenge"], '
+    'iframe[src*="hcaptcha-challenge"]'
+)
+CHECKBOX_SELECTOR = (
+    '#checkbox',
+    '[role="checkbox"]',
+    '.checkbox',
+    '[aria-checked]',
+    'input[type="checkbox"]',
+)
 
-def generate_form_words() -> Dict[str, str]:
-    """Generate 1-2 words for each form input."""
-    name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
-    slug = name.lower().replace(" ", ".")
-    email = f"{slug}@demo-test.io"
-    comment = random.choice(COMMENTS_POOL)
+FIRST_NAMES = (
+    "Alex", "Jordan", "Taylor", "Morgan", "Sam", "Chris", "Riley",
+    "Casey", "Logan", "Avery", "Jamie", "Dakota", "Reese", "Skyler",
+)
+LAST_NAMES = (
+    "Vance", "Frost", "Sterling", "Cross", "Stone", "Hayes", "Drake",
+    "Rivers", "Mercer", "Black", "Fox", "Ray", "Knight", "Cole",
+)
+COMMENTS = (
+    "Quick test", "Demo check", "Form test", "Live sample", "Hello demo",
+    "Short note", "Ready now", "Browser check",
+)
+
+
+def generate_form_words(rng: Optional[random.Random] = None) -> Dict[str, str]:
+    """Return short, non-sensitive values for the demo's optional field.
+
+    ``page.locator(...).fill`` inserts the value in one operation; no local
+    form is rendered in the dashboard and no account or token is generated.
+    """
+    rng = rng or random
+    name = f"{rng.choice(FIRST_NAMES)} {rng.choice(LAST_NAMES)}"
+    sample = rng.choice(COMMENTS)
     return {
         "name": name,
-        "email": email,
-        "comment": comment,
+        "email": "",
+        "comment": sample,
+        "field": sample,
         "url": TARGET_DEMO_URL,
     }
 
 
-# ── Challenge Question Formatter ──
-
-def pluralize(word: str) -> str:
-    """Pluralize object word for 'Select all X' phrasing."""
-    w = word.strip().replace("_", " ")
-    if w.endswith("s") or w.endswith("sh") or w.endswith("ch") or w.endswith("x") or w.endswith("z"):
-        return w + "es"
-    if w.endswith("y") and len(w) > 1 and w[-2] not in "aeiou":
-        return w[:-1] + "ies"
-    return w + "s"
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def format_challenge_question(challenge_type: str, meta: dict) -> Tuple[str, str]:
+def _question_from_text(text: str) -> str:
+    """Pick the visible instruction from an hCaptcha frame's text.
+
+    hCaptcha localizes and changes its markup, so this intentionally uses
+    wording rather than a brittle class name.  The complete frame text is
+    retained separately for debugging/display when no instruction line is
+    identifiable.
     """
-    Returns (short_question, full_prompt).
-    e.g. ("Select all cups", "Please click each image containing a cup")
-    """
-    prompt = meta.get("prompt", "")
-    
-    if challenge_type in ("grid", "affordance"):
-        if meta.get("affordance"):
-            ref = meta.get("reference", "tool")
-            short = f"Select items usable with {ref.replace('_', ' ')}"
-            return short, prompt or f"Please click each image you can use the item shown on"
-        
-        target = meta.get("target")
-        if not target and "tiles" in meta:
-            # Look at positive tiles if available
-            correct_indices = meta.get("correct", [])
-            tiles = meta.get("tiles", [])
-            if correct_indices and len(tiles) >= correct_indices[0]:
-                target = tiles[correct_indices[0] - 1]
-            elif tiles:
-                target = tiles[0]
-            else:
-                target = "object"
-        
-        target_clean = str(target).replace("_", " ")
-        short = f"Select all {pluralize(target_clean)}"
-        full = prompt or f"Please click each image containing a {target_clean}"
-        return short, full
-        
-    elif challenge_type == "point":
-        target = meta.get("target", "object")
-        target_clean = str(target).replace("_", " ")
-        if meta.get("relational"):
-            short = prompt.replace("Please click on ", "Click ").rstrip(".")
-            return short, prompt
-        else:
-            short = f"Click on the {target_clean}"
-            return short, prompt or f"Please click on the {target_clean}"
-            
-    elif challenge_type == "count":
-        target = meta.get("target", "objects")
-        target_clean = str(target).replace("_", " ")
-        short = f"Count the {pluralize(target_clean)}"
-        return short, prompt or f"How many {pluralize(target_clean)} are in this image?"
-        
-    elif challenge_type == "drag":
-        shape = meta.get("shape", "puzzle piece")
-        short = f"Drag the {shape} into the slot"
-        return short, prompt or "Please drag the element to the place where it fits"
-        
-    elif challenge_type == "pattern":
-        short = "Complete the animal pattern"
-        return short, prompt or "Put one of the animals into the empty spot to complete the pattern"
-        
-    return "Please complete the challenge", prompt or "Please complete the challenge"
+    raw = str(text or "")
+    compact = _clean_text(raw)
+    if not compact:
+        return ""
+    parts = [
+        _clean_text(p) for p in re.split(r"(?<=[.!?])\s+|\n+", raw)
+        if _clean_text(p)
+    ]
+    instruction = re.compile(
+        r"\b(select|click|choose|pick|mark|check|tap|identify|selecte|wählen|wähle|"
+        r"seleccione|selecciona|cliquez|choisissez|画像|画像を|選択|выберите|выбери|"
+        r"请|点击|เลือก|chọn)\b",
+        re.IGNORECASE,
+    )
+    # A body-only read can flatten a short set of chrome labels into one
+    # string. Do not mistake that chrome for the challenge question.
+    chrome_only = re.compile(
+        r"^(?:h?captcha|verify|privacy|terms|audio|accessibility|reload|next|"
+        r"please try again|i am human|english|en)(?:\s+(?:h?captcha|verify|privacy|"
+        r"terms|audio|accessibility|reload|next|please try again|i am human|english|en))*$",
+        re.IGNORECASE,
+    )
+    for part in parts:
+        if len(part) >= 8 and instruction.search(part) and not chrome_only.fullmatch(part):
+            return part[:500]
+    for part in parts:
+        if len(part) >= 8 and not chrome_only.fullmatch(part):
+            return part[:500]
+    if chrome_only.fullmatch(compact):
+        return ""
+    return compact[:500]
 
-
-# ── Challenge Modal ONLY Renderer ──
-
-def _load_fonts():
-    """Load standard fonts with graceful fallback."""
-    fonts = {}
-    try:
-        fonts["title_bold"] = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
-        fonts["h1_bold"] = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-        fonts["body"] = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-        fonts["tiny"] = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-        fonts["tiny_bold"] = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
-    except Exception:
-        d = ImageFont.load_default()
-        fonts = {"title_bold": d, "h1_bold": d, "body": d, "tiny": d, "tiny_bold": d}
-    return fonts
-
-
-def render_challenge_modal_screenshot(challenge_type: str, meta: dict, img: Image.Image) -> Tuple[str, Image.Image]:
-    """
-    Renders an authentic, pixel-perfect screenshot of the hCaptcha challenge MODAL ONLY.
-    Returns (base64_png_data_url, PIL_Image).
-    """
-    W, H = 410, 560
-    modal = Image.new("RGB", (W, H), color="#191a24")
-    draw = ImageDraw.Draw(modal)
-    fonts = _load_fonts()
-    
-    # Outer crisp modal border and subtle header accent
-    draw.rectangle([0, 0, W - 1, H - 1], outline="#2d3042", width=2)
-    
-    # ── Top Instruction Banner ──
-    banner_h = 88
-    draw.rounded_rectangle([12, 12, W - 12, 12 + banner_h], radius=7, fill="#232635", outline="#34384e", width=1)
-    
-    # hCaptcha badge / header
-    draw.text((22, 18), "hCaptcha challenge", fill="#34d399", font=fonts["tiny_bold"])
-    
-    # Formatted prompt
-    short_q, full_prompt = format_challenge_question(challenge_type, meta)
-    
-    # Display prompt prominently
-    p_text = full_prompt if len(full_prompt) <= 46 else short_q
-    draw.text((22, 34), p_text[:48], fill="#ffffff", font=fonts["h1_bold"])
-    if len(p_text) > 48:
-        draw.text((22, 54), p_text[48:92], fill="#ffffff", font=fonts["h1_bold"])
-        draw.text((22, 74), "Click verify once there are none left", fill="#9ca3af", font=fonts["body"])
-    else:
-        draw.text((22, 56), "Click verify once there are none left", fill="#9ca3af", font=fonts["body"])
-        draw.text((22, 74), f"Type: {challenge_type.upper()}", fill="#64748b", font=fonts["tiny"])
-
-    # Reference / sample icon thumbnail in top-right
-    ref_img = meta.get("reference_image")
-    if ref_img is not None:
-        try:
-            ref_thumb = ref_img.resize((52, 52), Image.Resampling.LANCZOS)
-            modal.paste(ref_thumb, (W - 74, 24))
-            draw.rectangle([W - 74, 24, W - 22, 76], outline="#34d399", width=2)
-        except Exception:
-            pass
-    elif challenge_type == "grid":
-        # Draw a mini sample tile icon
-        draw.rounded_rectangle([W - 68, 26, W - 22, 72], radius=4, fill="#1c1f2b", outline="#3b4259", width=1)
-        draw.text((W - 56, 42), "🔍", fill="#94a3b8", font=fonts["title_bold"])
-
-    # ── Challenge Content Area ──
-    content_y = 110
-    content_w = W - 24
-    content_h = 380
-    
-    # Scaled fit of challenge image into modal
-    c_w, c_h = img.size
-    scale = min(content_w / c_w, content_h / c_h)
-    new_w, new_h = max(10, int(c_w * scale)), max(10, int(c_h * scale))
-    scaled_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    pos_x = 12 + (content_w - new_w) // 2
-    pos_y = content_y + (content_h - new_h) // 2
-    
-    # Background frame for content
-    draw.rounded_rectangle([12, content_y, W - 12, content_y + content_h], radius=6, fill="#111218", outline="#242634", width=1)
-    modal.paste(scaled_img, (pos_x, pos_y))
-    
-    # ── Bottom Action Footer ──
-    footer_y = H - 54
-    draw.line([12, footer_y, W - 12, footer_y], fill="#272a3b", width=1)
-    
-    # Left action icon buttons (Refresh, Info, Audio)
-    draw.text((22, footer_y + 12), "🔄   ℹ️   🎧", fill="#8a8a92", font=fonts["title_bold"])
-    
-    # Right action button (VERIFY / NEXT)
-    btn_text = "NEXT" if challenge_type in ("drag", "pattern") else "VERIFY"
-    draw.rounded_rectangle([W - 110, footer_y + 8, W - 16, footer_y + 44], radius=6, fill="#059669", outline="#34d399", width=1)
-    draw.text((W - 88, footer_y + 18), btn_text, fill="#ffffff", font=fonts["title_bold"])
-    
-    # Bottom brand footer
-    draw.text((W // 2 - 48, H - 12), "hCaptcha · Privacy · Terms", fill="#475569", font=fonts["tiny"])
-
-    # Output PNG Base64
-    buf = io.BytesIO()
-    modal.save(buf, format="PNG", optimize=True)
-    png_bytes = buf.getvalue()
-    b64_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-    
-    return b64_url, modal
-
-
-# ── Challenge Round Factory ──
-
-def make_random_challenge(rng: Optional[random.Random] = None) -> Tuple[str, dict, Image.Image]:
-    """Generates a random multi-family challenge and returns (type, meta, image)."""
-    rng = rng or random.Random()
-    weights = [0.45, 0.15, 0.15, 0.10, 0.10, 0.05]
-    types = ["grid", "point", "drag", "count", "pattern", "affordance"]
-    c_type = rng.choices(types, weights=weights)[0]
-    
-    if c_type in ("grid", "affordance"):
-        img, meta = mc.make_grid_round(rng, size=108)
-        c_type = "affordance" if meta.get("affordance") else "grid"
-    elif c_type == "point":
-        img, meta = mc.make_point_round(rng, size=340)
-    elif c_type == "drag":
-        img, meta = mc.make_drag_round(rng, size=340)
-    elif c_type == "count":
-        img, meta = mc.make_count_round(rng, size=340)
-    elif c_type == "pattern":
-        img, meta = mc.make_pattern_round(rng, size=340)
-    else:
-        img, meta = mc.make_grid_round(rng, size=108)
-        c_type = "grid"
-        
-    return c_type, meta, img
-
-
-def generate_interactive_challenge(rng: Optional[random.Random] = None) -> dict:
-    """Generates an interactive 3x3 grid challenge for manual/auto solving in the UI."""
-    rng = rng or random.Random()
-    grid_img, meta = mc.make_grid_round(rng, size=100)
-    tiles_data = []
-    
-    names = meta.get("tiles", [])
-    correct_indices = set(meta.get("correct", []))  # 1-based
-    boxes = meta.get("tile_boxes", [])
-    
-    for i, (name, box) in enumerate(zip(names, boxes)):
-        x, y, w, h = box
-        tile_crop = grid_img.crop((x, y, x + w, y + h))
-        buf = io.BytesIO()
-        tile_crop.save(buf, format="PNG")
-        t_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-        tiles_data.append({
-            "index": i,
-            "name": name,
-            "image": t_b64,
-            "is_target": (i + 1) in correct_indices,
-        })
-        
-    short_q, full_prompt = format_challenge_question("grid", meta)
-    
-    ref_b64 = ""
-    if meta.get("reference_image") is not None:
-        buf = io.BytesIO()
-        meta["reference_image"].save(buf, format="PNG")
-        ref_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-        
-    return {
-        "id": f"int-{random.randint(10000, 99999)}",
-        "type": "grid",
-        "prompt": full_prompt,
-        "short_question": short_q,
-        "tiles": tiles_data,
-        "correct_indices": list(correct_indices),
-        "reference_image": ref_b64,
-    }
-
-
-# ── Trainer Engine (Background Farming Worker & State) ──
 
 class TrainerEngine:
-    """
-    Manages the Trainer tab background loop:
-      1. Auto goes to hCaptcha demo site (Google/hCaptcha demo).
-      2. Fills form instantly with 1-2 words.
-      3. Clicks the hCaptcha checkbox widget.
-      4. If token received without challenge (instant bypass) -> re-navigates demo site.
-      5. Once challenge modal loads -> takes screenshot of MODAL ONLY.
-      6. Adds challenge question to numbered list (with copy button support).
-      7. Loops continuously farming challenges!
-    """
+    """Run the real official demo in a human-in-the-loop browser session."""
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self.running: bool = False
+        self._lock = threading.RLock()
+        self.running = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        
-        # Timing / speed (delay between farming steps in seconds)
-        self.speed: float = 2.0
-        
-        # State
-        self.current_stage: str = "idle"  # idle, navigating, filling_form, clicking_checkbox, instant_pass, challenge_loaded, captured
-        self.status_text: str = "Trainer ready. Click START FARMING to begin."
+        self._one_shot = False
+        self.speed = 2.0
+        self.headless = True
+
+        self.current_stage = "idle"
+        self.status_text = "Ready. Start the real hCaptcha demo runner."
         self.current_form: Dict[str, str] = {
             "name": "",
             "email": "",
             "comment": "",
+            "field": "",
             "url": TARGET_DEMO_URL,
         }
-        
-        # Stats
-        self.farmed_count: int = 0
-        self.pass_count: int = 0
-        self.total_cycles: int = 0
+
+        self.captured_count = 0
+        self.pass_count = 0
+        self.total_cycles = 0
         self.start_time: Optional[float] = None
-        
-        # Latest Harvested Challenge
-        self.latest_challenge: Dict = {}
-        self.latest_screenshot: str = ""
-        self.latest_question: str = ""
-        
-        # Current active interactive challenge
-        self.current_interactive: Optional[dict] = None
-        
-        # Questions List: [{"id": 1, "question": "Select all cups", "full_prompt": "...", "type": "GRID", "time": "12:00:00"}]
-        self.questions: List[Dict] = []
-        
-        # Recent activity log
+
+        self.latest_challenge: Dict[str, Any] = {}
+        self.latest_screenshot = ""
+        self.latest_question = ""
+        self.questions: List[Dict[str, Any]] = []
         self.logs: List[str] = []
-        self._add_log("Trainer engine initialized.")
 
-    def _add_log(self, msg: str):
-        t_str = time.strftime("%H:%M:%S")
-        entry = f"[{t_str}] {msg}"
-        self.logs.append(entry)
-        if len(self.logs) > 60:
-            self.logs = self.logs[-50:]
+        # Owned by the runner thread/event loop.  They are kept here only so
+        # shutdown is observable and no second browser is spawned by a second
+        # START click.
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._external_task = None
+        self._external_page = None
+        self._add_log("Live demo runner initialized; synthetic challenges disabled.")
 
-    def start(self, speed: float = 2.0) -> dict:
-        """Start the background farming loop."""
+    # ── State/log helpers ────────────────────────────────────────────────
+
+    def _add_log(self, msg: str) -> None:
+        entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
         with self._lock:
-            if self.running:
-                return {"ok": True, "message": "Trainer already running"}
-            
+            self.logs.append(entry)
+            if len(self.logs) > 80:
+                self.logs = self.logs[-60:]
+
+    def _set_state(self, stage: str, text: str) -> None:
+        with self._lock:
+            self.current_stage = stage
+            self.status_text = text
+
+    def _stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    # ── Public lifecycle ─────────────────────────────────────────────────
+
+    def start(self, speed: float = 2.0, headless: Optional[bool] = None) -> dict:
+        """Start the live browser loop.
+
+        The loop stops at a real challenge and waits for the human to finish
+        it.  It never fabricates a prompt or treats a generated value as an
+        hCaptcha token.
+        """
+        with self._lock:
+            if self.running or (self._thread and self._thread.is_alive()):
+                return {"ok": True, "message": "Live demo runner already running or stopping"}
+            if self._external_task and not self._external_task.done():
+                return {"ok": True, "message": "Live demo runner already running or stopping"}
             self.speed = max(0.5, float(speed))
+            if headless is not None:
+                self.headless = bool(headless)
             self.running = True
+            self._one_shot = False
             self._stop_event.clear()
             if self.start_time is None:
                 self.start_time = time.time()
-                
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread = threading.Thread(
+                target=self._thread_entry,
+                name="hcaptcha-demo-runner",
+                daemon=True,
+            )
             self._thread.start()
-            self._add_log(f"Started challenge farming loop (speed={self.speed}s).")
-            return {"ok": True, "message": f"Trainer farming started ({self.speed}s interval)"}
+            self._add_log(
+                f"Started real Chrome runner for {TARGET_DEMO_URL} "
+                f"(poll delay={self.speed:.1f}s)."
+            )
+            return {"ok": True, "message": "Real hCaptcha demo runner started"}
+
+    def step(self, headless: Optional[bool] = None) -> dict:
+        """Queue one real demo cycle without starting a continuous loop."""
+        with self._lock:
+            if (self.running or (self._thread and self._thread.is_alive())
+                    or (self._external_task and not self._external_task.done())):
+                return {"ok": False, "message": "Runner already running or stopping"}
+            self.speed = max(0.5, self.speed)
+            if headless is not None:
+                self.headless = bool(headless)
+            self.running = True
+            self._one_shot = True
+            self._stop_event.clear()
+            if self.start_time is None:
+                self.start_time = time.time()
+            self._thread = threading.Thread(
+                target=self._thread_entry,
+                name="hcaptcha-demo-step",
+                daemon=True,
+            )
+            self._thread.start()
+            self._add_log("Queued one real hCaptcha demo cycle.")
+            return {"ok": True, "message": "Real demo cycle queued"}
+
+    def start_external(self, page, speed: float = 2.0,
+                       one_shot: bool = False) -> dict:
+        """Run against the app's live page so the operator can take over.
+
+        The Flask app already exposes the shared B1 browser through its LIVE
+        camera/action controls.  Reusing that page keeps the real challenge
+        visible and avoids launching a second hidden browser session.
+        This method must be called from the page's asyncio event loop.
+        """
+        if page is None:
+            return {"ok": False, "message": "Live browser page is not available"}
+        with self._lock:
+            if (self.running or (self._thread and self._thread.is_alive())
+                    or (self._external_task and not self._external_task.done())):
+                return {"ok": False, "message": "Runner already running or stopping"}
+            self.speed = max(0.5, float(speed))
+            self.running = True
+            self._one_shot = bool(one_shot)
+            self._stop_event.clear()
+            self._external_page = page
+            self._page = page
+            if self.start_time is None:
+                self.start_time = time.time()
+            self._external_task = asyncio.create_task(
+                self._run_attached_async(), name="hcaptcha-demo-attached-runner"
+            )
+            self._add_log("Attached runner to the shared LIVE browser page.")
+            return {"ok": True, "message": "Real demo runner attached to LIVE browser"}
+
+    def is_busy(self) -> bool:
+        with self._lock:
+            return bool(
+                self.running
+                or (self._thread and self._thread.is_alive())
+                or (self._external_task and not self._external_task.done())
+            )
+
+    def set_speed(self, speed: float) -> dict:
+        with self._lock:
+            self.speed = max(0.5, float(speed))
+            return {"ok": True, "speed": self.speed}
 
     def stop(self) -> dict:
-        """Stop/pause the farming loop."""
         with self._lock:
             if not self.running:
-                return {"ok": True, "message": "Trainer already stopped"}
-            
+                return {"ok": True, "message": "Live demo runner already stopped"}
             self.running = False
             self._stop_event.set()
             self.current_stage = "idle"
-            self.status_text = "Trainer paused."
-            self._add_log("Trainer farming stopped by user.")
-            return {"ok": True, "message": "Trainer farming stopped"}
-
-    def step(self) -> dict:
-        """Execute a single farming cycle on demand."""
-        return self._do_single_farm_cycle(force_challenge=True)
+            self.status_text = "Runner stopped."
+            self._add_log("Live demo runner stopped by user.")
+            return {"ok": True, "message": "Live demo runner stopped"}
 
     def clear(self) -> dict:
-        """Clear farmed questions and reset counters."""
         with self._lock:
             self.questions.clear()
-            self.farmed_count = 0
+            self.captured_count = 0
             self.pass_count = 0
             self.total_cycles = 0
             self.latest_screenshot = ""
             self.latest_question = ""
             self.latest_challenge = {}
-            self._add_log("Farmed questions list cleared.")
-            return {"ok": True, "message": "Questions list cleared"}
-
-    def get_new_interactive(self) -> dict:
-        """Creates a new interactive challenge for the on-screen modal."""
-        with self._lock:
-            self.current_interactive = generate_interactive_challenge()
-            return self.current_interactive
-
-    def verify_interactive(self, selected_indices: List[int]) -> dict:
-        """Verifies solution for current interactive challenge."""
-        with self._lock:
-            if not self.current_interactive:
-                return {"ok": False, "msg": "No active challenge"}
-            
-            # selected_indices is 0-based array from frontend
-            correct_1based = set(self.current_interactive.get("correct_indices", []))
-            selected_1based = set(i + 1 for i in selected_indices)
-            
-            passed = (correct_1based == selected_1based)
-            token = f"P1_{base64.b64encode(os.urandom(32)).decode('ascii')[:48]}" if passed else ""
-            
-            if passed:
-                self._add_log(f"Interactive challenge solved! Token: {token[:16]}...")
-            else:
-                self._add_log("Interactive challenge solution incorrect.")
-                
-            return {
-                "ok": True,
-                "passed": passed,
-                "token": token,
-                "expected": list(correct_1based),
-                "selected": list(selected_1based),
-            }
-
-    def _do_single_farm_cycle(self, force_challenge: bool = False) -> dict:
-        """
-        Executes one full farming cycle:
-          1. Navigate to demo site
-          2. Fill form instantly with 1-2 words
-          3. Click checkbox
-          4. Check if token returned without challenge -> retry
-          5. Challenge modal appears -> take modal ONLY screenshot -> extract question -> add to list
-        """
-        self.total_cycles += 1
-        
-        # 1. Navigating
-        self.current_stage = "navigating"
-        self.status_text = "Navigating to hCaptcha demo site (Google/Demo)..."
-        time.sleep(0.25)
-        if self._stop_event.is_set():
-            return {"ok": False, "msg": "stopped"}
-
-        # 2. Autofill form with 1-2 words
-        self.current_stage = "filling_form"
-        form_data = generate_form_words()
-        self.current_form = form_data
-        self.status_text = f"Autofilled form: Name='{form_data['name']}', Words='{form_data['comment']}'"
-        time.sleep(0.3)
-        if self._stop_event.is_set():
-            return {"ok": False, "msg": "stopped"}
-
-        # 3. Click hCaptcha Checkbox
-        self.current_stage = "clicking_checkbox"
-        self.status_text = "Clicked hCaptcha 'I am human' checkbox — waiting for verification..."
-        time.sleep(0.35)
-        if self._stop_event.is_set():
-            return {"ok": False, "msg": "stopped"}
-
-        # 4. Instant pass check (if token obtained without challenge modal)
-        # Random ~16% chance of instant pass simulation unless force_challenge is set
-        is_instant_pass = (not force_challenge) and (random.random() < 0.16)
-        if is_instant_pass:
-            self.pass_count += 1
-            self.current_stage = "instant_pass"
-            dummy_token = f"0x{random.randint(10**14, 10**15 - 1):x}"
-            self.status_text = f"Instant token obtained without challenge (Token: {dummy_token[:10]}...) — retrying demo site..."
-            self._add_log(f"Checkbox passed directly without challenge -> re-navigating demo site...")
-            time.sleep(0.4)
-            # Loop again to get a challenge
-            return {"ok": True, "bypassed": True}
-
-        # 5. Challenge Modal Loaded
-        self.current_stage = "challenge_loaded"
-        self.status_text = "Challenge modal opened! Rendering and capturing modal screenshot..."
-        
-        # Generate rich challenge
-        rng = random.Random()
-        c_type, meta, img = make_random_challenge(rng)
-        
-        # Render screenshot of MODAL ONLY
-        b64_modal_url, _ = render_challenge_modal_screenshot(c_type, meta, img)
-        
-        # Extract question
-        short_q, full_prompt = format_challenge_question(c_type, meta)
-        
-        # Append to questions list
-        q_id = len(self.questions) + 1
-        t_str = time.strftime("%H:%M:%S")
-        question_entry = {
-            "id": q_id,
-            "question": short_q,
-            "full_prompt": full_prompt,
-            "type": c_type.upper(),
-            "time": t_str,
-            "display": f"{q_id}. {short_q}",
-        }
-        
-        self.questions.append(question_entry)
-        self.farmed_count += 1
-        self.latest_question = f"{q_id}. {short_q}"
-        self.latest_screenshot = b64_modal_url
-        self.latest_challenge = {
-            "id": q_id,
-            "type": c_type,
-            "short_question": short_q,
-            "full_prompt": full_prompt,
-            "timestamp": t_str,
-        }
-        
-        self.current_stage = "captured"
-        self.status_text = f"Challenge #{q_id} captured: '{short_q}'"
-        self._add_log(f"Farmed Challenge #{q_id} [{c_type.upper()}]: {short_q}")
-        
-        return {"ok": True, "challenge": question_entry}
-
-    def _run_loop(self):
-        """Continuous farming loop."""
-        while self.running and not self._stop_event.is_set():
-            try:
-                res = self._do_single_farm_cycle()
-                if not self.running or self._stop_event.is_set():
-                    break
-                
-                # If instant pass occurred, short delay before re-try
-                if res.get("bypassed"):
-                    time.sleep(0.4)
-                else:
-                    # Delay before next challenge cycle based on speed
-                    time.sleep(self.speed)
-            except Exception as e:
-                self._add_log(f"Trainer loop error: {e}")
-                time.sleep(1.0)
-                
-        self.current_stage = "idle"
+            self._add_log("Captured question list cleared.")
+            return {"ok": True, "message": "Captured questions cleared"}
 
     def get_state(self) -> dict:
-        """Returns JSON-serializable snapshot of trainer status."""
-        return {
-            "running": self.running,
-            "speed": self.speed,
-            "stage": self.current_stage,
-            "status_text": self.status_text,
-            "form": self.current_form,
-            "farmed_count": self.farmed_count,
-            "pass_count": self.pass_count,
-            "total_cycles": self.total_cycles,
-            "latest_question": self.latest_question,
-            "latest_challenge": self.latest_challenge,
-            "latest_screenshot": self.latest_screenshot,
-            "questions": self.questions,
-            "logs": self.logs[-20:],
-        }
+        with self._lock:
+            return {
+                "running": self.running,
+                "speed": self.speed,
+                "stage": self.current_stage,
+                "status_text": self.status_text,
+                "form": dict(self.current_form),
+                "captured_count": self.captured_count,
+                "pass_count": self.pass_count,
+                "total_cycles": self.total_cycles,
+                "latest_question": self.latest_question,
+                "latest_challenge": dict(self.latest_challenge),
+                "latest_screenshot": self.latest_screenshot,
+                "questions": [dict(q) for q in self.questions],
+                "logs": list(self.logs[-20:]),
+                "target_url": TARGET_DEMO_URL,
+                "human_in_the_loop": True,
+            }
+
+    # ── Browser helpers ───────────────────────────────────────────────────
+
+    async def _wait_for_content(self, page, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stopped():
+            try:
+                body = await asyncio.wait_for(
+                    page.evaluate(
+                        "() => !!(document.body && (document.body.innerText || '').trim())"
+                    ),
+                    timeout=3.0,
+                )
+                if body:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+        return False
+
+    async def _visible_locators(self, page, selector: str) -> list:
+        try:
+            return [loc for loc in await page.locator(selector).all()
+                    if await loc.is_visible()]
+        except Exception:
+            return []
+
+    async def _fill_demo_field(self, page, value: str) -> bool:
+        for selector in FORM_FIELD_SELECTORS:
+            try:
+                locs = await self._visible_locators(page, selector)
+                for loc in locs:
+                    # Ignore the hidden hCaptcha response and any submit-like
+                    # controls that happen to be represented as inputs.
+                    typ = (await loc.get_attribute("type") or "text").lower()
+                    if typ in {"hidden", "submit", "button", "checkbox", "radio"}:
+                        continue
+                    await loc.fill(value, timeout=5000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _find_frame(self, page, selector: str):
+        """Return (iframe locator, frame) for the first visible matching frame."""
+        try:
+            refresh_frames = getattr(page, "_refresh_frames", None)
+            if callable(refresh_frames):
+                await refresh_frames(force=True)
+        except Exception:
+            pass
+        try:
+            locs = await self._visible_locators(page, selector)
+        except Exception:
+            locs = []
+        for iframe in locs:
+            try:
+                handle = await iframe.element_handle(timeout=2500)
+                frame = await handle.content_frame() if handle else None
+                if frame is not None:
+                    return iframe, frame
+            except Exception:
+                pass
+        return None, None
+
+    async def _wait_for_checkbox(self, page, timeout: float = 35.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stopped():
+            iframe, frame = await self._find_frame(page, WIDGET_IFRAME_SELECTOR)
+            if frame is not None:
+                try:
+                    controls = frame.locator(", ".join(CHECKBOX_SELECTOR))
+                    if await controls.count() > 0:
+                        return iframe, frame, controls.first
+                except Exception:
+                    pass
+            # The frame cache is refreshed by the engine after evaluate calls;
+            # this also gives hCaptcha time to attach its iframe after load.
+            await asyncio.sleep(0.35)
+        return None, None, None
+
+    async def _click_real_checkbox(self, page) -> bool:
+        iframe, frame, checkbox = await self._wait_for_checkbox(page)
+        if iframe is None or frame is None or checkbox is None:
+            return False
+        try:
+            await checkbox.click(timeout=5000)
+            self._add_log("Clicked the real hCaptcha checkbox.")
+            return True
+        except Exception as first_error:
+            # A few Chrome builds expose the checkbox through frame_locator
+            # before content_frame() has refreshed.  Retry with a trusted
+            # frame-scoped locator; do not use JS click or mutate hCaptcha DOM.
+            try:
+                src = await iframe.get_attribute("src") or ""
+                if src:
+                    fl = page.frame_locator(f'iframe[src="{src}"]')
+                    controls = fl.locator(", ".join(CHECKBOX_SELECTOR))
+                    await controls.first.click(timeout=5000)
+                    self._add_log("Clicked the real hCaptcha checkbox (frame locator).")
+                    return True
+            except Exception as second_error:
+                self._add_log(
+                    f"Real checkbox click failed: {type(first_error).__name__}; "
+                    f"frame retry: {type(second_error).__name__}"
+                )
+        return False
+
+    async def _read_response_token(self, page) -> bool:
+        """Detect hCaptcha's own response, without creating or injecting one."""
+        try:
+            return bool(await page.evaluate("""() => {
+                const ta = document.querySelector('textarea[name="h-captcha-response"]');
+                if (ta && String(ta.value || '').trim()) return true;
+                try {
+                    return !!(window.hcaptcha && typeof window.hcaptcha.getResponse === 'function'
+                        && String(window.hcaptcha.getResponse() || '').trim());
+                } catch (e) { return false; }
+            }"""))
+        except Exception:
+            return False
+
+    async def _checkbox_is_checked(self, page) -> bool:
+        try:
+            for _iframe, frame in await self._all_frames(page):
+                try:
+                    checked = await frame.evaluate("""() => {
+                        const el = document.querySelector('[aria-checked], input[type="checkbox"]');
+                        return !!el && (el.getAttribute('aria-checked') === 'true' || el.checked === true);
+                    }""")
+                    if checked:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    async def _all_frames(self, page) -> list:
+        out = []
+        try:
+            # Refreshing with a harmless evaluation makes the nodriver facade
+            # update its frame cache after the challenge iframe is mounted.
+            await page.evaluate("document.readyState")
+            for frame in list(page.frames):
+                if frame is not None:
+                    out.append((None, frame))
+        except Exception:
+            pass
+        return out
+
+    async def _challenge_ready(self, frame) -> bool:
+        """Avoid treating hCaptcha's empty iframe shell as a challenge."""
+        try:
+            state = await frame.evaluate("document.readyState")
+            if state not in {"interactive", "complete"}:
+                return False
+            text = _clean_text(await frame.locator("body").inner_text())
+            if len(text) >= 8:
+                return True
+            # Some locales/rendering paths paint the instruction as an image
+            # or canvas. Require a real painted control/media node instead of
+            # accepting the iframe's initial blank document.
+            for selector in ("img", "canvas", "button", "[role=button]", "[role=img]"):
+                if await frame.locator(selector).count() > 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def _wait_for_challenge_or_success(self, page, timeout: float = 60.0):
+        deadline = time.monotonic() + timeout
+        checked_since: Optional[float] = None
+        while time.monotonic() < deadline and not self._stopped():
+            _iframe, frame = await self._find_frame(page, CHALLENGE_IFRAME_SELECTOR)
+            if frame is not None:
+                if await self._challenge_ready(frame):
+                    return "challenge", _iframe, frame
+                # A challenge iframe can be attached before its document has
+                # painted. Keep waiting for the real prompt/media to appear.
+                await asyncio.sleep(0.35)
+                continue
+            # A response textarea is the strongest signal of a completed
+            # check.  Some accessibility-cookie passes expose only the
+            # checkbox state, so require it to remain checked briefly; this
+            # avoids mistaking the loading state immediately after our click
+            # for a successful pass while a challenge iframe is still being
+            # mounted.
+            if await self._read_response_token(page):
+                return "success", None, None
+            if await self._checkbox_is_checked(page):
+                checked_since = checked_since or time.monotonic()
+                if time.monotonic() - checked_since >= 2.0:
+                    return "success", None, None
+            else:
+                checked_since = None
+            await asyncio.sleep(0.4)
+        return "timeout", None, None
+
+    async def _capture_challenge(self, iframe, frame) -> Tuple[str, str, str]:
+        """Capture the real challenge iframe and read its visible prompt."""
+        shot = b""
+        try:
+            shot = await iframe.screenshot(timeout=12000)
+        except Exception:
+            try:
+                shot = await frame.screenshot(timeout=12000)
+            except Exception:
+                shot = b""
+
+        question = ""
+        full_text = ""
+        try:
+            # Prefer the challenge's own prompt/instruction nodes; the exact
+            # class changes between hCaptcha versions, so try semantic names
+            # before falling back to the complete body text.
+            for selector in (
+                '[class*="prompt" i]', '[class*="instruction" i]',
+                '[aria-live="polite"]', 'h1', 'h2', 'h3', 'p',
+            ):
+                try:
+                    for node in await frame.locator(selector).all():
+                        if not await node.is_visible():
+                            continue
+                        candidate = _question_from_text(await node.inner_text())
+                        if candidate:
+                            question = candidate
+                            break
+                except Exception:
+                    pass
+                if question:
+                    break
+            # Body text is evaluated inside the cross-origin challenge frame;
+            # it never reads or alters challenge answers.
+            body_text = await frame.locator("body").inner_text()
+            full_text = _clean_text(body_text)
+            question = question or _question_from_text(body_text)
+        except Exception:
+            try:
+                full_text = _clean_text(await frame.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                ))
+                question = question or _question_from_text(full_text)
+            except Exception:
+                pass
+
+        if not question:
+            question = "Challenge prompt could not be read; inspect the screenshot."
+        image = ""
+        if shot:
+            image = "data:image/png;base64," + base64.b64encode(shot).decode("ascii")
+        return image, question, full_text
+
+    async def _record_challenge(self, image: str, question: str, full_text: str) -> None:
+        with self._lock:
+            q_id = len(self.questions) + 1
+            now = time.strftime("%H:%M:%S")
+            entry = {
+                "id": q_id,
+                "question": question,
+                "full_prompt": full_text or question,
+                "type": "REAL HCAPTCHA",
+                "time": now,
+                "url": TARGET_DEMO_URL,
+                "display": f"{q_id}. {question}",
+            }
+            self.questions.append(entry)
+            self.captured_count += 1
+            self.latest_question = question
+            self.latest_screenshot = image
+            self.latest_challenge = {
+                "id": q_id,
+                "question": question,
+                "type": "REAL HCAPTCHA",
+                "timestamp": now,
+                "url": TARGET_DEMO_URL,
+            }
+        self._add_log(f"Captured real challenge #{q_id}: {question}")
+
+    async def _wait_for_human_completion(self, page) -> str:
+        """Wait for a real user to finish; return success or stopped."""
+        self._set_state(
+            "awaiting_human",
+            "Real hCaptcha challenge captured. Complete it in Chrome; runner is waiting.",
+        )
+        checked_since: Optional[float] = None
+        while not self._stopped():
+            if await self._read_response_token(page):
+                return "success"
+            # If a deployment does not expose the response textarea, use the
+            # widget's checked state only after the challenge iframe has been
+            # gone for a stable interval. The initial loading/checking state
+            # must not be treated as a human completion.
+            _iframe, challenge = await self._find_frame(page, CHALLENGE_IFRAME_SELECTOR)
+            if challenge is None and await self._checkbox_is_checked(page):
+                checked_since = checked_since or time.monotonic()
+                if time.monotonic() - checked_since >= 2.0:
+                    return "success"
+            else:
+                checked_since = None
+            # A challenge frame can briefly disappear while hCaptcha advances
+            # to another round. Keep waiting rather than re-clicking anything.
+            await asyncio.sleep(0.5)
+        return "stopped"
+
+    async def _reload_demo(self, page) -> None:
+        self._set_state("refreshing", "hCaptcha completed; refreshing the official demo…")
+        try:
+            await page.reload(timeout=45000)
+        except Exception as exc:
+            self._add_log(f"Demo refresh failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(0.5)
+
+    # ── Real cycle/loop ──────────────────────────────────────────────────
+
+    async def _do_real_cycle(self) -> str:
+        if self._page is None:
+            return "stopped"
+        page = self._page
+        with self._lock:
+            self.total_cycles += 1
+
+        self._set_state("navigating", f"Opening {TARGET_DEMO_URL} in real Chrome…")
+        try:
+            await page.goto(TARGET_DEMO_URL, wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            self._add_log(f"Official demo navigation failed: {type(exc).__name__}: {exc}")
+            self._set_state("error", "Could not open the official hCaptcha demo; see logs.")
+            return "error"
+        if not await self._wait_for_content(page):
+            self._set_state("error", "Official demo loaded without visible content.")
+            return "error"
+        if self._stopped():
+            return "stopped"
+
+        form_data = generate_form_words()
+        with self._lock:
+            self.current_form = form_data
+        self._set_state("filling_form", "Filling the real demo field with a short sample…")
+        if not await self._fill_demo_field(page, form_data["field"]):
+            self._add_log("Official demo optional field was not found; continuing to hCaptcha.")
+        if self._stopped():
+            return "stopped"
+
+        self._set_state("waiting_for_checkbox", "Waiting for the real hCaptcha checkbox to load…")
+        if not await self._click_real_checkbox(page):
+            self._set_state("error", "The real hCaptcha checkbox did not become clickable.")
+            self._add_log("No live hCaptcha checkbox found on the official demo.")
+            return "error"
+        if self._stopped():
+            return "stopped"
+
+        self._set_state("waiting_for_result", "Waiting for hCaptcha: challenge or instant success…")
+        result, iframe, frame = await self._wait_for_challenge_or_success(page)
+        if result == "challenge" and iframe is not None and frame is not None:
+            image, question, full_text = await self._capture_challenge(iframe, frame)
+            await self._record_challenge(image, question, full_text)
+            # Human-in-the-loop by design: no image selection, answer, token,
+            # or verification request is generated by this application.
+            result = await self._wait_for_human_completion(page)
+            if result == "success":
+                with self._lock:
+                    self.pass_count += 1
+                self._add_log("Human completed the real hCaptcha challenge.")
+                await self._reload_demo(page)
+            return result
+        if result == "success":
+            with self._lock:
+                self.pass_count += 1
+            self._set_state("instant_success", "hCaptcha passed without a challenge; refreshing…")
+            self._add_log("hCaptcha reported success without opening a challenge; refreshing demo.")
+            await self._reload_demo(page)
+            return "success"
+        self._set_state("timeout", "hCaptcha did not finish loading before the wait expired.")
+        self._add_log("Timed out waiting for a real hCaptcha challenge or success.")
+        return "timeout"
+
+    async def _run_attached_async(self) -> None:
+        """Run cycles on the app-owned page without closing its browser."""
+        try:
+            self._add_log("Shared LIVE browser is ready for the official demo.")
+            while not self._stopped():
+                result = await self._do_real_cycle()
+                if self._one_shot or result == "stopped":
+                    break
+                if self._stopped():
+                    break
+                await asyncio.sleep(0.8 if result in {"error", "timeout"} else self.speed)
+        except Exception as exc:
+            self._add_log(f"Attached demo runner error: {type(exc).__name__}: {exc}")
+            self._set_state("error", "Live demo runner stopped; see logs.")
+        finally:
+            with self._lock:
+                self.running = False
+                self._external_page = None
+                self._external_task = None
+                if self.current_stage not in {"error", "timeout"}:
+                    self.current_stage = "idle"
+                    self.status_text = (
+                        "Real demo cycle complete."
+                        if self._one_shot and not self._stop_event.is_set()
+                        else "Runner stopped."
+                    )
+
+    async def _run_async(self) -> None:
+        """Own one direct browser session for the live demo runner."""
+        try:
+            from browser_engine import async_playwright
+
+            self._set_state("starting_browser", "Starting real Google Chrome for the official demo…")
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=bool(self.headless),
+                args=["--window-size=1280,900"],
+            )
+            self._context = await self._browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                color_scheme="light",
+            )
+            self._page = await self._context.new_page()
+            self._add_log("Real Chrome ready; no synthetic challenge source is enabled.")
+
+            while not self._stopped():
+                result = await self._do_real_cycle()
+                if self._one_shot or result == "stopped":
+                    break
+                if self._stopped():
+                    break
+                # Errors/timeouts get a modest backoff; a completed check gets
+                # the configured poll delay before the next fresh demo load.
+                await asyncio.sleep(0.8 if result in {"error", "timeout"} else self.speed)
+        except Exception as exc:
+            self._add_log(f"Live demo runner error: {type(exc).__name__}: {exc}")
+            self._set_state("error", "Live demo runner stopped because Chrome failed; see logs.")
+        finally:
+            try:
+                if self._context is not None:
+                    await self._context.close()
+            except Exception:
+                pass
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception:
+                pass
+            try:
+                if self._playwright is not None:
+                    await self._playwright.stop()
+            except Exception:
+                pass
+            self._page = None
+            self._context = None
+            self._browser = None
+            self._playwright = None
+            with self._lock:
+                self.running = False
+                if self.current_stage not in {"error", "timeout"}:
+                    self.current_stage = "idle"
+                    self.status_text = (
+                        "Real demo cycle complete."
+                        if self._one_shot and not self._stop_event.is_set()
+                        else "Runner stopped."
+                    )
+
+    def _thread_entry(self) -> None:
+        try:
+            asyncio.run(self._run_async())
+        except Exception as exc:
+            with self._lock:
+                self.running = False
+                self.current_stage = "error"
+                self.status_text = "Live demo runner failed; see logs."
+            self._add_log(f"Runner thread error: {type(exc).__name__}: {exc}")
 
 
-# Global engine singleton
+# Global engine singleton used by the Flask endpoints.
 trainer_engine = TrainerEngine()
