@@ -783,6 +783,7 @@ class TrainerEngine:
 
     async def _run_async(self) -> None:
         """Own one direct browser session for the live demo runner."""
+        shot_task = None
         try:
             from browser_engine import async_playwright
 
@@ -798,6 +799,10 @@ class TrainerEngine:
             )
             self._page = await self._context.new_page()
             self._add_log("Real Chrome ready; no synthetic challenge source is enabled.")
+            shot_task = asyncio.create_task(
+                self._screenshot_loop(self._page),
+                name="hcaptcha-demo-screenshots",
+            )
 
             while not self._stopped():
                 result = await self._do_real_cycle()
