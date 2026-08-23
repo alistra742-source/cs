@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 82 collected (74 passed + 8 skipped when the models are not trained yet).
+Expected: 86 collected (78 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -371,6 +371,32 @@ class TestRoutePrompt(unittest.TestCase):
         self.assertFalse(hct.is_attribute_prompt(
             "Please click each image containing a bus"))
 
+    def test_prompt_setdown_places(self):
+        live = ("Find places safe for setting down the item "
+                "in the reference")
+        self.assertEqual(hct.classify_from_prompt(live), hct.BINARY)
+        self.assertTrue(hct.is_setdown_prompt(live))
+        self.assertFalse(hct.is_tower_prompt(live))
+        self.assertFalse(hct.is_attribute_prompt(live))
+        # sibling wording
+        for prompt in (
+                "Find places that are safe to set the item down",
+                "Select places safe for setting down the mug",
+                "Where the reference item could be stored",
+                "Find surfaces safe for the item in the reference",
+        ):
+            self.assertTrue(hct.is_setdown_prompt(prompt), prompt)
+            self.assertEqual(hct.classify(None, None, prompt), hct.BINARY, prompt)
+        # must NOT steal drag / affordance / metal grids
+        for prompt in (
+                "Please drag the element to the place where it fits",
+                "Please pick all things you can work on with the item "
+                "shown in the reference",
+                "Select items that are primarily metal",
+                "Please click on the animal who jumps the highest",
+        ):
+            self.assertFalse(hct.is_setdown_prompt(prompt), prompt)
+
     def test_prompt_identical_pair_variants(self):
         for prompt in (
                 "Please click on the two elements that are identical",
@@ -435,6 +461,27 @@ class TestRouteRounds(unittest.TestCase):
         fam = hct.classify(payload, dom, hct.question_text(payload))
         self.assertEqual(fam, hct.AREA_POINT)
         self.assertEqual(hct.answer_shape(fam), "points")
+
+    def test_setdown_mug_grid_round(self):
+        # Live Discord screenshot: mug reference + 3x3 scene grid.
+        payload = {"request_type": "image_label_binary",
+                   "requester_question": {
+                       "en": "Find places safe for setting down the item "
+                             "in the reference"},
+                   "requester_question_example": ["https://imgs/mug.jpg"],
+                   "tasklist": [{"datapoint_uri": "https://imgs/t%d.jpg" % i}
+                                for i in range(9)]}
+        dom = {"tiles": 9, "examples": 1, "choices": 0, "inputs": 0,
+               "canvases": 0, "images": 9, "draggables": 0,
+               "move_badge": False}
+        prompt = hct.question_text(payload)
+        fam = hct.classify(payload, dom, prompt)
+        self.assertEqual(fam, hct.BINARY)
+        self.assertEqual(hct.answer_shape(fam), "tiles")
+        # even when hCaptcha wraps the grid in area_select
+        mixed = dict(payload)
+        mixed["request_type"] = "image_label_area_select"
+        self.assertEqual(hct.classify(mixed, dom, prompt), hct.BINARY)
 
     def test_drag_round(self):
         payload = {"request_type": "image_drag_drop",
@@ -821,6 +868,37 @@ class TestKnowledgeBase(unittest.TestCase):
         self.assertIsNone(hct.resolve_semantic(
             "Select items that are primarily glass",
             ["cup", "window", "car"]))
+
+    def test_setdown_mug_clicks_surfaces_not_balloons(self):
+        # Live 3x3: nightstand, balloon, deck+ball, balloon, bench,
+        # deck+ball, leaf, building, leaf. Click furniture/deck only.
+        live = ("Find places safe for setting down the item "
+                "in the reference")
+        labels = ["table", "airplane", "wood", "airplane", "chair",
+                  "wood", "flower", "house", "flower"]
+        self.assertEqual(
+            hct.resolve_semantic(live, labels, example_label="cup"),
+            [1, 3, 5, 6])
+        # aliases the CNN / prompt nouns actually emit
+        self.assertEqual(hct.canonical("nightstand"), "table")
+        self.assertEqual(hct.canonical("bench"), "chair")
+        self.assertEqual(hct.canonical("wooden_deck"), "wood")
+        self.assertEqual(hct.canonical("maple_leaf"), "flower")
+        # no surfaces at all → vision, not an empty Verify
+        self.assertIsNone(hct.resolve_semantic(
+            live, ["airplane", "flower", "cup"]))
+
+    def test_larger_than_reference(self):
+        prompt = "Select items that are larger than the item in the reference"
+        labels = ["snail", "dog", "elephant", "butterfly"]
+        self.assertEqual(
+            hct.resolve_semantic(prompt, labels, example_label="dog"),
+            [3])
+        self.assertEqual(
+            hct.resolve_semantic(
+                "Pick the items smaller than the item shown",
+                labels, example_label="dog"),
+            [1, 4])
 
 
 # ── pointer realism ───────────────────────────────────────────────────────

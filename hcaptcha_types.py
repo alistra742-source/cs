@@ -133,7 +133,11 @@ _BINARY_GRID_Q_RE = re.compile(
     r"pick (all|every) (the )?(images?|photos?|pictures?)|"
     r"(select|choose|pick|check|mark) (all )?(the )?items|"
     r"items that (are|have|contain)|"
-    r"primarily \w+|made (of|from) ", re.I)
+    r"primarily \w+|made (of|from) |"
+    r"find (places|surfaces)|setting down|places? (that are )?safe|"
+    r"in the reference|"
+    r"find items that|find the (item|odd|matching)|"
+    r"select all images with|select the image showing", re.I)
 
 
 # Counting tasks ("How many X are in this image?") — a photo + numeric
@@ -175,7 +179,10 @@ _TOWER_PHRASE_RE = re.compile(
     r"missing block|block segment|incomplete tower|"
     r"complete the tower|onto the (incomplete )?tower|"
     r"move the .{0,50}(block|segment|tower)|"
-    r"missing segment|onto the stack",
+    r"missing segment|onto the stack|"
+    r"incomplete (stack|column|pillar|spire|structure)|"
+    r"unfinished tower|broken tower|truncated tower|"
+    r"stack the (missing )?(block|piece)",
     re.I)
 
 
@@ -325,7 +332,12 @@ _PROMPT_RULES = (
         r"onto the (incomplete )?tower|missing segment|"
         r"complete the pattern|empty (spot|cell)|into the empty "
         r"(spot|space|cell)|fill the (empty|missing|blank) "
-        r"(spot|space|cell)", re.I)),
+        r"(spot|space|cell)|"
+        r"\b(rotate|flip|slide|stack|fit|nest|join|attach|align|drop)\b.{0,40}"
+        r"(piece|block|segment|tile|shape|part)|"
+        r"place the (correct |missing )?(piece|block|tile|shape|part)|"
+        r"onto the incomplete|into the (empty|outlined|corresponding) "
+        r"(slot|space|gap|area)", re.I)),
     (BINARY, re.compile(
         r"click each image|click (on )?every (image|photo|picture|tile)|"
         r"select all (the )?(images|pictures|photos|tiles)|"
@@ -338,6 +350,9 @@ _PROMPT_RULES = (
         r"(select|choose|pick|check|mark) (all )?(the )?items|"
         r"items that (are|have|contain)|objects that (are|have)|"
         r"primarily \w+|made (of|from) |"
+        r"find (places|surfaces)|setting down|places? (that are )?safe|"
+        r"find items that|find the (item|odd|matching)|"
+        r"select the image showing|"
         r"(two|2|pair).{0,60}(identical|same|matching|duplicate|alike|similar) "
         r"(images|pictures|photos|tiles)|matching pair|"
         r"most similar (images|pictures|photos|tiles)", re.I)),
@@ -378,6 +393,8 @@ def classify(payload: dict = None, dom: dict = None, prompt: str = "") -> str:
     """
     if is_tower_prompt(prompt):
         return DRAG_DROP
+    if is_setdown_prompt(prompt):
+        return BINARY
     for result in (classify_from_payload(payload),
                    classify_from_dom(dom, prompt),
                    classify_from_prompt(prompt)):
@@ -592,6 +609,12 @@ SYNONYMS = {
     "desk": "table", "counter": "table",
     "pie": "pizza", "quiche": "pizza",
     "teacup": "cup", "drinking_glass": "cup", "bucket": "cup",
+    "coffee_mug": "cup", "coffee_cup": "cup", "tea_cup": "cup",
+    "nightstand": "table", "night_stand": "table", "dresser": "table",
+    "bedside_table": "table", "end_table": "table", "coffee_table": "table",
+    "deck": "wood", "floorboard": "wood", "floorboards": "wood",
+    "hardwood": "wood", "wooden_deck": "wood", "picnic_table": "table",
+    "leaf": "flower", "maple_leaf": "flower", "leaves": "flower",
     "magazine": "book", "notebook": "book",
     "watch": "clock", "alarm_clock": "clock", "wall_clock": "clock",
     "grandfather_clock": "clock", "cuckoo_clock": "clock",
@@ -725,6 +748,37 @@ _AFFORDANCE_PHRASE = re.compile(
     r"(image|picture|example)|goes with|used (with|on|together)|"
     r"fit(s)? with|belongs? with|associated with", re.I)
 
+# Live: "Find places safe for setting down the item in the reference"
+# Tight on purpose — "place where it fits" is a DRAG prompt, and bare
+# "in the reference" matches every reference-image affordance grid.
+_SETDOWN_PHRASE = re.compile(
+    r"setting down|"
+    r"set(?:ting)? (?:it |the (?:item|object) )?down|"
+    r"places? (?:that are )?safe|"
+    r"safe (?:places?|surfaces?)|"
+    r"safe (?:to |for )(?:set|put|place|rest|leave)|"
+    r"find places|"
+    r"could be (?:safely )?(?:stored|set|put|placed|left)|"
+    r"where (?:the )?(?:reference )?(?:item|object) could|"
+    r"place to (?:put|set|rest|leave|store) (?:the |this )?(?:item|object|it)|"
+    r"surfaces? (?:safe |suitable )?(?:for|to)",
+    re.I)
+
+# Horizontal furniture / lumber the 60-class CNN can actually emit.
+# house/wall are vertical or whole buildings — not a mug-safe surface.
+FLAT_SURFACES = {"table", "chair", "wood"}
+
+_REF_COMPARE_RULES = (
+    (re.compile(r"\b(larger|bigger|greater|heavier|taller|wider)\b", re.I),
+     "SIZE", "gt"),
+    (re.compile(r"\b(smaller|tiniest|shorter|narrower|lighter)\b", re.I),
+     "SIZE", "lt"),
+    (re.compile(r"\b(faster|quicker|speedier)\b", re.I), "SPEED", "gt"),
+    (re.compile(r"\b(slower)\b", re.I), "SPEED", "lt"),
+    (re.compile(r"\b(hotter|warmer)\b", re.I), "TEMP", "gt"),
+    (re.compile(r"\b(colder|cooler)\b", re.I), "TEMP", "lt"),
+)
+
 _EXAMPLE_CAT_PHRASE = re.compile(
     r"same (kind|category|type|group)|similar(ly)?|like the (one|item) shown|"
     r"belong(s|ing)? (with|together)|matching the (item|image|example)", re.I)
@@ -767,6 +821,11 @@ _ATTRIBUTE_SETS = (
 def is_attribute_prompt(prompt: str) -> bool:
     """True for material/attribute grids ('select items that are primarily metal')."""
     return bool(_ATTRIBUTE_PROMPT_RE.search(prompt or ""))
+
+
+def is_setdown_prompt(prompt: str) -> bool:
+    """True for 'find places safe for setting down the item in the reference'."""
+    return bool(_SETDOWN_PHRASE.search(prompt or ""))
 
 
 def attribute_members(prompt: str):
@@ -831,6 +890,33 @@ def resolve_semantic(prompt: str, tile_labels, example_label=None):
                                   else v < best_v):
                 best_i, best_v = i, v
         return [best_i] if best_i is not None else []
+
+    # 1.5) "Find places safe for setting down the item in the reference"
+    # — click tiles that are STABLE HORIZONTAL SURFACES (table/chair/wood),
+    # not the object itself and not a balloon / leaf / ball. Must run
+    # before tool-affordance: "item in the reference" used to miss.
+    # Zero surfaces → None so the vision model answers (an empty Verify
+    # almost never wins this family).
+    if is_setdown_prompt(p):
+        skip = {example} if example else set()
+        idx = [i for i, lab in enumerate(labels, 1)
+               if lab in FLAT_SURFACES and lab not in skip]
+        return idx if idx else None
+
+    # 1.6) comparative vs the reference ("larger than the item shown")
+    if example:
+        for rx, table_name, side in _REF_COMPARE_RULES:
+            if rx.search(p) and ("than" in p.lower() or "the reference" in p.lower()
+                                 or "item shown" in p.lower()):
+                table = _TABLES[table_name]
+                ev = table.get(example)
+                if ev is None:
+                    return None
+                if side == "gt":
+                    return [i for i, lab in enumerate(labels, 1)
+                            if table.get(lab) is not None and table[lab] > ev]
+                return [i for i, lab in enumerate(labels, 1)
+                        if table.get(lab) is not None and table[lab] < ev]
 
     # 2) tool affordance ("things you can work on with the item shown")
     if _AFFORDANCE_PHRASE.search(p):

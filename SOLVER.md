@@ -22,6 +22,7 @@ the vision model as fallback.
 | **pattern completion** | "put one of the animals into the empty spot to complete the pattern" | drag candidate → empty cell | **misrouted** — prompt regex missed it and the tile-rich DOM fell through to binary |
 | **mixed binary + point** | "click each image containing X, then click on Y" | tiles then (x, y) | **misrouted** — payload tier saw `area_select` and treated the grid stage as a point round |
 | **wooden-block tower** | "move the correct missing block segment onto the incomplete tower" | drag piece → short/gapped stack | **misrouted** — payload `image_label_area_select` committed to a point click; the Move badge (`+ Move`) was missed; DragLocator punched-slot geometry is the wrong puzzle |
+| **set-down / spatial-ref** | "find places safe for setting down the item in the reference" | tile indices (surfaces) | **misread** — treated as a tool-affordance or point click; clicked balloons/leaves instead of nightstand/bench/deck |
 
 The mixed round shares the `image_label_area_select` request type: hCaptcha
 serves a binary tile-grid stage followed by an area stage under one payload.
@@ -62,6 +63,26 @@ piece is often a separate DOM node beside the photo), takes a Move-badge
 hint from the DOM, then finds warm/wood columns and drops onto the
 shortest stack or the largest internal gap. Vision (`shape="tower"`) is
 a 18s last resort only — a 180s 504 expires the challenge.
+
+Set-down / spatial-reference grids ("Find places safe for setting down
+the item in the reference") are a **binary tile grid with a header
+photo** (a mug, a tool, …). The live prompt forces `BINARY` (it is not
+a point click). Offline, `is_setdown_prompt()` + `FLAT_SURFACES`
+(`table` / `chair` / `wood`, with nightstand/dresser/desk → table,
+bench/sofa → chair, deck → wood) clicks every furniture/lumber tile
+and skips balloons, balls, leaves, and building facades. No matching
+surface returns `None` so the vision model answers — an empty Verify
+almost never wins this family. The wording is tight on purpose:
+`"place where it fits"` is a drag puzzle and bare `"in the reference"`
+matches every affordance grid. The vision `tiles` system prompt tells
+the model to look at the header mug first and pick every surface it
+could rest on.
+
+This is how the long tail of the ~1000-prompt catalog is covered:
+**routing + aliases + the 60-class CNN + vision**, not a 1000-class
+retrain. The offline tile model still only emits the 60 trained
+classes; unmapped nouns (tennis ball, hot-air balloon, plastic, glass,
+3-D views, odd-one-out, actions) fall through to the vision model.
 
 The prompt tier also understands the **select-all** wording variants
 ("select/choose/pick/check/mark all the images/tiles with…"), the
@@ -174,9 +195,11 @@ toggle them off).
   materials return `None` so the vision model (which reads the object
   itself, not the background) answers.
 * `resolve_semantic(prompt, tile_labels, example_label) →` 1-based
-  indices, trying superlatives → affordance → same-category-as-example →
-  set predicates → plain noun. Returns **`None`** when the prompt is not
-  understood (server falls back to the vision model) and **`[]`** for a
+  indices, trying superlatives → set-down surfaces → comparative vs the
+  reference ("larger than the item shown") → affordance →
+  same-category-as-example → material/attribute sets → set predicates →
+  plain noun. Returns **`None`** when the prompt is not understood
+  (server falls back to the vision model) and **`[]`** for a
   legitimately empty round (they exist — clicking nothing and Verify is the
   right answer).
 * `resolve_pattern(grid_labels, hole_index, candidates) →` candidate
@@ -428,6 +451,11 @@ path keeps the confidence gate and falls back to the vision model below
   a piece that is not in the right strip fall through to the vision
   model (`shape="tower"`). The locator never guesses when every stack is
   the same height and there is no gap.
+* Set-down grids need the CNN to label nightstands as `table`, benches
+  as `chair`, and wooden decks as `wood`. A tennis-ball-on-deck photo
+  whose subject the 60-class model does not know is vision territory.
+  Do **not** retrain a 1000-class tile CNN for the prompt catalog — there
+  is no corpus, and the existing 60-class pass already takes 1.5–2 h.
 * The alias table is deliberately conservative: nouns that are NOT
   visually defensible at tile scale are left unmapped so the vision model
   (which reads arbitrary prompt text) answers them. The offline models

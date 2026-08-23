@@ -93,6 +93,14 @@ _SYSTEM_PROMPT = (
     "For visual-comparison prompts such as 'click the two elements/images that "
     "are identical', 'the same', 'matching', 'duplicates', 'similar', or 'most similar', "
     "compare all tiles against each other and return the matching tile numbers. "
+    "For spatial/reference prompts such as 'find places safe for setting down "
+    "the item in the reference', 'where the item could be stored/used', or "
+    "'match the reference item': look at the HEADER reference image FIRST "
+    "(a mug, a tool, …). Then pick EVERY tile that is a PLACE or SURFACE "
+    "where that object could safely rest or be used — a table, nightstand, "
+    "bench, wooden deck, counter, shelf, floor. Do NOT pick the object "
+    "itself, a ball, a leaf, a hot-air balloon, or anything that would "
+    "tip/spill/break the item. Several tiles usually match. "
     'Answer with ONLY a JSON object, never any other text: '
     '{"tiles": [1, 3, 7]} for a grid selection, or {"answer": "the text"} '
     "if the challenge asks you to type characters instead. "
