@@ -43,6 +43,7 @@ TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
 import live_ui
+import trainer
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -1356,6 +1357,48 @@ def handle_config():
 
 # ── Background event loop ─────────────────────────────────
 
+
+# ── Trainer Endpoints ─────────────────────────────────────
+
+@app.route('/trainer/status')
+def handle_trainer_status():
+    return jsonify(trainer.trainer_engine.get_state())
+
+@app.route('/trainer/start', methods=['POST'])
+def handle_trainer_start():
+    data = request.get_json(silent=True) or {}
+    speed = float(data.get('speed', 2.0))
+    res = trainer.trainer_engine.start(speed=speed)
+    return jsonify(res)
+
+@app.route('/trainer/stop', methods=['POST'])
+def handle_trainer_stop():
+    return jsonify(trainer.trainer_engine.stop())
+
+@app.route('/trainer/step', methods=['POST'])
+def handle_trainer_step():
+    return jsonify(trainer.trainer_engine.step())
+
+@app.route('/trainer/clear', methods=['POST'])
+def handle_trainer_clear():
+    return jsonify(trainer.trainer_engine.clear())
+
+@app.route('/trainer/questions')
+def handle_trainer_questions():
+    st = trainer.trainer_engine.get_state()
+    return jsonify(st.get('questions', []))
+
+@app.route('/trainer/interactive/new', methods=['GET', 'POST'])
+def handle_trainer_interactive_new():
+    return jsonify(trainer.trainer_engine.get_new_interactive())
+
+@app.route('/trainer/interactive/verify', methods=['POST'])
+def handle_trainer_interactive_verify():
+    data = request.get_json(silent=True) or {}
+    selected = data.get('selected', [])
+    return jsonify(trainer.trainer_engine.verify_interactive(selected))
+
+
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
@@ -1441,7 +1484,7 @@ DASHBOARD_HTML = r'''
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0a0a0b">
 <meta charset="utf-8">
-<title>EY3 - Token Forge</title>
+<title>EY3 - Token Forge & Trainer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html{background:#0a0a0b}
@@ -1492,12 +1535,81 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 .badge{display:inline-block;font-size:10px;padding:3px 10px;border-radius:99px;
   font-family:'JetBrains Mono','Courier New',monospace;letter-spacing:1px}
 .badge-ok{background:rgba(52,211,153,.15);color:#34d399}
+.badge-warn{background:rgba(251,191,36,.15);color:#fbbf24}
 .badge-err{background:rgba(248,113,113,.15);color:#f87171}
 .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .hide{display:none!important}
 .mt{margin-top:12px}.mb{margin-bottom:12px}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1e;
-  border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999}
+  border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999;box-shadow:0 12px 30px rgba(0,0,0,.6)}
+
+/* Trainer Tab & hCaptcha Modal Layout */
+.trainer-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px;align-items:start}
+@media(max-width:820px){.trainer-grid{grid-template-columns:1fr}}
+
+.trainer-ss-box{background:#0b0c10;border:1px solid #272a3a;border-radius:12px;padding:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:340px;position:relative;overflow:hidden}
+#trainerModalImg{max-width:100%;height:auto;max-height:480px;border-radius:8px;border:1px solid #33374b;box-shadow:0 12px 36px rgba(0,0,0,.6);object-fit:contain}
+.trainer-ph{color:#8a8a92;font-family:'JetBrains Mono',monospace;font-size:12px;text-align:center;padding:34px 16px;line-height:1.6}
+
+.q-list-wrap{max-height:480px;overflow-y:auto;background:#08080a;border:1px solid #26262b;border-radius:10px;padding:6px}
+.q-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #1a1a1f;transition:.15s ease}
+.q-row:last-child{border-bottom:none}
+.q-row:hover{background:#131318}
+.q-num{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:13px;color:#34d399;min-width:24px}
+.q-body{flex:1;min-width:0}
+.q-title{font-size:13px;font-weight:600;color:#fff;margin-bottom:3px;word-break:break-word}
+.q-meta{font-size:10px;color:#8a8a92;font-family:'JetBrains Mono',monospace;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.btn-copy-q{padding:5px 11px;font-size:11px;font-weight:700;background:#1a1a22;border:1px solid #323547;color:#34d399;border-radius:7px;cursor:pointer;white-space:nowrap;transition:.15s}
+.btn-copy-q:hover{background:#232738;border-color:#34d399}
+.btn-copy-q.copied{background:#059669;color:#fff;border-color:#34d399}
+
+.badge-tag{font-size:9px;padding:2px 6px;border-radius:4px;background:#232738;color:#93c5fd;font-weight:600;letter-spacing:.5px}
+
+.stage-banner{background:#16171d;border:1px solid #2a2d3d;border-radius:10px;padding:11px 16px;font-size:12px;font-family:'JetBrains Mono',monospace;color:#a1a1aa;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.stage-dot{width:9px;height:9px;border-radius:50%;background:#52525b;display:inline-block;flex-shrink:0}
+.stage-dot.active{background:#34d399;box-shadow:0 0 10px #34d399;animation:pulseDot 1.2s infinite}
+@keyframes pulseDot{0%{opacity:.4}50%{opacity:1}100%{opacity:.4}}
+
+/* Simulated Form & Checkbox Stage */
+.demo-form-stage{background:#101116;border:1px solid #262835;border-radius:10px;padding:14px}
+.demo-input-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+@media(max-width:500px){.demo-input-row{grid-template-columns:1fr}}
+.demo-input-box{background:#181920;border:1px solid #2a2c3a;border-radius:8px;padding:7px 10px;font-size:12px;color:#d4d4d8;font-family:'JetBrains Mono',monospace}
+
+/* Realistic hCaptcha Checkbox Widget */
+.hcaptcha-checkbox-card{background:#1e2029;border:1px solid #36394a;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;max-width:320px;cursor:pointer;user-select:none;margin-top:10px;box-shadow:0 4px 12px rgba(0,0,0,.3);transition:.15s}
+.hcaptcha-checkbox-card:hover{border-color:#4b4f66;background:#232530}
+.hcaptcha-cb-left{display:flex;align-items:center;gap:12px}
+.hcaptcha-box{width:26px;height:26px;border:2px solid #5a5f78;border-radius:4px;background:#15161c;display:flex;align-items:center;justify-content:center;transition:.15s;color:#34d399;font-size:14px;font-weight:700}
+.hcaptcha-box.checked{background:#059669;border-color:#34d399;color:#fff}
+.hcaptcha-box.loading{border-color:#34d399;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;color:transparent}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hcaptcha-label{font-size:13px;font-weight:600;color:#e2e8f0;font-family:-apple-system,sans-serif}
+.hcaptcha-cb-right{display:flex;flex-direction:column;align-items:center}
+.hcaptcha-logo-txt{font-size:10px;font-weight:700;color:#34d399;letter-spacing:1px;font-family:'JetBrains Mono',monospace}
+.hcaptcha-sub-txt{font-size:8px;color:#71717a;letter-spacing:.3px}
+
+/* Interactive Demo Modal Overlay */
+#demoCaptchaOverlay{display:none;position:fixed;inset:0;z-index:350;padding:16px;background:rgba(0,0,0,.78);backdrop-filter:blur(5px);align-items:center;justify-content:center}
+#demoCaptchaOverlay.on{display:flex}
+.hcaptcha-interactive-modal{width:min(420px,100%);background:#191a24;border:1px solid #373b50;border-radius:14px;box-shadow:0 28px 80px rgba(0,0,0,.8);display:flex;flex-direction:column;overflow:hidden}
+.int-head{background:#232635;border-bottom:1px solid #34384e;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.int-head-text h4{font-size:14px;font-weight:700;color:#fff;margin-bottom:3px}
+.int-head-text p{font-size:11px;color:#94a3b8}
+.int-ref-thumb{width:46px;height:46px;border-radius:6px;border:1px solid #34d399;object-fit:cover;display:none}
+.int-body{padding:14px;background:#13141c}
+.int-grid{display:grid;grid-template-columns:repeat(3, 1fr);gap:6px}
+.int-tile{position:relative;aspect-ratio:1;border-radius:6px;overflow:hidden;border:2px solid transparent;cursor:pointer;background:#0d0e14;user-select:none}
+.int-tile img{width:100%;height:100%;object-fit:cover;display:block}
+.int-tile:hover{border-color:#475569}
+.int-tile.selected{border-color:#34d399;box-shadow:0 0 0 1px #34d399}
+.int-tile-check{display:none;position:absolute;top:4px;right:4px;width:20px;height:20px;background:#059669;color:#fff;border-radius:50%;align-items:center;justify-content:center;font-size:11px;font-weight:700}
+.int-tile.selected .int-tile-check{display:flex}
+.int-foot{background:#191a24;border-top:1px solid #272a3b;padding:10px 14px;display:flex;align-items:center;justify-content:space-between}
+.int-foot-icons{font-size:16px;display:flex;gap:12px;color:#8a8a92;cursor:pointer}
+.int-actions{display:flex;gap:8px}
+.btn-int-verify{background:#059669;border:1px solid #34d399;color:#fff;font-size:12px;font-weight:700;padding:8px 16px;border-radius:7px;cursor:pointer}
+.btn-int-solve{background:#1f2937;border:1px solid #374151;color:#93c5fd;font-size:11px;font-weight:600;padding:8px 12px;border-radius:7px;cursor:pointer}
 </style></head><body>
 
 <h1>EY3 <span style="font-size:11px;color:#8a8a92;border:1px solid #26262b;border-radius:99px;padding:4px 10px;font-weight:500;letter-spacing:2px">TOKEN FORGE</span></h1>
@@ -1507,6 +1619,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <nav id="tabNav">
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
+<button data-tab="trainer" onclick="showTab('trainer')">Trainer</button>
 </nav>
 
 <div id="tabmain">
@@ -1557,6 +1670,117 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════
+     TRAINER TAB: Automated Challenge Harvester & Demo Modal
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tabtrainer" class="hide">
+  <!-- Top Stat Cards -->
+  <div class="row mb">
+    <div class="col stat"><div class="n" id="statFarmed">0</div><div class="l">Farmed Challenges</div></div>
+    <div class="col stat"><div class="n" id="statBypassed">0</div><div class="l">Instant Tokens</div></div>
+    <div class="col stat"><div class="n" id="statCycles">0</div><div class="l">Total Cycles</div></div>
+    <div class="col stat"><div class="n" id="statSpeed">2.0s</div><div class="l">Interval Delay</div></div>
+  </div>
+
+  <!-- Control & Actions Card -->
+  <div class="card">
+    <div class="flex" style="justify-content:space-between;margin-bottom:12px">
+      <h3 style="margin:0">hCaptcha Harvester & Demo Controls</h3>
+      <span id="trainerStatusBadge" class="badge badge-ok">IDLE</span>
+    </div>
+    <div class="flex">
+      <button class="primary" id="btnTrainerStart" onclick="startTrainer()">▶ START FARMING</button>
+      <button class="danger" id="btnTrainerStop" onclick="stopTrainer()" disabled>⏸ STOP</button>
+      <button id="btnTrainerStep" onclick="stepTrainer()">⏭ FARM 1 CHALLENGE</button>
+      <button id="btnOpenDemoModal" onclick="openInteractiveModal()">🎲 POPUP DEMO MODAL</button>
+      <select id="trainerSpeedSelect" style="width:auto;min-width:130px" onchange="updateTrainerSpeed(this.value)">
+        <option value="1.0">Fast (1.0s)</option>
+        <option value="2.0" selected>Normal (2.0s)</option>
+        <option value="3.5">Relaxed (3.5s)</option>
+      </select>
+      <button onclick="clearTrainerQuestions()">🗑 Clear</button>
+    </div>
+  </div>
+
+  <!-- Live Stage Banner -->
+  <div class="stage-banner">
+    <span class="stage-dot" id="trainerStageDot"></span>
+    <span id="trainerStageText">Trainer ready. Click START FARMING to harvest challenges.</span>
+  </div>
+
+  <!-- Main 2-Column Grid -->
+  <div class="trainer-grid">
+    <!-- Left Column: Modal Screen & Demo Site Form -->
+    <div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+          <h3 style="margin:0">Latest Challenge (Modal ONLY)</h3>
+          <button class="btn-copy-q" id="btnCopyLatest" onclick="copyLatestQuestion()" style="display:none">📋 Copy Question</button>
+        </div>
+        <div class="trainer-ss-box">
+          <div id="trainerPlaceholder" class="trainer-ph">
+            Start farming to harvest challenges.<br>Takes screenshot of modal ONLY.
+          </div>
+          <img id="trainerModalImg" style="display:none" alt="hCaptcha Challenge Modal Screenshot">
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Simulated Demo Site (Google / Demo Auto-Fill)</h3>
+        <div class="demo-form-stage">
+          <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET: https://accounts.hcaptcha.com/demo</div>
+          <div class="demo-input-row">
+            <div>
+              <label>Name (1-2 words)</label>
+              <input class="demo-input-box" id="demoFormName" readonly placeholder="Auto-fills 1-2 words">
+            </div>
+            <div>
+              <label>Email</label>
+              <input class="demo-input-box" id="demoFormEmail" readonly placeholder="demo@example.com">
+            </div>
+          </div>
+          <div style="margin-bottom:8px">
+            <label>Comment / Words (1-2 words)</label>
+            <input class="demo-input-box" id="demoFormComment" readonly placeholder="Auto-fills 1-2 words">
+          </div>
+
+          <!-- Realistic Checkbox Widget -->
+          <div class="hcaptcha-checkbox-card" id="demoCheckboxWidget" onclick="onCheckboxWidgetClick()">
+            <div class="hcaptcha-cb-left">
+              <div class="hcaptcha-box" id="demoCheckboxBox">
+                <span id="demoCheckboxIcon"></span>
+              </div>
+              <div class="hcaptcha-label" id="demoCheckboxLabel">I am human</div>
+            </div>
+            <div class="hcaptcha-cb-right">
+              <div class="hcaptcha-logo-txt">hCaptcha</div>
+              <div class="hcaptcha-sub-txt">Privacy · Terms</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Farmed Questions List -->
+    <div>
+      <div class="card">
+        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+          <h3 style="margin:0">Farmed Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
+          <div class="flex" style="gap:6px">
+            <button class="btn-copy-q" onclick="copyAllQuestions()">📋 Copy All</button>
+            <button class="btn-copy-q" onclick="exportQuestionsJson()">⬇️ JSON</button>
+          </div>
+        </div>
+        <div class="q-list-wrap" id="trainerQuestionsList">
+          <div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">
+            No questions farmed yet.<br>Click START FARMING or FARM 1 CHALLENGE.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="logOverlay" role="dialog" aria-modal="true" aria-labelledby="allLogsTitle">
   <div class="logs-modal">
     <div class="logs-head">
@@ -1564,6 +1788,38 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
       <button class="logs-close" type="button" onclick="closeAllLogs()" aria-label="Close all logs">X</button>
     </div>
     <div id="allLogsBox" class="all-logs-box">Loading logs...</div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     INTERACTIVE DEMO MODAL (Works directly on your screen)
+     ═══════════════════════════════════════════════════════════ -->
+<div id="demoCaptchaOverlay" role="dialog" aria-modal="true" aria-labelledby="intModalTitle">
+  <div class="hcaptcha-interactive-modal">
+    <div class="int-head">
+      <div class="int-head-text">
+        <h4 id="intModalTitle">Select all matching items</h4>
+        <p id="intModalSub">Click verify once there are none left</p>
+      </div>
+      <img id="intRefThumb" class="int-ref-thumb" alt="Reference">
+      <button style="margin-left:auto;background:none;border:none;color:#94a3b8;font-size:18px;cursor:pointer;padding:4px 8px" onclick="closeInteractiveModal()" aria-label="Close">✕</button>
+    </div>
+    <div class="int-body">
+      <div class="int-grid" id="intTilesGrid">
+        <!-- 9 Tiles injected here -->
+      </div>
+    </div>
+    <div class="int-foot">
+      <div class="int-foot-icons">
+        <span title="Reload challenge" onclick="loadNewInteractiveChallenge()">🔄</span>
+        <span title="Audio challenge" onclick="toast('Audio challenge requested')">🎧</span>
+        <span title="Info" onclick="toast('hCaptcha Interactive Challenge Demo')">ℹ️</span>
+      </div>
+      <div class="int-actions">
+        <button class="btn-int-solve" type="button" onclick="autoSolveInteractive()">AUTO SOLVE</button>
+        <button class="btn-int-verify" id="btnIntVerify" type="button" onclick="verifyInteractiveChallenge()">VERIFY</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1583,7 +1839,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens'];
+  var ids=['main','tokens','trainer'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -1591,6 +1847,9 @@ function showTab(name){
   document.querySelectorAll('#tabNav button').forEach(function(b){
     b.classList.toggle('act',b.getAttribute('data-tab')===name);
   });
+  if(name==='trainer'){
+    refreshTrainer();
+  }
 }
 window.showTab=showTab;
 
@@ -1656,7 +1915,6 @@ function renderLogs(box,logs,compact){
     var cutoff=Date.now()/1000-300;
     rendered=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;})
       .map(compactLogLine).filter(Boolean);
-    // Collapse repeated browser-crash summaries while full detail remains in ALL LOGS.
     rendered=rendered.filter(function(line,index,all){return index===0||line!==all[index-1];}).slice(-30);
   }else{
     rendered=items.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');});
@@ -1724,39 +1982,397 @@ function copyLogs(){
   fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
     var logs=(d&&d.all_logs||d&&d.logs||[]);
     var text=logs.map(function(l){return(l.time||'')+' '+(l.message||l.m||'')}).join('\n');
-    function done(){toast('Logs copied to clipboard');}
-    function fallback(t,cb){
-      var ta=document.createElement('textarea');
-      ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
-      document.body.appendChild(ta); ta.select();
-      try{document.execCommand('copy');cb();}
-      catch(e){alert('Copy failed - use ALL LOGS instead');}
-      document.body.removeChild(ta);
-    }
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done).catch(function(){fallback(text,done);});
-    }else{fallback(text,done);}
+    copyToClipboard(text, 'Logs copied to clipboard');
   }).catch(function(e){alert('Error: '+e.message);});
 }
 window.copyLogs=copyLogs;
+
+// ── Generic Clipboard Helper ──
+function copyToClipboard(text, successMsg, btn){
+  function done(){
+    if(successMsg)toast(successMsg);
+    if(btn){
+      btn.classList.add('copied');
+      var old = btn.textContent;
+      btn.textContent = '✓ Copied!';
+      setTimeout(function(){btn.classList.remove('copied');btn.textContent=old;}, 1500);
+    }
+  }
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(function(){fallbackCopy(text,done);});
+  }else{
+    fallbackCopy(text,done);
+  }
+}
+function fallbackCopy(text,cb){
+  var ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try{document.execCommand('copy');cb();}
+  catch(e){alert('Copy failed');}
+  document.body.removeChild(ta);
+}
+
+// ═══════════════════════════════════════════════════════════
+// TRAINER / HARVESTER JAVASCRIPT LOGIC
+// ═══════════════════════════════════════════════════════════
+var trainerState = {
+  running: false,
+  questions: [],
+  latestQuestion: '',
+  speed: 2.0
+};
+
+function startTrainer(){
+  var speed = parseFloat($('trainerSpeedSelect').value) || 2.0;
+  api('/trainer/start', {body: {speed: speed}}).then(function(r){return r.json();})
+    .then(function(d){
+      toast(d.message||'Trainer started');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function stopTrainer(){
+  api('/trainer/stop').then(function(r){return r.json();})
+    .then(function(d){
+      toast(d.message||'Trainer stopped');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function stepTrainer(){
+  toast('Harvesting 1 challenge...');
+  api('/trainer/step').then(function(r){return r.json();})
+    .then(function(d){
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function clearTrainerQuestions(){
+  api('/trainer/clear').then(function(r){return r.json();})
+    .then(function(d){
+      toast('Questions cleared');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function updateTrainerSpeed(val){
+  var speed = parseFloat(val) || 2.0;
+  $('statSpeed').textContent = speed.toFixed(1) + 's';
+  if(trainerState.running){
+    api('/trainer/start', {body: {speed: speed}}).catch(function(){});
+  }
+}
+window.startTrainer = startTrainer;
+window.stopTrainer = stopTrainer;
+window.stepTrainer = stepTrainer;
+window.clearTrainerQuestions = clearTrainerQuestions;
+window.updateTrainerSpeed = updateTrainerSpeed;
+
+function copySingleQuestion(qText, btn){
+  copyToClipboard(qText, 'Copied: "' + qText + '"', btn);
+}
+window.copySingleQuestion = copySingleQuestion;
+
+function copyLatestQuestion(){
+  if(trainerState.latestQuestion){
+    copyToClipboard(trainerState.latestQuestion, 'Copied question: ' + trainerState.latestQuestion);
+  }
+}
+window.copyLatestQuestion = copyLatestQuestion;
+
+function copyAllQuestions(){
+  if(!trainerState.questions||!trainerState.questions.length){
+    toast('No questions to copy');
+    return;
+  }
+  var fullText = trainerState.questions.map(function(q, i){
+    return (i+1) + '. ' + (q.question || q.full_prompt);
+  }).join('\n');
+  copyToClipboard(fullText, 'Copied ' + trainerState.questions.length + ' questions to clipboard');
+}
+window.copyAllQuestions = copyAllQuestions;
+
+function exportQuestionsJson(){
+  if(!trainerState.questions||!trainerState.questions.length){
+    toast('No questions to export');
+    return;
+  }
+  var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(trainerState.questions, null, 2));
+  var dlAnchor = document.createElement('a');
+  dlAnchor.setAttribute("href", dataStr);
+  dlAnchor.setAttribute("download", "hcaptcha_farmed_questions.json");
+  document.body.appendChild(dlAnchor);
+  dlAnchor.click();
+  dlAnchor.remove();
+  toast('Exported questions JSON');
+}
+window.exportQuestionsJson = exportQuestionsJson;
+
+function renderQuestionsList(questions){
+  var wrap = $('trainerQuestionsList');
+  if(!wrap) return;
+  if(!questions || !questions.length){
+    wrap.innerHTML = '<div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">No questions farmed yet.<br>Click START FARMING or FARM 1 CHALLENGE.</div>';
+    return;
+  }
+  var html = '';
+  // Show in order, with newest highlighted
+  questions.forEach(function(q, idx){
+    var num = (idx + 1);
+    var qTitle = q.question || q.full_prompt || 'Challenge Question';
+    var safeText = qTitle.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    var badgeType = q.type || 'GRID';
+    html += '<div class="q-row">' +
+      '<div class="q-num">' + num + '.</div>' +
+      '<div class="q-body">' +
+        '<div class="q-title">' + qTitle + '</div>' +
+        '<div class="q-meta">' +
+          '<span class="badge-tag">' + badgeType + '</span>' +
+          '<span>' + (q.time||'') + '</span>' +
+          (q.full_prompt && q.full_prompt !== qTitle ? '<span style="color:#64748b">· ' + q.full_prompt + '</span>' : '') +
+        '</div>' +
+      '</div>' +
+      '<button class="btn-copy-q" onclick="copySingleQuestion(\'' + safeText + '\', this)">📋 Copy</button>' +
+    '</div>';
+  });
+  wrap.innerHTML = html;
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function refreshTrainer(){
+  fetch('/trainer/status?t=' + Date.now()).then(function(r){return r.json();})
+    .then(function(s){
+      trainerState.running = !!s.running;
+      trainerState.questions = s.questions || [];
+      trainerState.latestQuestion = s.latest_question || '';
+      
+      // Update Stat Numbers
+      $('statFarmed').textContent = s.farmed_count || 0;
+      $('statBypassed').textContent = s.pass_count || 0;
+      $('statCycles').textContent = s.total_cycles || 0;
+      $('qCountBadge').textContent = (s.questions && s.questions.length) || 0;
+      
+      // Buttons state
+      $('btnTrainerStart').disabled = !!s.running;
+      $('btnTrainerStop').disabled = !s.running;
+      
+      // Status badge
+      var badge = $('trainerStatusBadge');
+      if(s.running){
+        badge.className = 'badge badge-ok';
+        badge.textContent = 'FARMING LOOP';
+      }else{
+        badge.className = 'badge badge-warn';
+        badge.textContent = 'IDLE';
+      }
+      
+      // Stage Dot & Banner
+      var dot = $('trainerStageDot');
+      if(s.running){
+        dot.className = 'stage-dot active';
+      }else{
+        dot.className = 'stage-dot';
+      }
+      $('trainerStageText').textContent = s.status_text || 'Trainer ready.';
+      
+      // Auto-filled Demo Form inputs
+      if(s.form){
+        $('demoFormName').value = s.form.name || '';
+        $('demoFormEmail').value = s.form.email || '';
+        $('demoFormComment').value = s.form.comment || '';
+      }
+      
+      // Simulated Checkbox state
+      var cbBox = $('demoCheckboxBox');
+      var cbLabel = $('demoCheckboxLabel');
+      if(s.stage === 'clicking_checkbox' || s.stage === 'challenge_loaded'){
+        cbBox.className = 'hcaptcha-box loading';
+        cbLabel.textContent = 'Verifying...';
+      } else if(s.stage === 'instant_pass'){
+        cbBox.className = 'hcaptcha-box checked';
+        cbBox.textContent = '✓';
+        cbLabel.textContent = 'Verified (Token)';
+      } else if(s.stage === 'captured'){
+        cbBox.className = 'hcaptcha-box';
+        cbBox.textContent = '';
+        cbLabel.textContent = 'Challenge Loaded';
+      } else {
+        cbBox.className = 'hcaptcha-box';
+        cbBox.textContent = '';
+        cbLabel.textContent = 'I am human';
+      }
+      
+      // Modal ONLY Screenshot image
+      var img = $('trainerModalImg');
+      var ph = $('trainerPlaceholder');
+      var btnCopyLatest = $('btnCopyLatest');
+      if(s.latest_screenshot){
+        img.src = s.latest_screenshot;
+        img.style.display = 'block';
+        if(ph) ph.style.display = 'none';
+        if(btnCopyLatest) btnCopyLatest.style.display = 'inline-block';
+      } else {
+        img.style.display = 'none';
+        if(ph) ph.style.display = 'block';
+        if(btnCopyLatest) btnCopyLatest.style.display = 'none';
+      }
+      
+      // Farmed Questions List
+      renderQuestionsList(s.questions);
+    }).catch(function(){});
+}
+window.refreshTrainer = refreshTrainer;
+
+// ═══════════════════════════════════════════════════════════
+// INTERACTIVE MODAL COMPONENT (Works in screen)
+// ═══════════════════════════════════════════════════════════
+var activeInteractive = null;
+var selectedTiles = new Set();
+
+function openInteractiveModal(){
+  var overlay = $('demoCaptchaOverlay');
+  if(!overlay) return;
+  overlay.classList.add('on');
+  loadNewInteractiveChallenge();
+}
+function closeInteractiveModal(){
+  var overlay = $('demoCaptchaOverlay');
+  if(overlay) overlay.classList.remove('on');
+}
+window.openInteractiveModal = openInteractiveModal;
+window.closeInteractiveModal = closeInteractiveModal;
+
+function onCheckboxWidgetClick(){
+  var cbBox = $('demoCheckboxBox');
+  var cbLabel = $('demoCheckboxLabel');
+  cbBox.className = 'hcaptcha-box loading';
+  cbLabel.textContent = 'Loading challenge...';
+  setTimeout(function(){
+    cbBox.className = 'hcaptcha-box';
+    cbLabel.textContent = 'I am human';
+    openInteractiveModal();
+  }, 400);
+}
+window.onCheckboxWidgetClick = onCheckboxWidgetClick;
+
+function loadNewInteractiveChallenge(){
+  selectedTiles.clear();
+  var grid = $('intTilesGrid');
+  grid.innerHTML = '<div style="grid-column:1/span 3;color:#8a8a92;font-size:12px;padding:30px;text-align:center">Loading challenge tiles...</div>';
+  
+  fetch('/trainer/interactive/new?t=' + Date.now()).then(function(r){return r.json();})
+    .then(function(d){
+      activeInteractive = d;
+      $('intModalTitle').textContent = d.short_question || 'Select all matching items';
+      $('intModalSub').textContent = d.prompt || 'Click verify once there are none left';
+      
+      var refImg = $('intRefThumb');
+      if(d.reference_image){
+        refImg.src = d.reference_image;
+        refImg.style.display = 'block';
+      } else {
+        refImg.style.display = 'none';
+      }
+      
+      var html = '';
+      (d.tiles || []).forEach(function(t){
+        html += '<div class="int-tile" id="intTile_' + t.index + '" onclick="toggleTileSelect(' + t.index + ')">' +
+          '<img src="' + t.image + '" alt="' + t.name + '">' +
+          '<div class="int-tile-check">✓</div>' +
+        '</div>';
+      });
+      grid.innerHTML = html;
+    }).catch(function(){
+      grid.innerHTML = '<div style="grid-column:1/span 3;color:#f87171;font-size:12px;padding:20px;text-align:center">Failed to load challenge</div>';
+    });
+}
+window.loadNewInteractiveChallenge = loadNewInteractiveChallenge;
+
+function toggleTileSelect(index){
+  var el = $('intTile_' + index);
+  if(!el) return;
+  if(selectedTiles.has(index)){
+    selectedTiles.delete(index);
+    el.classList.remove('selected');
+  } else {
+    selectedTiles.add(index);
+    el.classList.add('selected');
+  }
+}
+window.toggleTileSelect = toggleTileSelect;
+
+function verifyInteractiveChallenge(){
+  if(!activeInteractive){
+    toast('No active challenge');
+    return;
+  }
+  var selectedArr = Array.from(selectedTiles);
+  api('/trainer/interactive/verify', {body: {selected: selectedArr}}).then(function(r){return r.json();})
+    .then(function(res){
+      if(res.passed){
+        toast('✓ VERIFIED! Human token: ' + (res.token ? res.token.slice(0, 16) + '...' : 'PASS'));
+        var cbBox = $('demoCheckboxBox');
+        var cbLabel = $('demoCheckboxLabel');
+        if(cbBox){cbBox.className = 'hcaptcha-box checked'; cbBox.textContent = '✓';}
+        if(cbLabel){cbLabel.textContent = 'Verified!';}
+        setTimeout(function(){
+          closeInteractiveModal();
+        }, 900);
+      } else {
+        toast('❌ Incorrect selection. Try again or auto-solve!');
+        // Shake modal
+        var m = document.querySelector('.hcaptcha-interactive-modal');
+        if(m){
+          m.style.transform = 'translateX(6px)';
+          setTimeout(function(){m.style.transform='translateX(-6px)';}, 80);
+          setTimeout(function(){m.style.transform='translateX(4px)';}, 160);
+          setTimeout(function(){m.style.transform='none';}, 240);
+        }
+      }
+    }).catch(function(e){toast('Verification error: ' + e.message);});
+}
+window.verifyInteractiveChallenge = verifyInteractiveChallenge;
+
+function autoSolveInteractive(){
+  if(!activeInteractive || !activeInteractive.tiles) return;
+  selectedTiles.clear();
+  activeInteractive.tiles.forEach(function(t){
+    var el = $('intTile_' + t.index);
+    if(t.is_target){
+      selectedTiles.add(t.index);
+      if(el) el.classList.add('selected');
+    } else {
+      if(el) el.classList.remove('selected');
+    }
+  });
+  toast('Auto-selected matching target tiles! Click VERIFY.');
+}
+window.autoSolveInteractive = autoSolveInteractive;
+
 (function(){
   var overlay=$('logOverlay');
   if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
-  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAllLogs();});
+  var demoOverlay=$('demoCaptchaOverlay');
+  if(demoOverlay)demoOverlay.addEventListener('click',function(e){if(e.target===demoOverlay)closeInteractiveModal();});
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'){closeAllLogs();closeInteractiveModal();}
+  });
 })();
 
 // Init
 refreshStatus();
 refreshLogs();
 refreshTokens();
+refreshTrainer();
 setInterval(refreshStatus,5000);
 setInterval(refreshLogs,2200);
 setInterval(refreshTokens,12000);
+setInterval(function(){
+  var tabTrainer = $('tabtrainer');
+  if(tabTrainer && !tabTrainer.classList.contains('hide')){
+    refreshTrainer();
+  }
+}, 1800);
 </script>
 </body></html>
-
 '''
-
 
 if __name__ == "__main__":
     main()
