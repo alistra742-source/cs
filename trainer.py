@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import random
 import re
 import threading
@@ -31,9 +32,16 @@ FORM_FIELD_SELECTORS = (
     'input:not([type])',
     'textarea',
 )
+# Prefer the checkbox widget, never the challenge modal. The loose
+# ``iframe[src*="hcaptcha.com"]`` match also hits the challenge iframe.
 WIDGET_IFRAME_SELECTOR = (
-    'iframe[title*="hCaptcha"], '
-    'iframe[src*="hcaptcha.com"]'
+    'iframe[title*="checkbox" i], '
+    'iframe[title*="Widget containing checkbox" i], '
+    'iframe[src*="frame=checkbox"], '
+    'iframe[src*="newassets.hcaptcha.com"]'
+)
+ANY_HCAPTCHA_IFRAME_SELECTOR = (
+    'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i]'
 )
 CHALLENGE_IFRAME_SELECTOR = (
     'iframe[title*="hCaptcha challenge"], '
@@ -156,6 +164,7 @@ class TrainerEngine:
         self.latest_question = ""
         self.questions: List[Dict[str, Any]] = []
         self.logs: List[str] = []
+        self.pointer_log: List[Dict[str, Any]] = []
 
         # Owned by the runner thread/event loop.  They are kept here only so
         # shutdown is observable and no second browser is spawned by a second
@@ -323,10 +332,73 @@ class TrainerEngine:
                 "latest_screenshot": self.latest_screenshot,
                 "questions": [dict(q) for q in self.questions],
                 "logs": list(self.logs[-20:]),
+                "pointer_log": [dict(p) for p in self.pointer_log[-20:]],
                 "target_url": TARGET_DEMO_URL,
                 "human_in_the_loop": True,
                 "screenshot_interval": SCREENSHOT_INTERVAL_S,
             }
+
+    def note_pointer(self, entry: Dict[str, Any]) -> None:
+        """Record an operator click/drag from the LIVE camera."""
+        if not isinstance(entry, dict):
+            return
+        kind = str(entry.get("kind") or "")
+        rec = dict(entry)
+        rec.setdefault("t", time.strftime("%H:%M:%S"))
+        with self._lock:
+            self.pointer_log.append(rec)
+            if len(self.pointer_log) > 40:
+                self.pointer_log = self.pointer_log[-40:]
+        if kind == "click":
+            self._add_log(
+                f"Operator click at ({float(entry.get('x', 0)):.0f},"
+                f"{float(entry.get('y', 0)):.0f})."
+            )
+        elif kind == "drag":
+            self._add_log(
+                f"Operator drag ({float(entry.get('x1', 0)):.0f},"
+                f"{float(entry.get('y1', 0)):.0f}) → "
+                f"({float(entry.get('x2', 0)):.0f},"
+                f"{float(entry.get('y2', 0)):.0f})."
+            )
+
+    def note_live_challenge(self, image: str, question: str = "") -> None:
+        """Publish a live-browser challenge screenshot into the trainer pane.
+
+        Does not mint tokens or invent a prompt. A new question is recorded
+        only when the challenge iframe itself produced readable text that
+        differs from the last captured instruction.
+        """
+        image = str(image or "")
+        question = str(question or "").strip()
+        if not image and not question:
+            return
+        with self._lock:
+            if image:
+                self.latest_screenshot = image
+            if question and question != self.latest_question:
+                q_id = len(self.questions) + 1
+                now = time.strftime("%H:%M:%S")
+                entry = {
+                    "id": q_id,
+                    "question": question,
+                    "full_prompt": question,
+                    "type": "REAL HCAPTCHA",
+                    "time": now,
+                    "url": TARGET_DEMO_URL,
+                    "display": f"{q_id}. {question}",
+                }
+                self.questions.append(entry)
+                self.captured_count += 1
+                self.latest_question = question
+                self.latest_challenge = {
+                    "id": q_id,
+                    "question": question,
+                    "type": "REAL HCAPTCHA",
+                    "timestamp": now,
+                    "url": TARGET_DEMO_URL,
+                }
+                self._add_log(f"Live browser captured challenge #{q_id}: {question}")
 
     # ── Browser helpers ───────────────────────────────────────────────────
 
@@ -370,69 +442,348 @@ class TrainerEngine:
                 continue
         return False
 
-    async def _find_frame(self, page, selector: str):
-        """Return (iframe locator, frame) for the first visible matching frame."""
+    def _is_challenge_frame_url(self, url: str) -> bool:
+        u = (url or "").lower()
+        return "hcaptcha-challenge" in u or "frame=challenge" in u
+
+    def _is_widget_frame_url(self, url: str) -> bool:
+        u = (url or "").lower()
+        if "hcaptcha" not in u:
+            return False
+        if self._is_challenge_frame_url(u):
+            return False
+        return True
+
+    async def _refresh_page_frames(self, page) -> None:
         try:
-            refresh_frames = getattr(page, "_refresh_frames", None)
-            if callable(refresh_frames):
-                await refresh_frames(force=True)
+            refresh = getattr(page, "_refresh_frames", None)
+            if callable(refresh):
+                await refresh(force=True)
+                return
         except Exception:
             pass
         try:
-            locs = await self._visible_locators(page, selector)
+            await page.evaluate("document.readyState")
+        except Exception:
+            pass
+
+    async def _resolve_hcaptcha_frame(self, page, iframe, want_checkbox: bool = True):
+        """Resolve a live Frame for an hCaptcha iframe.
+
+        ``content_frame()`` is None for attached cross-origin widgets on
+        the nodriver engine. Walk ``page.frames`` the same way the Discord
+        bot does, preferring a visible checkbox widget over its hidden twin
+        and never picking the challenge modal when we want the checkbox.
+        """
+        try:
+            handle = await iframe.element_handle(timeout=4000)
+            frame = await handle.content_frame() if handle else None
+            if frame is not None:
+                return frame
+        except Exception:
+            pass
+        src = ""
+        try:
+            src = await iframe.get_attribute("src") or ""
+        except Exception:
+            src = ""
+        await self._refresh_page_frames(page)
+        probe_js = """() => {
+            const b = document.body;
+            return JSON.stringify({
+                cb: !!document.querySelector(
+                    '#checkbox, [role="checkbox"], .checkbox, '
+                    + 'input[type="checkbox"], [aria-checked], .button-submit'),
+                hidden: b ? b.getAttribute('aria-hidden') : null
+            });
+        }"""
+        best = None
+        for f in list(getattr(page, "frames", None) or []):
+            try:
+                furl = f.url or ""
+            except Exception:
+                continue
+            if "hcaptcha" not in furl.lower():
+                continue
+            if want_checkbox and self._is_challenge_frame_url(furl):
+                continue
+            info = None
+            try:
+                raw = await f.evaluate(probe_js)
+                info = json.loads(raw) if raw else None
+            except Exception:
+                info = None
+            if src and src in furl:
+                best = best or f
+            if info and info.get("cb"):
+                if info.get("hidden") != "true":
+                    return f
+                if best is None:
+                    best = f
+        return best
+
+    async def _find_frame(self, page, selector: str):
+        """Return (iframe locator, frame) for the first matching iframe."""
+        await self._refresh_page_frames(page)
+        try:
+            locs = await page.locator(selector).all()
         except Exception:
             locs = []
+        want_checkbox = "challenge" not in selector.lower()
         for iframe in locs:
             try:
-                handle = await iframe.element_handle(timeout=2500)
-                frame = await handle.content_frame() if handle else None
-                if frame is not None:
-                    return iframe, frame
+                box = await iframe.bounding_box()
             except Exception:
-                pass
+                box = None
+            if box is not None and float(box.get("width") or 0) < 8:
+                continue
+            frame = await self._resolve_hcaptcha_frame(
+                page, iframe, want_checkbox=want_checkbox)
+            if frame is not None:
+                return iframe, frame
+        return None, None
+
+    async def _find_widget(self, page):
+        """Locate the checkbox widget iframe + its live frame."""
+        for selector in (WIDGET_IFRAME_SELECTOR, ANY_HCAPTCHA_IFRAME_SELECTOR):
+            iframe, frame = await self._find_frame(page, selector)
+            if iframe is None or frame is None:
+                continue
+            try:
+                furl = frame.url or ""
+            except Exception:
+                furl = ""
+            if self._is_challenge_frame_url(furl):
+                continue
+            return iframe, frame
         return None, None
 
     async def _wait_for_checkbox(self, page, timeout: float = 35.0):
         deadline = time.monotonic() + timeout
+        last_log = 0.0
         while time.monotonic() < deadline and not self._stopped():
-            iframe, frame = await self._find_frame(page, WIDGET_IFRAME_SELECTOR)
-            if frame is not None:
+            iframe, frame = await self._find_widget(page)
+            if iframe is not None and frame is not None:
                 try:
                     controls = frame.locator(", ".join(CHECKBOX_SELECTOR))
                     if await controls.count() > 0:
                         return iframe, frame, controls.first
                 except Exception:
                     pass
-            # The frame cache is refreshed by the engine after evaluate calls;
-            # this also gives hCaptcha time to attach its iframe after load.
+                # Frame is up even if the checkbox node is not queryable yet
+                # (0x0 painted widget). Still return it so we can click the
+                # iframe's left-center, where hCaptcha draws the box.
+                return iframe, frame, None
+            now = time.monotonic()
+            if now - last_log >= 6.0:
+                last_log = now
+                self._add_log("Still waiting for the official hCaptcha checkbox widget…")
             await asyncio.sleep(0.35)
         return None, None, None
 
-    async def _click_real_checkbox(self, page) -> bool:
-        iframe, frame, checkbox = await self._wait_for_checkbox(page)
-        if iframe is None or frame is None or checkbox is None:
-            return False
-        try:
-            await checkbox.click(timeout=5000)
-            self._add_log("Clicked the real hCaptcha checkbox.")
-            return True
-        except Exception as first_error:
-            # A few Chrome builds expose the checkbox through frame_locator
-            # before content_frame() has refreshed.  Retry with a trusted
-            # frame-scoped locator; do not use JS click or mutate hCaptcha DOM.
+    async def _widget_page_point(self, page, iframe, frame):
+        """Page-space click target for the checkbox (iframe left-center fallback)."""
+        point = None
+        if frame is not None:
             try:
-                src = await iframe.get_attribute("src") or ""
-                if src:
-                    fl = page.frame_locator(f'iframe[src="{src}"]')
-                    controls = fl.locator(", ".join(CHECKBOX_SELECTOR))
-                    await controls.first.click(timeout=5000)
-                    self._add_log("Clicked the real hCaptcha checkbox (frame locator).")
+                point = await frame.evaluate("""() => {
+                    const sels = ['[role="checkbox"]', '#checkbox', '.checkbox',
+                                  'input[type="checkbox"]', '[aria-checked]',
+                                  '.button-submit'];
+                    let el = null;
+                    for (const s of sels) { el = document.querySelector(s); if (el) break; }
+                    if (!el) return null;
+                    const sized = (n) => {
+                        if (!n) return null;
+                        const r = n.getBoundingClientRect();
+                        return (r && r.width > 0 && r.height > 0)
+                            ? {left: r.left, top: r.top, width: r.width, height: r.height}
+                            : null;
+                    };
+                    let rect = sized(el);
+                    if (!rect) {
+                        let best = null, bestArea = 0;
+                        const walk = (n) => {
+                            const r = sized(n);
+                            if (r) {
+                                const a = r.width * r.height;
+                                if (a > bestArea) { best = r; bestArea = a; }
+                            }
+                            for (const c of n.children) walk(c);
+                        };
+                        for (const c of el.children) walk(c);
+                        if (best) rect = best;
+                    }
+                    if (!rect) {
+                        let p = el.parentElement;
+                        while (p) {
+                            const r = sized(p);
+                            if (r) { rect = r; break; }
+                            p = p.parentElement;
+                        }
+                    }
+                    if (!rect) return null;
+                    return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+                }""")
+            except Exception:
+                point = None
+        try:
+            box = await iframe.bounding_box()
+        except Exception:
+            box = None
+        if not box or float(box.get("width") or 0) < 4:
+            return None
+        if point and point.get("x") is not None:
+            return (float(box["x"]) + float(point["x"]),
+                    float(box["y"]) + float(point["y"]))
+        # hCaptcha paints the box on the left edge, vertically centered.
+        return (float(box["x"]) + float(box.get("width") or 0) * 0.12,
+                float(box["y"]) + float(box.get("height") or 0) * 0.5)
+
+    async def _checkbox_click_landed(self, page, frame) -> bool:
+        if frame is not None:
+            try:
+                flipped = await frame.evaluate(
+                    """() => {
+                        const el = document.querySelector('[aria-checked]');
+                        return !!el && el.getAttribute('aria-checked') === 'true';
+                    }""")
+                if flipped:
                     return True
-            except Exception as second_error:
-                self._add_log(
-                    f"Real checkbox click failed: {type(first_error).__name__}; "
-                    f"frame retry: {type(second_error).__name__}"
-                )
+            except Exception:
+                pass
+        try:
+            chall = page.locator(CHALLENGE_IFRAME_SELECTOR)
+            if await chall.count() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if await self._read_response_token(page):
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _confirm_checkbox(self, page, frame, attempt: str) -> bool:
+        for _ in range(6):
+            if await self._checkbox_click_landed(page, frame):
+                self._add_log(f"Clicked the real hCaptcha checkbox ({attempt}).")
+                return True
+            await asyncio.sleep(0.35)
+        return False
+
+    async def _click_real_checkbox(self, page) -> bool:
+        """Click the official demo checkbox with the same strategies as the bot.
+
+        A lone Playwright locator click inside a cross-origin widget iframe
+        almost never registers on this engine. Use frame_locator, a real
+        page-space mouse click, keyboard activation, then JS el.click().
+        """
+        iframe, frame, checkbox = await self._wait_for_checkbox(page)
+        if iframe is None:
+            self._add_log("No live hCaptcha checkbox widget found on the official demo.")
+            return False
+        full_src = ""
+        try:
+            full_src = await iframe.get_attribute("src") or ""
+        except Exception:
+            full_src = ""
+        page_point = await self._widget_page_point(page, iframe, frame)
+        if page_point:
+            self._add_log(
+                f"Checkbox target at page ({page_point[0]:.0f},{page_point[1]:.0f})."
+            )
+
+        for attempt in range(1, 6):
+            if attempt > 1:
+                await asyncio.sleep(0.4)
+                iframe2, frame2 = await self._find_widget(page)
+                if iframe2 is not None:
+                    iframe = iframe2
+                if frame2 is not None:
+                    frame = frame2
+                    try:
+                        full_src = await iframe.get_attribute("src") or full_src
+                    except Exception:
+                        pass
+                    page_point = await self._widget_page_point(page, iframe, frame) or page_point
+
+            if full_src and "hcaptcha" in full_src.lower():
+                try:
+                    fl = page.frame_locator(f'iframe[src="{full_src}"]')
+                    fl_cb = fl.locator(", ".join(CHECKBOX_SELECTOR))
+                    for ci in range(min(4, await fl_cb.count())):
+                        try:
+                            await fl_cb.nth(ci).click(timeout=3000)
+                            if await self._confirm_checkbox(
+                                    page, frame, f"frame click #{ci} attempt {attempt}"):
+                                return True
+                        except Exception:
+                            continue
+                except Exception as exc:
+                    self._add_log(
+                        f"frame_locator checkbox click failed: {type(exc).__name__}"
+                    )
+
+            if page_point:
+                try:
+                    cx, cy = page_point
+                    try:
+                        await page.mouse.move(cx, cy, steps=2)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.12)
+                    await page.mouse.click(cx, cy)
+                    if await self._confirm_checkbox(
+                            page, frame, f"mouse click attempt {attempt}"):
+                        return True
+                except Exception as exc:
+                    self._add_log(f"Mouse checkbox click failed: {type(exc).__name__}")
+
+            if checkbox is not None:
+                try:
+                    await checkbox.click(timeout=3000)
+                    if await self._confirm_checkbox(
+                            page, frame, f"locator click attempt {attempt}"):
+                        return True
+                except Exception:
+                    pass
+
+            if frame is not None:
+                try:
+                    await frame.evaluate("""() => {
+                        const el = document.querySelector(
+                            '[role="checkbox"], #checkbox, .checkbox, [aria-checked], .button-submit');
+                        if (el) el.focus();
+                    }""")
+                    await asyncio.sleep(0.08)
+                    await page.keyboard.press("Enter")
+                    if await self._confirm_checkbox(
+                            page, frame, f"keyboard Enter attempt {attempt}"):
+                        return True
+                    await page.keyboard.press("Space")
+                    if await self._confirm_checkbox(
+                            page, frame, f"keyboard Space attempt {attempt}"):
+                        return True
+                except Exception as exc:
+                    self._add_log(f"Keyboard checkbox activation failed: {type(exc).__name__}")
+
+                try:
+                    js_clicked = await frame.evaluate("""() => {
+                        const el = document.querySelector(
+                            '[role="checkbox"], #checkbox, .checkbox, input[type="checkbox"], [aria-checked], .button-submit');
+                        if (!el) return false;
+                        el.click();
+                        return true;
+                    }""")
+                    if js_clicked and await self._confirm_checkbox(
+                            page, frame, f"JS click attempt {attempt}"):
+                        return True
+                except Exception as exc:
+                    self._add_log(f"JS checkbox click failed: {type(exc).__name__}")
+
+        self._add_log("hCaptcha checkbox click never confirmed after 5 attempts.")
         return False
 
     async def _read_response_token(self, page) -> bool:

@@ -144,58 +144,101 @@ async def _element_shot(tab, box: dict) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 # Mouse
 # ─────────────────────────────────────────────────────────────────────────────
+_BUTTON_MASK = {"left": 1, "right": 2, "middle": 4}
+
+
+def mouse_move_points(sx: float, sy: float, x: float, y: float,
+                      steps: Optional[int] = None) -> List[tuple]:
+    """Waypoints from the current cursor to (x, y).
+
+    Playwright interpolates from the *current* position. The previous
+    implementation scaled toward the origin, so a drag with ``steps>1``
+    jumped to (0,0) mid-gesture and hCaptcha never saw a real press-move.
+    """
+    n = int(steps) if steps and int(steps) > 1 else 1
+    x, y = float(x), float(y)
+    sx, sy = float(sx), float(sy)
+    if n <= 1:
+        return [(x, y)]
+    return [(sx + (x - sx) * i / n, sy + (y - sy) * i / n)
+            for i in range(1, n + 1)]
+
+
 class _Mouse:
-    """Playwright page.mouse over CDP Input.dispatchMouseEvent. Tracks the
-    current cursor position so down()/up() (drag gestures) land where the
-    pointer already is, like Playwright."""
+    """Playwright page.mouse over CDP Input.dispatchMouseEvent.
+
+    Tracks cursor position *and* pressed buttons so ``move()`` after
+    ``down()`` emits ``buttons=1`` mouseMoved events — required for
+    hCaptcha drag challenges. ``down()``/``up()`` land where the pointer
+    already is, like Playwright.
+    """
 
     def __init__(self, page: "_Page"):
         self._page = page
         self._tab = page._tab
         self._x = 0.0
         self._y = 0.0
+        self._buttons = 0
+
+    def _button_name(self, button: str) -> str:
+        return button if button in ("left", "right", "middle") else "left"
+
+    def _mask_for(self, button: str) -> int:
+        return _BUTTON_MASK.get(self._button_name(button), 1)
+
+    async def _dispatch_move(self, x: float, y: float) -> None:
+        held = "left" if (self._buttons & 1) else (
+            "right" if (self._buttons & 2) else (
+                "middle" if (self._buttons & 4) else "none"))
+        await self._tab.send(cdp.input_.dispatch_mouse_event(
+            "mouseMoved", x=float(x), y=float(y),
+            button=cdp.input_.MouseButton(held), buttons=int(self._buttons)))
 
     async def move(self, x: float, y: float, steps: Optional[int] = None) -> None:
-        x, y = float(x), float(y)
-        none = cdp.input_.MouseButton("none")
-        n = int(steps) if steps and steps > 1 else 1
-        if n > 1:
-            for i in range(1, n + 1):
-                await self._tab.send(cdp.input_.dispatch_mouse_event(
-                    "mouseMoved", x=x * i / n, y=y * i / n, button=none, buttons=0))
-        else:
-            await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mouseMoved", x=x, y=y, button=none, buttons=0))
-        self._x, self._y = x, y
+        for mx, my in mouse_move_points(self._x, self._y, x, y, steps):
+            await self._dispatch_move(mx, my)
+            self._x, self._y = float(mx), float(my)
+        self._x, self._y = float(x), float(y)
 
     async def click(self, x: float, y: float, button: str = "left", **kwargs) -> None:
         await self.move(x, y, steps=1)
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=1))
+        await self.down(button)
         await asyncio.sleep(random.uniform(0.03, 0.09))
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=1))
+        await self.up(button)
 
     async def dblclick(self, x: float, y: float, button: str = "left", **kwargs) -> None:
         await self.move(x, y, steps=1)
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        b = cdp.input_.MouseButton(name)
+        mask = self._mask_for(name)
         for _ in range(2):
+            self._buttons |= mask
             await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=2))
+                "mousePressed", x=self._x, y=self._y, button=b,
+                buttons=self._buttons, click_count=2))
             await asyncio.sleep(random.uniform(0.02, 0.06))
+            self._buttons &= ~mask
             await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=2))
+                "mouseReleased", x=self._x, y=self._y, button=b,
+                buttons=self._buttons, click_count=2))
 
     async def down(self, button: str = "left", **kwargs) -> None:
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        mask = self._mask_for(name)
+        self._buttons |= mask
         await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=1))
+            "mousePressed", x=self._x, y=self._y,
+            button=cdp.input_.MouseButton(name),
+            buttons=self._buttons, click_count=1))
 
     async def up(self, button: str = "left", **kwargs) -> None:
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        mask = self._mask_for(name)
+        self._buttons &= ~mask
         await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=1))
+            "mouseReleased", x=self._x, y=self._y,
+            button=cdp.input_.MouseButton(name),
+            buttons=self._buttons, click_count=1))
 
     async def wheel(self, delta_x: float = 0, delta_y: float = 0) -> None:
         await self._tab.send(cdp.input_.dispatch_mouse_event(

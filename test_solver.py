@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 96 collected (88 passed + 8 skipped when the models are not trained yet).
+Expected: 100 collected (92 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -1291,6 +1291,125 @@ class TestModels(unittest.TestCase):
         print("\n  REAL-photo tile accuracy: %.3f (%d/%d)"
               % (acc, ok, len(want)))
         self.assertGreaterEqual(acc, 0.45)
+
+
+# live browser pointer helpers + trainer ingest
+
+
+class TestTrainerFrames(unittest.TestCase):
+
+    def test_widget_vs_challenge_urls(self):
+        import trainer
+        eng = trainer.TrainerEngine()
+        widget = ("https://newassets.hcaptcha.com/captcha/v1/x/static/"
+                  "hcaptcha.html#frame=checkbox")
+        challenge = ("https://newassets.hcaptcha.com/captcha/v1/x/static/"
+                     "hcaptcha.html#frame=challenge")
+        self.assertTrue(eng._is_widget_frame_url(widget))
+        self.assertFalse(eng._is_challenge_frame_url(widget))
+        self.assertTrue(eng._is_challenge_frame_url(challenge))
+        self.assertFalse(eng._is_widget_frame_url(challenge))
+        self.assertFalse(eng._is_widget_frame_url("https://example.com"))
+
+
+class TestTrainerLiveNotes(unittest.TestCase):
+
+    def test_note_pointer_and_challenge(self):
+        import trainer
+        eng = trainer.TrainerEngine()
+        eng.note_pointer({"kind": "click", "x": 120.4, "y": 88.9})
+        eng.note_pointer({"kind": "drag", "x1": 10, "y1": 20, "x2": 80, "y2": 90})
+        self.assertEqual(len(eng.pointer_log), 2)
+        joined = " ".join(eng.logs)
+        self.assertIn("Operator click at (120,89)", joined)
+        self.assertIn("Operator drag (10,20)", joined)
+        eng.note_live_challenge("data:image/png;base64,abc", "Select all boats")
+        self.assertEqual(eng.latest_screenshot, "data:image/png;base64,abc")
+        self.assertEqual(eng.captured_count, 1)
+        self.assertEqual(eng.latest_question, "Select all boats")
+        # same prompt only refreshes the screenshot
+        eng.note_live_challenge("data:image/png;base64,def", "Select all boats")
+        self.assertEqual(eng.captured_count, 1)
+        self.assertEqual(eng.latest_screenshot, "data:image/png;base64,def")
+
+
+class TestLivePointer(unittest.TestCase):
+
+    def test_parse_and_format(self):
+        import live_control as lc
+        self.assertEqual(lc.parse_xy({"x": 12.2, "y": "40"}), (12.2, 40.0))
+        self.assertEqual(lc.parse_xy({"x1": 1, "y1": 2}, "x1", "y1"), (1.0, 2.0))
+        self.assertEqual(lc.parse_xy({"x": None, "y": "nope"}), (0.0, 0.0))
+        self.assertEqual(lc.format_click_log(432.4, 518.9),
+                         "click at (432, 519)")
+        self.assertIn("drag (10, 20) → (80, 90)",
+                      lc.format_drag_log(10, 20, 80, 90))
+        self.assertTrue(lc.is_challenge_frame_url(
+            "https://hcaptcha.com/captcha#frame=challenge"))
+        self.assertFalse(lc.is_challenge_frame_url(
+            "https://hcaptcha.com/captcha#frame=checkbox"))
+        rec = lc.pointer_entry("click", x=1.234, y=5)
+        self.assertEqual(rec["kind"], "click")
+        self.assertEqual(rec["x"], 1.2)
+        self.assertIn("t", rec)
+
+
+class TestMouseMovePoints(unittest.TestCase):
+
+    def test_interpolates_from_current_not_origin(self):
+        from nodriver_engine import mouse_move_points
+        pts = mouse_move_points(100, 200, 140, 200, steps=4)
+        self.assertEqual(len(pts), 4)
+        self.assertEqual(pts[0], (110.0, 200.0))
+        self.assertEqual(pts[-1], (140.0, 200.0))
+        # a 1-step move is just the destination
+        self.assertEqual(mouse_move_points(10, 10, 80, 90, steps=1),
+                         [(80.0, 90.0)])
+
+
+class TestPerformLiveAction(unittest.IsolatedAsyncioTestCase):
+
+    async def test_click_and_drag_use_mouse(self):
+        import live_control as lc
+
+        class FakeMouse:
+            def __init__(self):
+                self.ops = []
+                self.x = 0.0
+                self.y = 0.0
+
+            async def move(self, x, y, steps=None):
+                self.x, self.y = float(x), float(y)
+                self.ops.append(("move", self.x, self.y, steps))
+
+            async def click(self, x, y):
+                self.x, self.y = float(x), float(y)
+                self.ops.append(("click", self.x, self.y))
+
+            async def down(self, button="left"):
+                self.ops.append(("down", self.x, self.y))
+
+            async def up(self, button="left"):
+                self.ops.append(("up", self.x, self.y))
+
+        class FakePage:
+            def __init__(self):
+                self.mouse = FakeMouse()
+
+        page = FakePage()
+        rec = await lc.perform_live_action(page, {"action": "click", "x": 40, "y": 80})
+        self.assertEqual(rec["kind"], "click")
+        self.assertEqual(rec["x"], 40.0)
+        self.assertTrue(any(op[0] == "click" for op in page.mouse.ops))
+
+        page = FakePage()
+        rec = await lc.perform_live_action(
+            page, {"action": "drag", "x1": 10, "y1": 20, "x2": 90, "y2": 40})
+        self.assertEqual(rec["kind"], "drag")
+        kinds = [op[0] for op in page.mouse.ops]
+        self.assertIn("down", kinds)
+        self.assertIn("up", kinds)
+        self.assertLess(kinds.index("down"), kinds.index("up"))
 
 
 if __name__ == "__main__":

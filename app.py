@@ -1775,6 +1775,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
           </div>
           <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
         </div>
+        <div id="trainerPointerLog" class="demo-note" style="margin-top:10px;min-height:18px;font-family:monospace"></div>
       </div>
 
       <div class="card">
@@ -2179,6 +2180,20 @@ function refreshTrainer(){
         if(btnCopyLatest) btnCopyLatest.style.display = 'none';
       }
       renderQuestionsList(s.questions);
+      var ptr = $('trainerPointerLog');
+      if(ptr){
+        var items = s.pointer_log || [];
+        if(!items.length){
+          ptr.textContent = '';
+        }else{
+          ptr.textContent = items.slice(-6).map(function(p){
+            var t = p.t ? p.t + ' ' : '';
+            if(p.kind === 'click') return t + 'click ' + Math.round(p.x||0) + ', ' + Math.round(p.y||0);
+            if(p.kind === 'drag') return t + 'drag ' + Math.round(p.x1||0) + ',' + Math.round(p.y1||0) + ' -> ' + Math.round(p.x2||0) + ',' + Math.round(p.y2||0);
+            return t + (p.kind || '');
+          }).join('  |  ');
+        }
+      }
     }).catch(function(){});
 }
 window.refreshTrainer = refreshTrainer;

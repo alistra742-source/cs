@@ -6,16 +6,117 @@ dashboard can run them on the bot's asyncio loop without touching the big bot
 modules. They drive the SAME ``bot._page`` the bot uses — the operator and the
 bot share one real Chrome (nodriver) session, and every action here is a
 pure read or input over that page (no second browser is ever launched).
+
+Pointer actions (click + drag) are logged with page-space coordinates and
+a challenge-iframe screenshot is captured whenever hCaptcha is showing one.
 """
 import asyncio
 import base64
+import math
 import time
+from typing import Optional
 
 from browser_engine import ENGINE
 from server import NAV_TIMEOUT_MS, capture_page_screenshot
 
 VIEWPORT_W = 1920
 VIEWPORT_H = 1080
+
+CHALLENGE_IFRAME_SELECTOR = (
+    'iframe[title*="hCaptcha challenge"], '
+    'iframe[src*="hcaptcha-challenge"]'
+)
+_POINTER_LOG_CAP = 24
+
+
+def parse_xy(action: dict, xkey: str = "x", ykey: str = "y") -> tuple:
+    """Read a page-space (x, y) pair from a live-action payload."""
+    action = action or {}
+    try:
+        x = float(action.get(xkey, 0) or 0)
+    except (TypeError, ValueError):
+        x = 0.0
+    try:
+        y = float(action.get(ykey, 0) or 0)
+    except (TypeError, ValueError):
+        y = 0.0
+    return x, y
+
+
+def format_click_log(x: float, y: float) -> str:
+    return f"click at ({x:.0f}, {y:.0f})"
+
+
+def format_drag_log(x1: float, y1: float, x2: float, y2: float) -> str:
+    return (
+        f"drag ({x1:.0f}, {y1:.0f}) → ({x2:.0f}, {y2:.0f}) "
+        f"[dx={x2 - x1:.0f}, dy={y2 - y1:.0f}]"
+    )
+
+
+def is_challenge_frame_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "hcaptcha-challenge" in u or "frame=challenge" in u
+
+
+def pointer_entry(kind: str, **coords) -> dict:
+    """One logged pointer event (JSON-safe)."""
+    out = {"kind": str(kind), "t": time.strftime("%H:%M:%S"), "ts": time.time()}
+    for key, value in coords.items():
+        try:
+            out[key] = round(float(value), 1)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _record_pointer(bot, entry: dict) -> None:
+    if bot is None or not entry:
+        return
+    log = list(getattr(bot, "_live_pointer_log", None) or [])
+    log.append(entry)
+    if len(log) > _POINTER_LOG_CAP:
+        log = log[-_POINTER_LOG_CAP:]
+    try:
+        bot._live_pointer_log = log
+        bot._live_last_pointer = entry
+    except Exception:
+        pass
+
+
+def _live_log(bot, message: str, level: str = "info") -> None:
+    if bot is None:
+        return
+    try:
+        bot._log(f"[Live] {message}", level=level)
+    except Exception:
+        pass
+
+
+def _push_trainer_pointer(entry: dict) -> None:
+    try:
+        import trainer
+        trainer.trainer_engine.note_pointer(entry)
+    except Exception:
+        pass
+
+
+def _push_trainer_shot(image: str, question: str = "") -> None:
+    if not image:
+        return
+    try:
+        import trainer
+        trainer.trainer_engine.note_live_challenge(image, question)
+    except Exception:
+        pass
+
+
+def _attach_pointer_fields(meta: dict, bot) -> dict:
+    meta = meta or {}
+    meta["last_pointer"] = getattr(bot, "_live_last_pointer", None) or None
+    meta["pointer_log"] = list(getattr(bot, "_live_pointer_log", None) or [])
+    meta["challenge_screenshot"] = getattr(bot, "_live_challenge_b64", "") or ""
+    return meta
 
 
 async def live_meta(bot) -> dict:
@@ -44,7 +145,7 @@ async def live_meta(bot) -> dict:
         dsf = float(getattr(bot, "_fingerprint", {}).get("pixel_ratio", 1.0) or 1.0)
     except Exception:
         dsf = 1.0
-    return {
+    meta = {
         "connected": connected,
         "url": url,
         "title": title,
@@ -54,6 +155,7 @@ async def live_meta(bot) -> dict:
         "browser": ENGINE,
         "worker_id": getattr(bot, "worker_id", ""),
     }
+    return _attach_pointer_fields(meta, bot)
 
 
 async def live_screenshot(bot) -> str:
@@ -64,7 +166,8 @@ async def live_screenshot(bot) -> str:
     FULLPAGE_SHOTS=1) — see server.capture_page_screenshot for the
     capture policy and the OOM safety net. Failures log the EXACT reason
     so the dashboard's ALL LOGS shows why a frame is missing instead of
-    silently sitting on 'waiting for frame'."""
+    silently sitting on 'waiting for frame'.
+    """
     page = getattr(bot, "_page", None)
     if page is None:
         return ""
@@ -92,9 +195,153 @@ async def live_screenshot(bot) -> str:
     return ""
 
 
+async def _refresh_frames(page) -> None:
+    try:
+        refresh = getattr(page, "_refresh_frames", None)
+        if callable(refresh):
+            await refresh(force=True)
+            return
+    except Exception:
+        pass
+    try:
+        await page.evaluate("document.readyState")
+    except Exception:
+        pass
+
+
+async def _challenge_iframe_present(page) -> bool:
+    if page is None:
+        return False
+    try:
+        loc = page.locator(CHALLENGE_IFRAME_SELECTOR)
+        if await loc.count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        for frame in list(getattr(page, "frames", None) or []):
+            try:
+                if is_challenge_frame_url(frame.url or ""):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+async def capture_challenge_screenshot(page) -> str:
+    """PNG data-URL of the live hCaptcha challenge iframe, or empty."""
+    if page is None:
+        return ""
+    await _refresh_frames(page)
+    shot = b""
+    try:
+        loc = page.locator(CHALLENGE_IFRAME_SELECTOR)
+        if await loc.count() > 0:
+            try:
+                shot = await loc.first.screenshot(timeout=7000)
+            except Exception:
+                shot = b""
+    except Exception:
+        shot = b""
+    if not shot:
+        try:
+            for frame in list(getattr(page, "frames", None) or []):
+                try:
+                    if not is_challenge_frame_url(getattr(frame, "url", "") or ""):
+                        continue
+                    shot = await frame.screenshot(timeout=7000)
+                except Exception:
+                    shot = b""
+                if shot:
+                    break
+        except Exception:
+            shot = b""
+    if not shot:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(shot).decode("ascii")
+
+
+async def _read_challenge_prompt(page) -> str:
+    """Best-effort visible instruction from the live challenge frame."""
+    if page is None:
+        return ""
+    try:
+        import trainer
+    except Exception:
+        trainer = None
+    try:
+        for frame in list(getattr(page, "frames", None) or []):
+            try:
+                if not is_challenge_frame_url(getattr(frame, "url", "") or ""):
+                    continue
+                text = ""
+                try:
+                    text = await frame.locator("body").inner_text()
+                except Exception:
+                    try:
+                        text = str(await frame.evaluate(
+                            "() => document.body ? document.body.innerText : ''"
+                        ) or "")
+                    except Exception:
+                        text = ""
+                if trainer is not None:
+                    question = trainer._question_from_text(text)
+                else:
+                    question = " ".join(str(text or "").split())[:500]
+                if question:
+                    return question
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+async def _note_challenge_shot(bot, page) -> str:
+    """Capture the challenge iframe (if any) and publish it."""
+    if page is None:
+        return getattr(bot, "_live_challenge_b64", "") or ""
+    try:
+        present = await asyncio.wait_for(
+            _challenge_iframe_present(page), timeout=1.5)
+    except Exception:
+        present = False
+    if not present:
+        return getattr(bot, "_live_challenge_b64", "") or ""
+    try:
+        image = await asyncio.wait_for(
+            capture_challenge_screenshot(page), timeout=4.0)
+    except Exception:
+        image = ""
+    if not image:
+        return getattr(bot, "_live_challenge_b64", "") or ""
+    question = ""
+    try:
+        question = await asyncio.wait_for(
+            _read_challenge_prompt(page), timeout=2.0)
+    except Exception:
+        question = ""
+    try:
+        bot._live_challenge_b64 = image
+    except Exception:
+        pass
+    _push_trainer_shot(image, question)
+    if bot is not None and not getattr(bot, "_live_challenge_logged", False):
+        try:
+            bot._live_challenge_logged = True
+        except Exception:
+            pass
+        extra = f" — {question}" if question else ""
+        _live_log(bot, f"Captured hCaptcha challenge screenshot{extra}.")
+    return image
+
+
 async def get_live_state(bot) -> dict:
     meta = await live_meta(bot)
     shot = ""
+    page = getattr(bot, "_page", None)
     if meta["connected"]:
         shot = await live_screenshot(bot)
         if not shot:
@@ -104,8 +351,14 @@ async def get_live_state(bot) -> dict:
                 shot = bot.get_latest_screenshot() or ""
             except Exception:
                 shot = ""
+        try:
+            ch = await _note_challenge_shot(bot, page)
+            if ch:
+                meta["challenge_screenshot"] = ch
+        except Exception:
+            pass
     meta["screenshot"] = shot
-    return meta
+    return _attach_pointer_fields(meta, bot)
 
 
 def _dead_page(url: str) -> bool:
@@ -114,7 +367,8 @@ def _dead_page(url: str) -> bool:
 
     Engine-agnostic: Chromium (the engine in use) spells a dead tunnel
     chrome-error://chromewebdata/; about:neterror:: is kept for robustness
-    in case a future engine swap lands on Firefox."""
+    in case a future engine swap lands on Firefox.
+    """
     u = (url or "").lower()
     if "chrome-error" in u or "neterror" in u or "err_tunnel" in u or "err_" in u:
         return True
@@ -172,8 +426,33 @@ async def live_navigate(bot, url: str) -> dict:
 
 async def _live_click(page, x: float, y: float) -> None:
     x, y = float(x), float(y)
-    await page.mouse.move(x, y, steps=4)
+    try:
+        await page.mouse.move(x, y, steps=4)
+    except Exception:
+        pass
     await page.mouse.click(x, y)
+
+
+async def _live_drag(page, x1: float, y1: float, x2: float, y2: float) -> None:
+    """Real press-move-release drag (hCaptcha ignores a click at the drop)."""
+    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+    try:
+        import human_mouse as hm
+        await hm.drag(page, (x1, y1), (x2, y2))
+        return
+    except Exception:
+        pass
+    await page.mouse.move(x1, y1)
+    await asyncio.sleep(0.08)
+    await page.mouse.down()
+    dist = math.hypot(x2 - x1, y2 - y1)
+    steps = max(12, min(48, int(dist / 10.0) or 12))
+    try:
+        await page.mouse.move(x2, y2, steps=steps)
+    except Exception:
+        await page.mouse.move(x2, y2)
+    await asyncio.sleep(0.06)
+    await page.mouse.up()
 
 
 async def _live_key(page, key: str) -> None:
@@ -193,6 +472,59 @@ async def _live_key(page, key: str) -> None:
         await page.keyboard.type(key, delay=0)
 
 
+async def perform_live_action(page, action: dict) -> dict:
+    """Run one pointer/keyboard action. Returns a pointer entry or {error}."""
+    action = action or {}
+    kind = str(action.get("action", "") or "")
+    if kind == "back":
+        await page.evaluate("window.history.back()")
+        return {"kind": "back"}
+    if kind == "forward":
+        await page.evaluate("window.history.forward()")
+        return {"kind": "forward"}
+    if kind == "reload":
+        await page.reload(timeout=NAV_TIMEOUT_MS)
+        return {"kind": "reload"}
+    if kind == "click":
+        x, y = parse_xy(action)
+        await _live_click(page, x, y)
+        return pointer_entry("click", x=x, y=y)
+    if kind == "drag":
+        x1, y1 = parse_xy(action, "x1", "y1")
+        if "x1" not in action and "x" in action:
+            x1, y1 = parse_xy(action, "x", "y")
+        x2, y2 = parse_xy(action, "x2", "y2")
+        if "x2" not in action and action.get("to"):
+            x2, y2 = parse_xy(action.get("to") or {}, "x", "y")
+        await _live_drag(page, x1, y1, x2, y2)
+        return pointer_entry("drag", x1=x1, y1=y1, x2=x2, y2=y2)
+    if kind == "mousedown":
+        x, y = parse_xy(action)
+        await page.mouse.move(x, y)
+        await page.mouse.down()
+        return pointer_entry("mousedown", x=x, y=y)
+    if kind == "mousemove":
+        x, y = parse_xy(action)
+        await page.mouse.move(x, y)
+        return pointer_entry("mousemove", x=x, y=y)
+    if kind == "mouseup":
+        x, y = parse_xy(action)
+        await page.mouse.move(x, y)
+        await page.mouse.up()
+        return pointer_entry("mouseup", x=x, y=y)
+    if kind == "scroll":
+        dy = float(action.get("delta_y", action.get("deltaY", 0)) or 0)
+        await page.evaluate(f"window.scrollBy(0, {dy})")
+        return {"kind": "scroll", "delta_y": dy}
+    if kind == "key":
+        await _live_key(page, action.get("key", ""))
+        return {"kind": "key", "key": str(action.get("key", "") or "")}
+    if kind == "type":
+        await page.keyboard.type(str(action.get("text", "")), delay=0)
+        return {"kind": "type"}
+    return {"kind": kind or "unknown", "error": f"unknown action: {kind}"}
+
+
 async def live_action(bot, action: dict) -> dict:
     page = getattr(bot, "_page", None)
     if page is None:
@@ -203,35 +535,41 @@ async def live_action(bot, action: dict) -> dict:
     action = action or {}
     kind = str(action.get("action", ""))
     err = None
+    rec: Optional[dict] = None
     try:
-        if kind == "back":
-            await page.evaluate("window.history.back()")
-        elif kind == "forward":
-            await page.evaluate("window.history.forward()")
-        elif kind == "reload":
-            await page.reload(timeout=NAV_TIMEOUT_MS)
-        elif kind == "click":
-            await _live_click(
-                page, float(action.get("x", 0)), float(action.get("y", 0)))
-        elif kind == "scroll":
-            dy = float(action.get("delta_y", action.get("deltaY", 0)) or 0)
-            await page.evaluate(f"window.scrollBy(0, {dy})")
-        elif kind == "key":
-            await _live_key(page, action.get("key", ""))
-        elif kind == "type":
-            await page.keyboard.type(str(action.get("text", "")), delay=0)
-        else:
-            err = f"unknown action: {kind}"
+        rec = await perform_live_action(page, action)
+        if rec and rec.get("error"):
+            err = rec["error"]
     except Exception as e:
         err = f"action {kind} failed: {e}"
+        rec = {"kind": kind, "error": err}
+
+    if rec and rec.get("kind") in ("click", "drag", "mousedown", "mouseup"):
+        _record_pointer(bot, rec)
+        _push_trainer_pointer(rec)
+        if rec.get("kind") == "click":
+            _live_log(bot, format_click_log(rec.get("x", 0), rec.get("y", 0)))
+        elif rec.get("kind") == "drag":
+            _live_log(bot, format_drag_log(
+                rec.get("x1", 0), rec.get("y1", 0),
+                rec.get("x2", 0), rec.get("y2", 0)))
+        elif rec.get("kind") in ("mousedown", "mouseup"):
+            _live_log(bot, f"{rec['kind']} at ({rec.get('x', 0):.0f}, {rec.get('y', 0):.0f})")
+
     # Visual actions refresh the frame immediately (with a screenshot) so the
     # operator SEES the result of the click; bare-meta responses were blanking
     # the feed to "waiting for frame". Input actions (key/scroll/type) stay
     # fast — the next 1.4s poll refreshes the frame for those.
-    if kind in ("click", "back", "forward", "reload"):
+    visual = kind in ("click", "drag", "mousedown", "mouseup",
+                      "back", "forward", "reload")
+    if visual:
         st = await get_live_state(bot)
     else:
         st = await live_meta(bot)
+    if rec:
+        st["last_pointer"] = rec if rec.get("kind") in (
+            "click", "drag", "mousedown", "mousemove", "mouseup") else (
+            getattr(bot, "_live_last_pointer", None) or rec)
     if err:
         st["error"] = err
     return st
