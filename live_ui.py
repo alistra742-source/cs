@@ -43,14 +43,14 @@ LIVE_INJECTION = r'''
     <div class="live-tools">
       <button id="liveKeyBtn" type="button" aria-pressed="false">KEY</button>
       <button id="liveDragBtn" type="button" aria-pressed="false">DRAG</button>
-      <button id="liveRegBtn" type="button">REGISTER</button>
+      <button id="liveRegBtn" type="button" title="Open Discord registration in the live browser">DISCORD REGISTER</button>
       <button id="liveCopyAll" type="button">COPY ALL</button>
     </div>
     <div id="liveTypeBar" class="live-type-bar">
       <input id="liveTypeInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Type into Chrome">
     </div>
     <div class="live-frame" id="liveFrame">
-      <div id="livePlaceholder" class="live-placeholder">Tap REGISTER to open Discord signup, or start the runner.</div>
+      <div id="livePlaceholder" class="live-placeholder">Tap DISCORD REGISTER to open Discord signup, or start the runner.</div>
       <img id="liveImage" alt="Latest real Chrome camera frame" draggable="false">
       <svg id="liveTrail" class="live-trail" aria-hidden="true"></svg>
       <div id="liveMark" class="live-mark" aria-hidden="true"></div>
@@ -64,7 +64,7 @@ LIVE_INJECTION = r'''
       <img id="liveChallengeImg" class="live-challenge-shot" alt="Latest hCaptcha challenge screenshot">
       <div id="livePointerLog" class="live-pointer-log"></div>
     </div>
-    <div class="live-foot">Real Chrome camera — refreshes every 3 seconds. REGISTER opens discord.com/register. KEY opens your phone keyboard. DRAG on = drag, off = click only. Challenge shots are saved and kept.</div>
+    <div class="live-foot">Real Chrome camera — refreshes every 3 seconds. DISCORD REGISTER opens discord.com/register. KEY opens your phone keyboard. DRAG on = drag, off = click only. Challenge shots are saved and kept.</div>
   </div>
 </div>
 <script>

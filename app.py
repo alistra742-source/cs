@@ -1699,6 +1699,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
 <button data-tab="trainer" onclick="showTab('trainer')">Live Demo</button>
+<button data-tab="data" onclick="showTab('data')">Data</button>
 </nav>
 
 <div id="tabmain">
@@ -1790,58 +1791,56 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
     <span id="trainerStageText">Ready to open the official hCaptcha demo.</span>
   </div>
 
-  <div class="trainer-grid">
-    <div>
-      <div class="card" style="margin-bottom:12px">
-        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
-          <h3 style="margin:0">Latest Real Challenge</h3>
-          <button class="btn-copy-q" id="btnCopyLatest" onclick="copyLatestQuestion()" style="display:none">📋 Copy Question</button>
+  <div class="card">
+    <h3>Official hCaptcha Demo</h3>
+    <div class="demo-form-stage">
+      <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET</div>
+      <a class="demo-link" href="https://accounts.hcaptcha.com/demo" target="_blank" rel="noopener">https://accounts.hcaptcha.com/demo</a>
+      <div class="demo-input-row" style="margin-top:12px">
+        <div>
+          <label>Generated sample</label>
+          <input class="demo-input-box" id="demoFormComment" readonly placeholder="Filled in the real demo">
         </div>
-        <div class="trainer-ss-box">
-          <div id="trainerPlaceholder" class="trainer-ph">
-            Start the real demo runner.<br>A live Chrome screenshot refreshes here every 3 seconds.
-          </div>
-          <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
+        <div>
+          <label>Current runner value</label>
+          <input class="demo-input-box" id="demoFormName" readonly placeholder="Waiting for runner">
         </div>
-        <div id="trainerPointerLog" class="demo-note" style="margin-top:10px;min-height:18px;font-family:monospace"></div>
       </div>
+      <label>Browser form field</label>
+      <input class="demo-input-box" id="demoFormEmail" readonly placeholder="The official page has one optional field">
+      <div class="demo-note">Checkbox interaction and challenge rendering happen in Chrome, not in this dashboard. Captured challenge images and prompts are available in the Data tab.</div>
+    </div>
+  </div>
+</div>
 
-      <div class="card">
-        <h3>Official hCaptcha Demo</h3>
-        <div class="demo-form-stage">
-          <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET</div>
-          <a class="demo-link" href="https://accounts.hcaptcha.com/demo" target="_blank" rel="noopener">https://accounts.hcaptcha.com/demo</a>
-          <div class="demo-input-row" style="margin-top:12px">
-            <div>
-              <label>Generated sample</label>
-              <input class="demo-input-box" id="demoFormComment" readonly placeholder="Filled in the real demo">
-            </div>
-            <div>
-              <label>Current runner value</label>
-              <input class="demo-input-box" id="demoFormName" readonly placeholder="Waiting for runner">
-            </div>
-          </div>
-          <label>Browser form field</label>
-          <input class="demo-input-box" id="demoFormEmail" readonly placeholder="The official page has one optional field">
-          <div class="demo-note">Checkbox interaction and challenge rendering happen in Chrome, not in this dashboard.</div>
-        </div>
+<!-- Captured image challenges and their prompts are kept separate from controls. -->
+<div id="tabdata" class="hide">
+  <div class="card" style="margin-bottom:12px">
+    <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+      <h3 style="margin:0">Latest Real Challenge</h3>
+      <button class="btn-copy-q" id="btnCopyLatest" onclick="copyLatestQuestion()" style="display:none">📋 Copy Question</button>
+    </div>
+    <div class="trainer-ss-box">
+      <div id="trainerPlaceholder" class="trainer-ph">
+        No real challenge captured yet.<br>Start the real demo runner, then return here to inspect captured images.
+      </div>
+      <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
+    </div>
+    <div id="trainerPointerLog" class="demo-note" style="margin-top:10px;min-height:18px;font-family:monospace"></div>
+  </div>
+
+  <div class="card">
+    <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+      <h3 style="margin:0">Captured Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
+      <div class="flex" style="gap:6px">
+        <button class="btn-copy-q" onclick="copyAllQuestions()">📋 Copy All</button>
+        <button class="btn-copy-q" onclick="exportQuestionsJson()">⬇️ JSON</button>
+        <button class="btn-copy-q" onclick="clearTrainerQuestions()">🗑 Clear</button>
       </div>
     </div>
-
-    <div>
-      <div class="card">
-        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
-          <h3 style="margin:0">Captured Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
-          <div class="flex" style="gap:6px">
-            <button class="btn-copy-q" onclick="copyAllQuestions()">📋 Copy All</button>
-            <button class="btn-copy-q" onclick="exportQuestionsJson()">⬇️ JSON</button>
-          </div>
-        </div>
-        <div class="q-list-wrap" id="trainerQuestionsList">
-          <div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">
-            No real challenge captured yet.<br>Start the runner to open the official demo.
-          </div>
-        </div>
+    <div class="q-list-wrap" id="trainerQuestionsList">
+      <div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">
+        No real challenge captured yet.<br>Start the runner to open the official demo.
       </div>
     </div>
   </div>
@@ -1873,7 +1872,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens','trainer'];
+  var ids=['main','tokens','trainer','data'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -1881,7 +1880,7 @@ function showTab(name){
   document.querySelectorAll('#tabNav button').forEach(function(b){
     b.classList.toggle('act',b.getAttribute('data-tab')===name);
   });
-  if(name==='trainer'){
+  if(name==='trainer' || name==='data'){
     refreshTrainer();
   }
 }
@@ -2241,7 +2240,8 @@ setInterval(refreshLogs,2200);
 setInterval(refreshTokens,12000);
 setInterval(function(){
   var tabTrainer = $('tabtrainer');
-  if(tabTrainer && !tabTrainer.classList.contains('hide')){
+  var tabData = $('tabdata');
+  if((tabTrainer && !tabTrainer.classList.contains('hide')) || (tabData && !tabData.classList.contains('hide'))){
     refreshTrainer();
   }
 }, 3000);
