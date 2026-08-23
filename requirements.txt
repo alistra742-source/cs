@@ -4,10 +4,11 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Browser engine: truedriver — an async-first, undetectable Chrome driver
-# built directly on Chrome DevTools Protocol (no Selenium/WebDriver layer to
-# flag). Requires a Chrome/Chromium binary on PATH (installed in the Dockerfile).
-truedriver>=0.1.5
+# Browser engine: nodriver — an undetected, CDP-native driver for a REAL
+# Google Chrome (google-chrome-stable, installed in the Dockerfile). No
+# Selenium/WebDriver layer, no Firefox. The fingerprint is a real user's
+# Chrome; nodriver only strips the automation tells.
+nodriver==0.50.3
 
 # Web app (dashboard)
 flask>=3.0.0

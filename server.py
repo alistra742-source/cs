@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import gc
 import json
 import os
 import random
 import re
 import socket
+import struct
 import time
 from typing import Optional
 
@@ -836,6 +838,39 @@ _DOB_LOCATE_JS = r"""([label, aliases, valueText, monthAliases]) => {
 # Options of an open DOB menu (custom dropdowns and native <select>).
 _DOB_OPTION_SEL = '[role="listbox"] [role="option"], [role="menu"] [role="option"], [class*="menu" i] [role="option"], [class*="popout" i] [role="option"], [class*="menu" i] [class*="option" i], [class*="popout" i] [class*="option" i], [role="option"], [id*="option" i], [class*="option" i], option, li, [role="menuitem"]'
 
+# Scoped "did THIS control's menu actually open?" check. The old global
+# check (any visible [class*=menu]/[class*=option] anywhere on the page)
+# false-positived on the Month/Day menus' leftovers and on unrelated page
+# chrome, so the Year step could proceed to pick an option from a menu that
+# was never open and then fail every pick method. This requires a visible
+# option/menu element that sits in the SAME ROW as the marked control and
+# opens directly above or below it — i.e. the control's own menu.
+_DOB_MENU_OPEN_JS = r"""(label) => {
+    const ctrl = document.querySelector('[data-dob-target="' + label + '"]');
+    if (!ctrl) return false;
+    const cr = ctrl.getBoundingClientRect();
+    if (!cr.width || !cr.height) return false;
+    let n = 0;
+    const cands = document.querySelectorAll(
+        '[role="option"], [role="menuitem"], [class*="option" i], ' +
+        '[class*="menu" i], [class*="listbox" i], [class*="popout" i]');
+    for (const e of cands) {
+        if (e === ctrl) continue;
+        if (e.offsetParent !== null && e.getClientRects().length === 0) continue;
+        const r = e.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        // Same horizontal band as the control (menus drop under it).
+        const sameRow = (r.left < cr.right + 250) && (r.right > cr.left - 250);
+        // Opening just below OR just above the control's edge.
+        const adjacent =
+            (r.top >= cr.bottom - 12 && r.top <= cr.bottom + 260) ||
+            (r.bottom <= cr.top + 12 && r.bottom >= cr.top - 260);
+        if (sameRow && adjacent) n++;
+    }
+    // >=2 so a single stray fragment can't count as an open menu.
+    return n >= 2;
+}"""
+
 # Find the index (within _DOB_OPTION_SEL) of the option that represents
 # `optionText` in the page's locale. Months resolve to their numeric index so
 # the English "January" matches the Dutch "Januari" / French "janvier" / ...
@@ -909,9 +944,22 @@ _DOB_OPTION_POS_JS = r"""([optionText, monthAliases]) => {
         const t = norm(el.textContent || el.getAttribute('aria-label') || '');
         const v = el.getAttribute('data-value') || el.getAttribute('value') || t;
         if (matches(t, v)) {
-            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-            const r = el.getBoundingClientRect();
-            if (r.width < 3 || r.height < 3) continue;
+            // Bring the option fully inside the VIEWPORT, not just the menu
+            // listbox: the Year menu drops past the 720px viewport bottom
+            // and a 'nearest' scroll cannot fix that (the page has no room
+            // to scroll). Center it, then correct with an explicit window
+            // scroll if the page itself couldn't reach. Re-measure after.
+            try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+            let r = el.getBoundingClientRect();
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (vh && r && (r.top < 0 || r.bottom > vh)) {
+                const delta = (r.top < 0) ? (r.top - 24) : (r.bottom - vh + 24);
+                try { window.scrollBy(0, delta); } catch (e) {}
+                r = el.getBoundingClientRect();
+            }
+            if (!r || r.width < 3 || r.height < 3) continue;
+            const vh2 = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (vh2 && (r.top < 0 || r.bottom > vh2 + 2)) continue; // still unreachable
             return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t.slice(0, 30) };
         }
     }
@@ -1041,6 +1089,15 @@ _ESSENTIAL_PREFIXES = (
     "[Captcha] Challenge round",
     "[Captcha] Clicking tiles:",
     "[Captcha] [OK] Vision",
+    "[Captcha] Clicked Next",
+    "[Captcha] Clicked Verify",
+    "[Captcha] Offline",
+    "[Captcha] Next challenge",
+    "[Captcha] Offline tower",
+    "[Captcha] Vision tower",
+    "[Captcha] Tower wording",
+    "[Captcha] Tower heuristic",
+    "[Captcha] Tower last-resort",
 )
 
 
@@ -1089,6 +1146,30 @@ def _tor_check():
         return False
 
 
+def _cgroup_oom_kills() -> int:
+    """Total cgroup OOM kills for this container (0 when unreadable).
+
+    cgroup v2 exposes the counter in memory.events ("oom_kill N"); v1 in
+    memory.oom_control. A rising counter while a renderer "Page crashed"
+    means the KILLER was the container memory limit — not a dead proxy —
+    so rotating circuits cannot fix it.
+    """
+    for path in ("/sys/fs/cgroup/memory.events",
+                 "/sys/fs/cgroup/memory/memory.oom_control"):
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == "oom_kill":
+                        try:
+                            return int(parts[1])
+                        except ValueError:
+                            return 0
+        except Exception:
+            pass
+    return 0
+
+
 PAST_CAPTCHA_KEYWORDS = ['/channels', '/verify', '/welcome', '@me', 'discord.com/app']
 
 _BIO_POOL = [
@@ -1127,31 +1208,235 @@ RENDER_WAIT_BUDGET_S = 75.0
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
-# ── Full-page LIVE camera frames ─────────────────────────────────
-# The operator asked to SEE EVERYTHING in the camera feed, so frames are
-# now FULL-PAGE captures. Uncapped full-page screenshots of a very tall
-# SPA (Discord's channel tree can scroll for tens of thousands of pixels)
-# force the renderer to paint + encode the entire surface — that is the
-# exact memory spike that used to OOM-kill the content process. So the
-# full-page capture is budgeted: pages taller than FULLPAGE_MAX_PX keep
-# the old viewport-only frame, and any full-page failure falls back to a
-# viewport capture instead of dropping the frame.
-FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "1").strip().lower() not in ("0", "false", "no", "off")
+# ── LIVE camera frames (full browser view) ─────────────────────────
+# A camera frame must be the BROWSER'S FULL VIEW — the whole window, with
+# the page exactly as it is. The old full_page=True primary path (the
+# engine maps it to CDP captureBeyondViewport) re-rendered the page with
+# the viewport expanded to the full page size BEFORE the capture:
+#   * Discord's React app listens for resize and re-lays out mid-capture,
+#     so frames caught the form blank, shifted or half-rendered — the
+#     "it looks like it hasn't loaded / the code is making it disappear"
+#     symptom;
+#   * content below the original viewport had never been painted (lazy
+#     React), so the "full" image was blank exactly where the filled
+#     form should have been;
+#   * when the expanded capture missed its 20s budget (common in the
+#     1 GB container — the re-render also allocates a huge paint buffer
+#     and can OOM-kill the renderer), the engine silently fell back to a
+#     viewport frame of just the top 720px — the "screenshot isn't full"
+#     symptom.
+# So the primary frame is now a plain FULL-VIEWPORT capture (the entire
+# browser window: stable, zero page perturbation, no blank regions, no
+# OOM), preceded by a conservative reveal step that scrolls the register
+# form into view ONLY when it is entirely out of sight and no menu is
+# open — the filled form is always in the Discord frame, and the camera
+# can never fight the bot's own actions.
+#
+# FULLPAGE_SHOTS=1 opts into the WHOLE SCROLLABLE PAGE instead: the page
+# is first scrolled through in viewport steps (forcing the lazy React
+# content to actually render), then the full surface is captured with an
+# explicit clip and the previous scroll position is restored. Off by
+# default — the full browser view above is what the live feed shows.
+FULLPAGE_SHOTS = (os.environ.get("FULLPAGE_SHOTS") or "0").strip().lower() not in ("0", "false", "no", "off")
 FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
+
+# Scroll the register form back into view when it is ENTIRELY out of
+# sight. Never touches the scroll while a menu/popout is open (a DOB
+# dropdown mid-selection) or when the form is at least partially visible
+# (the bot is working in it). Returns 'scrolled' when it moved the page.
+_REVEAL_FORM_JS = r"""() => {
+    try {
+        const openMenu = document.querySelector(
+            '[role="option"], [role="menuitem"], [class*="popout" i]');
+        if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        const form = document.querySelector('form')
+            || document.querySelector(
+                'input[name="email"], input[type="email"], input[name="password"]');
+        if (!form) return 'ok';
+        const r = form.getBoundingClientRect();
+        if (!r || (r.width === 0 && r.height === 0)) return 'ok';
+        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (vh <= 0) return 'ok';
+        if (!(r.bottom <= 0 || r.top >= vh)) return 'ok';
+        form.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return 'scrolled';
+    } catch (e) {
+        return 'ok';
+    }
+}"""
+
+# Live-camera reveal: still never fights an open menu, but if the register
+# form is mostly below the fold we pull it up so the full browser window
+# shows the form instead of a half-empty Discord chrome shot.
+_REVEAL_FORM_LIVE_JS = r"""() => {
+    try {
+        const openMenu = document.querySelector(
+            '[role="option"], [role="menuitem"], [class*="popout" i]');
+        if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        const form = document.querySelector('form')
+            || document.querySelector(
+                'input[name="email"], input[type="email"], input[name="password"]');
+        if (!form) return 'ok';
+        const r = form.getBoundingClientRect();
+        if (!r || (r.width === 0 && r.height === 0)) return 'ok';
+        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (vh <= 0) return 'ok';
+        const entirelyOut = (r.bottom <= 0 || r.top >= vh);
+        const mostlyBelow = r.top > vh * 0.28 && r.bottom > vh;
+        if (!entirelyOut && !mostlyBelow) return 'ok';
+        form.scrollIntoView({ block: 'start', behavior: 'instant' });
+        return 'scrolled';
+    } catch (e) {
+        return 'ok';
+    }
+}"""
+
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+PNG_IEND = b"IEND\xaeB`\x82"
+
+
+def png_is_complete(data) -> bool:
+    """True when ``data`` is a finished PNG (signature + IEND), not a half frame."""
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if len(data) < 33 or bytes(data[:8]) != PNG_SIG:
+        return False
+    tail = bytes(data[-24:])
+    return tail.endswith(PNG_IEND) or PNG_IEND in tail
+
+
+def png_dimensions(data) -> tuple:
+    """(width, height) from a PNG IHDR, or (0, 0) if unreadable."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 24:
+        return (0, 0)
+    if bytes(data[:8]) != PNG_SIG:
+        return (0, 0)
+    try:
+        width, height = struct.unpack(">II", bytes(data[16:24]))
+    except Exception:
+        return (0, 0)
+    if width <= 0 or height <= 0 or width > 20000 or height > 20000:
+        return (0, 0)
+    return (int(width), int(height))
+
+# Full size of the scrollable document + the current viewport.
+_PAGE_SIZE_JS = r"""() => {
+    const de = document.documentElement;
+    const b = document.body;
+    const docH = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
+    return {
+        docH: docH,
+        vw: window.innerWidth || (de ? de.clientWidth : 0),
+        vh: window.innerHeight || (de ? de.clientHeight : 0),
+    };
+}"""
+
+
+async def _full_page_shot(page, log=None,
+                          fullpage_timeout: float = 20.0) -> bytes:
+    """Whole scrollable surface of a lazy-rendering SPA, or b"".
+
+    1. Measure the full size; skip when the page fits the viewport (the
+       viewport frame IS the full page) or exceeds the OOM budget.
+    2. Scroll through in viewport-sized steps with short pauses so React
+       actually renders the lazy content below the fold (a bare
+       beyond-viewport capture would paint that area blank).
+    3. Capture the full surface with an explicit clip (one paint — no
+       viewport resize storm), then restore the pre-capture scroll
+       position so the frame never yanks the bot's working position.
+    """
+    try:
+        size = await asyncio.wait_for(page.evaluate(_PAGE_SIZE_JS), timeout=2.5)
+        if not isinstance(size, dict):
+            return b""
+        doc_h = float(size.get("docH") or 0)
+        vw = float(size.get("vw") or 0)
+        vh = float(size.get("vh") or 0)
+        if vw <= 0 or vh <= 0 or doc_h <= vh * 1.05:
+            return b""  # fits (roughly) in the viewport - viewport frame is full
+        if doc_h > FULLPAGE_MAX_PX:
+            if log:
+                log(f"[Shot] page {int(doc_h)}px tall exceeds the "
+                    f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
+            return b""
+        # Remember where the bot is working, then scroll through so the
+        # lazy content renders (real scroll events, short settle pauses).
+        try:
+            scroll_y = float(await asyncio.wait_for(
+                page.evaluate("window.scrollY || 0"), timeout=2.0))
+        except Exception:
+            scroll_y = 0.0
+        step = vh * 0.9
+        steps = max(1, int((doc_h - vh) / step)) + 1
+        for i in range(1, steps + 1):
+            y = min(step * i, doc_h - vh)
+            try:
+                await asyncio.wait_for(
+                    page.evaluate(f"window.scrollTo(0, {int(y)})"), timeout=2.0)
+            except Exception:
+                break
+            await asyncio.sleep(0.15)
+        data = b""
+        try:
+            data = await asyncio.wait_for(
+                page.screenshot(full_page=True,
+                                clip={"x": 0, "y": 0,
+                                      "width": int(vw), "height": int(doc_h)},
+                                timeout=fullpage_timeout * 1000),
+                timeout=fullpage_timeout)
+        except Exception as e:
+            if log:
+                log(f"[Shot] full-page capture failed "
+                    f"({type(e).__name__}) - viewport frame", level="warn")
+        finally:
+            try:
+                await asyncio.wait_for(
+                    page.evaluate(f"window.scrollTo(0, {int(scroll_y)})"),
+                    timeout=2.0)
+            except Exception:
+                pass
+        return data or b""
+    except Exception:
+        return b""
+
+
+def _png_viewport_ok(data, min_w: int = 200, min_h: int = 200) -> bool:
+    """True when ``data`` is a finished PNG large enough to be a full frame."""
+    if not png_is_complete(data):
+        return False
+    width, height = png_dimensions(data)
+    return width >= min_w and height >= min_h
 
 
 async def capture_page_screenshot(page, log=None,
                                   fullpage_timeout: float = 20.0,
-                                  viewport_timeout: float = 10.0) -> bytes:
-    """FULL-PAGE PNG capture with an OOM safety net.
+                                  viewport_timeout: float = 10.0,
+                                  reveal: str = "safe") -> bytes:
+    """Full browser-view frame, with the register form guaranteed in sight.
 
-    Measures the page first; when its scroll height fits the
-    FULLPAGE_MAX_PX budget it captures the whole scrollable surface (what
-    the operator asked for: "see everything"), otherwise it degrades to a
-    viewport-only frame. Both the worker camera loop and the dashboard
-    LIVE feed go through here, so every frame in the dashboard is the
-    tallest safe capture. Returns PNG bytes, or b"" when even the
-    viewport capture fails (callers keep their last good frame).
+    Primary path (default): a conservative reveal step — scroll the
+    register form into view only when it is ENTIRELY out of sight and no
+    menu is open (see _REVEAL_FORM_JS), so the camera can never fight
+    the bot's own actions — then a FULL-VIEWPORT capture: the entire
+    browser window, zero page perturbation, no blank beyond-viewport
+    regions, no OOM. This is the "full browser view" the feed shows.
+
+    ``reveal="live"`` still never fights an open menu, but will also
+    pull the register form up when it is mostly below the fold so the
+    live camera shows the full Discord window instead of half chrome.
+
+    Incomplete / truncated / tiny PNGs are rejected and retried. A
+    glitched half-frame is never returned — callers keep their last
+    good image instead.
+
+    Opt-in path (FULLPAGE_SHOTS=1): the whole scrollable surface,
+    rendered first by a scroll-through so lazy content is in the paint
+    (see _full_page_shot), budgeted by FULLPAGE_MAX_PX.
+
+    Every caller (worker camera loop, dashboard LIVE feed, the event
+    captures in the signup flow) goes through here. Returns PNG bytes,
+    or b"" when even the viewport capture fails (callers keep their last
+    good frame).
     """
     if page is None:
         return b""
@@ -1164,38 +1449,63 @@ async def capture_page_screenshot(page, log=None,
         except Exception:
             return b""
 
+    live = str(reveal or "safe").strip().lower() == "live"
+    reveal_js = _REVEAL_FORM_LIVE_JS if live else _REVEAL_FORM_JS
+    try:
+        if await asyncio.wait_for(page.evaluate(reveal_js), timeout=2.0) == "scrolled":
+            await asyncio.sleep(0.25)  # let the scroll + repaint settle
+    except Exception:
+        pass
+    # Two animation frames so Discord/React finish painting after a reveal.
+    try:
+        await asyncio.wait_for(page.evaluate(
+            "() => new Promise((ok) => {"
+            "requestAnimationFrame(() => requestAnimationFrame(ok));"
+            "})"), timeout=1.5)
+    except Exception:
+        pass
+
     if FULLPAGE_SHOTS:
-        height = 0
         try:
-            height = await asyncio.wait_for(page.evaluate(
-                "() => Math.max("
-                "document.documentElement ? document.documentElement.scrollHeight : 0,"
-                " document.body ? document.body.scrollHeight : 0)"), timeout=2.5)
-        except Exception:
-            height = 0
-        if not isinstance(height, (int, float)) or isinstance(height, bool):
-            height = 0
-        if height <= FULLPAGE_MAX_PX:
-            try:
-                data = await asyncio.wait_for(
-                    page.screenshot(full_page=True, timeout=fullpage_timeout * 1000), timeout=fullpage_timeout)
-                if data:
-                    return data
-                if log:
-                    log("[Shot] empty full-page capture - viewport frame",
-                        level="warn")
-            except Exception as e:
-                if log:
-                    log(f"[Shot] full-page capture failed "
-                        f"({type(e).__name__}) - viewport frame", level="warn")
-        elif height > FULLPAGE_MAX_PX and log:
-            log(f"[Shot] page {int(height)}px tall exceeds the "
-                f"{FULLPAGE_MAX_PX}px budget - viewport frame", level="info")
-    # Viewport fallback (one retry, like the old capture loop).
-    shot = await _viewport(viewport_timeout)
-    if not shot and viewport_timeout >= 8.0:
-        shot = await _viewport(10.0)
-    return shot
+            shot = await _full_page_shot(page, log=log,
+                                         fullpage_timeout=fullpage_timeout)
+            if _png_viewport_ok(shot):
+                return shot
+        except Exception as e:
+            if log:
+                log(f"[Shot] full-page path failed ({type(e).__name__}) - viewport frame",
+                    level="warn")
+
+    # Primary frame: the full viewport (the entire browser window).
+    # Live register retries a couple of times so a truncated/half PNG is
+    # never published as the camera frame.
+    tries = 3 if live else 2
+    for attempt in range(tries):
+        timeout = viewport_timeout if attempt == 0 else max(4.0, float(viewport_timeout) * 0.7)
+        shot = await _viewport(timeout)
+        if _png_viewport_ok(shot):
+            return shot
+        if attempt + 1 < tries:
+            await asyncio.sleep(0.12)
+    return b""
+
+
+# ── Browser-error URL detection (engine-agnostic) ──────────────────────
+# A dead proxy / DNS failure lands the tab on the browser's built-in error
+# page. The engine is real Chrome, so the direct form is
+# chrome-error://chromewebdata/; about:neterror:: is kept for robustness
+# in case a future engine swap lands on Firefox. Both are DEFINITIVE
+# "this circuit cannot reach Discord at all" signals — rotate.
+_BROWSER_ERROR_URL_MARKERS = (
+    "chrome-error://",
+    "about:neterror",
+    "neterror::",
+)
+
+
+def _is_browser_error_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return any(m in u for m in _BROWSER_ERROR_URL_MARKERS)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1203,9 +1513,9 @@ async def capture_page_screenshot(page, log=None,
 # ═══════════════════════════════════════════════════════════════
 
 # Pointer realism is provided by human_mouse.py (manual cubic-bezier glide,
-# settle, and human dwell on down/up) for the challenge interactions that need
-# it, and by plain page.mouse clicks elsewhere. The truedriver facade maps
-# page.mouse to native CDP Input.dispatchMouseEvent.
+# settle, and human dwell on down/up) for the challenge interactions that
+# need it, and by plain page.mouse clicks elsewhere. Those clicks ride on
+# nodriver's CDP Input.dispatchMouseEvent — real Chrome input events.
 
 class DiscordAutomation:
     def __init__(self, headless: bool = False, email: str = "",
@@ -1279,8 +1589,15 @@ class DiscordAutomation:
         # burning 20 dead polls on a corpse.
         self._page_crashed = False
         self._last_browser_diag = 0.0
-        # truedriver launches Chrome with a fresh temporary profile per launch
-        # — there is no bot-side fingerprint to keep.
+        # OOM tracking: cgroup OOM-kill counter at browser launch + crash
+        # timestamps. A renderer crash accompanied by a rising counter is a
+        # MEMORY kill — recovery must reclaim + retry the SAME transport
+        # instead of rotating circuits (which cannot fix memory pressure).
+        self._oom_kills_at_launch = 0
+        self._oom_crash_times: list = []
+        # Real Chrome owns the identity: a fresh temporary profile per launch
+        # (nodriver mints a temp user-data-dir) — there is no bot-side
+        # fingerprint to keep or randomize.
         self._fingerprint = {}
 
     def _log(self, message: str, level: str = "info") -> None:
@@ -1336,17 +1653,17 @@ class DiscordAutomation:
         def _collect() -> dict:
             try:
                 from importlib.metadata import version
-                truedriver_version = version("truedriver")
+                nodriver_version = version("nodriver")
             except Exception:
-                truedriver_version = "unknown"
-            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "truedriver")
+                nodriver_version = "unknown"
+            cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "nodriver")
             return {
                 "reason": reason,
                 "error_type": type(exc).__name__ if exc is not None else "",
                 "error": str(exc)[:500] if exc is not None else "",
                 "uid": os.getuid() if hasattr(os, "getuid") else None,
                 "engine": ENGINE,
-                "truedriver_package": truedriver_version,
+                "nodriver_package": nodriver_version,
                 "browser_connected": bool(getattr(self._browser, "is_connected", False)) if self._browser else False,
                 "page_present": self._page is not None,
                 "transport": "proxy" if self.proxy else ("direct" if self._direct else "tor"),
@@ -1355,6 +1672,7 @@ class DiscordAutomation:
                 "cgroup_memory_current": _read("/sys/fs/cgroup/memory.current"),
                 "cgroup_memory_max": _read("/sys/fs/cgroup/memory.max"),
                 "cgroup_memory_events": _read("/sys/fs/cgroup/memory.events"),
+                "cgroup_oom_kills": _cgroup_oom_kills(),
                 "cgroup_pids_current": _read("/sys/fs/cgroup/pids.current"),
                 "cgroup_pids_max": _read("/sys/fs/cgroup/pids.max"),
                 "process_status": _read("/proc/self/status", 1200),
@@ -1363,6 +1681,20 @@ class DiscordAutomation:
         try:
             diagnostics = await asyncio.to_thread(_collect)
             self._log("[Diag] Browser failure " + json.dumps(diagnostics, sort_keys=True), level="error")
+            # Make the #1 container killer impossible to miss in ALL LOGS:
+            # a non-zero cgroup OOM-kill counter means the browser process
+            # was killed by the container memory limit, NOT by a bad proxy
+            # or a dead circuit — rotating cannot fix it.
+            try:
+                if int(diagnostics.get("cgroup_oom_kills") or 0) > 0:
+                    self._log(
+                        f"[Diag] cgroup OOM killer has fired {diagnostics.get('cgroup_oom_kills')}x "
+                        f"in total — browser processes are being KILLED by the container memory "
+                        f"limit (max={diagnostics.get('cgroup_memory_max')}). This is a memory "
+                        "problem, not a proxy/circuit problem; raise the container memory limit.",
+                        level="error")
+            except Exception:
+                pass
         except Exception as diag_error:
             self._log(f"[Diag] Browser failure diagnostics unavailable: {type(diag_error).__name__}: {diag_error}", level="error")
 
@@ -1370,9 +1702,10 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (truedriver applies it at launch
-        — a context-level proxy would either be ignored or rejected).
-        Returns the Playwright-style {server, username, password} dict
+        """The proxy rides on browser launch (nodriver applies it as Chrome
+        --proxy-server/--proxy-user/--proxy-pass launch flags — a
+        context-level proxy would be rejected when the browser already has
+        one). Returns the Playwright-style {server, username, password} dict
         (or None for TOR/direct)."""
         if not (self.proxy and isinstance(self.proxy, dict)):
             return None
@@ -1399,7 +1732,7 @@ class DiscordAutomation:
         # residential session, relaunch must ride TOR exactly like initialize()
         # does — otherwise switch_proxy(None) silently goes DIRECT (the
         # context-level proxy is ignored by the engine) and Discord's
-        # Cloudflare blocks the datacenter IP with chrome-error.
+        # Cloudflare blocks the datacenter IP with a browser error page.
         launch_proxy = self._launch_proxy()
         if launch_proxy is None and not self._direct and _tor_check():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
@@ -1452,22 +1785,32 @@ class DiscordAutomation:
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
-        # Chromium uses a clean Playwright context for each launch. Do not
-        # claim engine-level fingerprint randomization that the driver does
-        # not provide; diagnostics should reflect the runtime accurately.
+        # Real Chrome IS the identity: genuine Chrome JS/TLS/HTTP2
+        # fingerprints, real fonts, real capabilities — nothing for the bot
+        # to pin, mint, or randomize.
         self._ua = ""
         self._fingerprint = {}
         self._log(f"[Engine] Fresh {ENGINE} context requested")
 
-        # Launch the browser WITH the proxy. The engine applies it as a
-        # --proxy-server launch arg — a proxy passed later to new_context()
-        # would be silently ignored and traffic would go direct.
+        # Launch the browser WITH the proxy. The engine applies it at
+        # firefox launch — a proxy passed later to new_context() would be
+        # rejected and traffic would go direct.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
+
+        # Self-identifying engine line: if this is ABSENT, the deployed
+        # image predates the nodriver/Chrome switch (or the OOM-aware
+        # recovery) — rebuild before drawing conclusions from its OOMs.
+        # Headless real-Chrome is the lightest engine we've shipped, and
+        # cgroup OOM attribution (see _cgroup_oom_kills) is always on.
+        self._log(
+            f"[Engine] {ENGINE} on real Google Chrome (google-chrome-stable), "
+            f"headless={self.headless}, LOW_MEMORY_MODE={'on' if LOW_MEMORY_MODE else 'off'}"
+        )
 
         # Use a smaller renderer surface in a 1 GB container. This keeps
         # page paint and screenshot buffers materially below a 1920x1080
@@ -1489,17 +1832,18 @@ class DiscordAutomation:
             host_ip = await asyncio.to_thread(self._resolve_proxy_ip, p.get("host", ""))
             ip_part = f" IP={host_ip}," if host_ip else ""
             self._log(f"Proxy: {server} ({ip_part} auth={'yes' if p.get('username') else 'no'})")
+        elif getattr(self, "_direct", False):
+            self._tor_enabled = False
+            self._log("[Proxy] Direct connection - no proxy")
         elif _tor_check():
             self._tor_enabled = True
             self._log("[TOR] Using TOR SOCKS5 proxy...")
             if _tor_newnym():
                 self._log("[TOR] New identity requested")
-            # truedriver already rides the TOR proxy from browser launch — a
-            # context-level proxy would be rejected by Playwright when the
-            # browser was launched with one.
+            # Chrome already rides the TOR proxy from browser launch — a
+            # context-level proxy would be rejected when the browser was
+            # launched with one.
             await asyncio.sleep(1)
-        elif getattr(self, "_direct", False):
-            self._log("[Proxy] Direct connection - no proxy and TOR unavailable")
         else:
             self._log("[TOR] [FATAL] TOR SOCKS5 (127.0.0.1:9050) NOT reachable - TOR-only mode requires TOR running on this instance", level="error")
             self._tor_enabled = False
@@ -1530,8 +1874,14 @@ class DiscordAutomation:
         self._attach_rqdata_capture()
         self._attach_crash_listener()
 
-        # CDP-level webdriver removal — runs BEFORE init scripts, catches early checks
+        # Automation-tell stripping (incl. navigator.webdriver) is done by
+        # nodriver itself at the CDP level — apply_cdp_stealth is a contract
+        # no-op.
         await apply_cdp_stealth(self._context, self._page)
+
+        # Baseline for OOM attribution: a renderer crash with a HIGHER cgroup
+        # OOM-kill counter than this is a memory kill, not a dead proxy.
+        self._oom_kills_at_launch = _cgroup_oom_kills()
 
         # Report the real egress IP of this session (bounded, never blocks).
         asyncio.create_task(self._log_proxy_exit_ip())
@@ -1719,7 +2069,7 @@ class DiscordAutomation:
     async def switch_direct(self) -> bool:
         """Relaunch the browser with NO proxy (direct egress). Last resort when
         every residential session is dead and TOR is unavailable — the LIVE
-        tab still renders a real page instead of chrome-error."""
+        tab still renders a real page instead of a browser error page."""
         self.proxy = None
         self._direct = True
         try:
@@ -1767,8 +2117,8 @@ class DiscordAutomation:
                 return bool(closed())
             if closed is not None:
                 return bool(closed)
-            # truedriver's wrapper may not expose is_closed; a tiny bounded read
-            # distinguishes a live page from a closed CDP target.
+            # some engine wrappers may not expose is_closed; a tiny bounded
+            # read distinguishes a live page from a closed target.
             await asyncio.wait_for(page.evaluate("location.href"), timeout=1.0)
             return False
         except Exception:
@@ -1777,8 +2127,9 @@ class DiscordAutomation:
     def rotate_fingerprint(self) -> None:
         """Rotate to a brand-new browser identity.
 
-        The Chromium driver recreates its Playwright context on relaunch.
-        Reset local state so the next launch starts from a clean context."""
+        Real Chrome with a fresh temp profile is already a new identity on
+        every relaunch. Reset local state so the next launch starts from a
+        clean context."""
         self._fingerprint = {}
         self._ua = ""
         self._log(f"[Engine] {ENGINE} context will be recreated on next launch")
@@ -1900,9 +2251,9 @@ class DiscordAutomation:
             # already waits for the Discord SPA to boot, so we lose nothing.
             #
             # WRAPPED in asyncio.wait_for: the engine's timeout is advisory
-            # only. When the proxy is dead, Chromium's internal TCP retry logic
-            # can hang regardless of timeout — asyncio.wait_for with a hard cap
-            # kills the coroutine and forces a fresh proxy.
+            # only. When the proxy is dead, the browser's internal TCP retry
+            # logic can hang regardless of timeout — asyncio.wait_for with a
+            # hard cap kills the coroutine and forces a fresh proxy.
             await asyncio.wait_for(
                 self._page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms),
                 timeout=(timeout_ms / 1000.0) + 3.0,  # hard cap (never 18s)
@@ -1919,7 +2270,7 @@ class DiscordAutomation:
             # attempt as "No email available". It can also raise transport
             # errors when the circuit dies mid-commit. None of that is fatal
             # here: the render-wait loop below is the real gate and rotates
-            # on chrome-error / dead reads, so a slow-but-alive TOR circuit
+            # on browser-error / dead reads, so a slow-but-alive TOR circuit
             # gets to finish loading instead of being killed at 30s.
             elapsed = time.time() - t0
             err_type = type(e).__name__.lower()
@@ -1989,15 +2340,16 @@ class DiscordAutomation:
         self._log('[Nav] Page: title="' + str(page_title)[:80] + '" url=' + str(page_url)[:80])
 
         # ── Dead proxy (cannot reach Discord at all) ──
-        # chrome-error:// is a REAL dead signal (DNS/connection failure).
-        # about:blank is NOT dead: a slow TOR/residential circuit can still be
-        # committing the navigation when the goto cap fires, so a blank tab
-        # means "still loading" here, not "dead". Dead sessions surface
-        # chrome-error within seconds; blank-but-alive sessions just need the
-        # render-wait loop below (which re-issues the goto if the tab stays
-        # blank). Bouncing on about:blank is what made the bot "fail instantly
-        # without waiting" on slow circuits.
-        if "chrome-error://" in (page_url or ""):
+        # A browser error page (chrome-error:// on Chrome; about:neterror on
+        # other engines) is a REAL dead signal (DNS/connection failure).
+        # about:blank is NOT dead: a slow TOR/residential circuit can still
+        # be committing the navigation when the goto cap fires, so a blank
+        # tab means "still loading" here, not "dead". Dead sessions surface
+        # an error page within seconds; blank-but-alive sessions just need
+        # the render-wait loop below (which re-issues the goto if the tab
+        # stays blank). Bouncing on about:blank is what made the bot "fail
+        # instantly without waiting" on slow circuits.
+        if _is_browser_error_url(page_url):
             proxy_label = "PROXY SESSION" if self.proxy else "TOR CIRCUIT"
             self._nav_error = f"{proxy_label.lower()} dead (browser error page: {page_url[:60]})"
             self._log(f"[Nav] {proxy_label} DEAD (url={page_url[:60]}) - rotating to fresh circuit")
@@ -2009,7 +2361,7 @@ class DiscordAutomation:
         # A slow TOR/residential circuit can keep the page unreadable for
         # minutes while the navigation commits and React downloads. The
         # render-wait loop below is the only gate; real dead proxies were
-        # already caught by the chrome-error / about:blank check above.
+        # already caught by the browser-error / about:blank check above.
         title_blank = not str(page_title or "").strip()
         url_blank = not str(page_url or "").strip() or str(page_url or "").strip() in ("about:blank",)
         if title_blank and url_blank:
@@ -2177,8 +2529,8 @@ class DiscordAutomation:
                 # ── Mid-wait page-health checks ──
                 cur_url = (state.get("url") or "").strip() or ""
                 # Browser error page appearing mid-wait = the circuit died.
-                if "chrome-error://" in cur_url:
-                    self._nav_error = "proxy/circuit dead (chrome-error page)"
+                if _is_browser_error_url(cur_url):
+                    self._nav_error = "proxy/circuit dead (browser error page)"
                     self._log("[Nav] Browser error page - rotating circuit")
                     return False
                 if cur_url in ("", "about:blank"):
@@ -2387,51 +2739,103 @@ class DiscordAutomation:
                                     reason: str = "renderer crashed") -> bool:
         """Recover one unavailable page with a fresh browser process.
 
-        A truedriver renderer crash or a TargetClosedError can leave the browser
+        A renderer crash or a TargetClosedError can leave the browser
         transport technically connected while its page/context is unusable.
-        Restarting the complete browser once avoids trying to poll a target
-        that no longer exists; a second failure is left to normal rotation.
+        Restarting the complete browser avoids polling a target that no
+        longer exists; exhaustion is left to normal rotation.
+
+        OOM-aware: when the cgroup OOM-kill counter rose since this browser
+        launched, the crash was a MEMORY kill — rotating circuits cannot fix
+        memory pressure. So recovery retries the SAME transport a few times
+        with reclaim pauses (kernel memory reclaim + Python GC) between
+        attempts, and after repeated OOM crashes it backs off hard and tells
+        the operator the container memory limit is the problem.
         """
         if self._stopped.is_set():
             return False
-        self._log(f'[Nav] {reason} - restarting browser process once', level='warn')
-        try:
-            await self._relaunch_browser()
-            if self._page is None:
-                raise RuntimeError('browser restart produced no page')
-            self._page_crashed = False
-            await asyncio.wait_for(
-                self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
-                timeout=33.0,
-            )
-            await asyncio.sleep(0.5)
-            self._log('[Nav] Browser restart after renderer crash completed', level='info')
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._page_crashed = True
-            await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
-            self._log(
-                f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})',
-                level='error',
-            )
-            return False
+        oom_now = _cgroup_oom_kills()
+        oom_since_launch = oom_now - getattr(self, "_oom_kills_at_launch", 0)
+        is_oom = oom_since_launch > 0
+
+        # Track OOM crashes in a 5-minute window. Three of them means the
+        # container cap is simply too small for real Chrome + Discord — a
+        # hot retry loop would just burn proxy sessions faster.
+        if is_oom:
+            now = time.time()
+            self._oom_crash_times = [t for t in self._oom_crash_times if now - t < 300]
+            self._oom_crash_times.append(now)
+            if len(self._oom_crash_times) >= 3:
+                self._log(
+                    f"[Mem] {len(self._oom_crash_times)} cgroup OOM kills of the browser in the "
+                    f"last 5 minutes — the container memory limit is too small for real Chrome + "
+                    f"Discord (cgroup oom_kill={oom_now}). Reclaiming, then backing off 60s. "
+                    "Raise the container memory limit (2 GB recommended) to stop this.",
+                    level="error")
+                gc.collect()
+                await asyncio.sleep(60)
+
+        self._log(
+            f'[Nav] {reason} - restarting browser process'
+            + (f' (cgroup OOM kills since launch: {oom_since_launch} — memory pressure, '
+               'not a dead proxy; reclaiming before each retry)' if is_oom
+               else ' once'),
+            level='warn')
+        attempts = 3 if is_oom else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    # Let the OOM killer's work settle: kernel reclaim first,
+                    # then the Python heap (screenshot ring, logs) — only
+                    # then spend another browser on the same memory cap.
+                    gc.collect()
+                    await asyncio.sleep(4.0 * attempt)
+                await self._relaunch_browser()
+                if self._page is None:
+                    raise RuntimeError('browser restart produced no page')
+                self._page_crashed = False
+                await asyncio.wait_for(
+                    self._page.goto(url, wait_until='domcontentloaded', timeout=30000),
+                    timeout=33.0,
+                )
+                await asyncio.sleep(0.5)
+                self._log('[Nav] Browser restart after renderer crash completed', level='info')
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._page_crashed = True
+                if attempt < attempts:
+                    self._log(
+                        f'[Nav] Restart attempt {attempt}/{attempts} failed ({type(e).__name__}) '
+                        f'- memory reclaim pause, retrying same transport', level='warn')
+                    continue
+                await self._log_browser_diagnostics("browser-restart-failed", e, force=True)
+                self._log(
+                    f'[Nav] Browser restart after renderer crash failed ({type(e).__name__}: {e})'
+                    + (' — caused by the container memory cap; rotating the circuit will not '
+                       'fix it, the memory limit must be raised' if is_oom else ''),
+                    level='error',
+                )
+                return False
     async def capture_screenshot(self) -> str:
         if not self._page:
             return ""
-        # FULL-PAGE capture (operator asked to see everything), budgeted by
-        # FULLPAGE_MAX_PX with an automatic viewport fallback — the OOM
-        # guard lives in capture_page_screenshot. Same base64 history
-        # contract as before: latest frame appended, ring trimmed at 100.
+        # Full browser-view frame (form revealed when out of sight; whole
+        # scrollable page only when FULLPAGE_SHOTS=1) — the capture policy
+        # lives in capture_page_screenshot. Same base64 history contract
+        # as before: latest frame appended, ring trimmed at 100.
         screenshot = await capture_page_screenshot(
-            self._page, log=self._log, fullpage_timeout=20.0)
-        if not screenshot:
+            self._page, log=self._log, fullpage_timeout=20.0, reveal="live")
+        if not screenshot or not png_is_complete(screenshot):
             return ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
         self._screenshots.append(b64)
-        if len(self._screenshots) > 100:
-            self._screenshots = self._screenshots[-50:]
+        # Tiny ring on purpose: each frame is a full-viewport PNG in base64
+        # (~150-400 KB) and this list lives in the Python heap next to the
+        # browser inside a 1 GB container — 100 frames was a 30-40 MB
+        # constant tax. The dashboard only ever needs the latest frame.
+        if len(self._screenshots) > 10:
+            self._screenshots = self._screenshots[-8:]
         return b64
 
     async def start_discord_signup(self) -> bool:
@@ -2634,10 +3038,10 @@ class DiscordAutomation:
     # ── Cloudflare Turnstile ─────────────────────────────────────────────
     # Discord sits behind Cloudflare, and a Turnstile captcha can gate
     # navigation / form submit / mail verification. The widget is clicked
-    # with a real, humanized locator click on the truedriver page (the engine's
-    # humanize layer drives the pointer — never a synthetic JS event), then
-    # we confirm the challenge cleared via cf_clearance or the widget
-    # leaving the DOM.
+    # with a real, humanized locator click on the Chrome page (nodriver
+    # drives the pointer with CDP input events — never a synthetic JS
+    # event), then we confirm the challenge cleared via cf_clearance or the
+    # widget leaving the DOM.
     _TURNSTILE_SELECTORS = (
         'iframe[src*="challenges.cloudflare.com"]',
         'iframe[src*="turnstile"]',
@@ -2669,15 +3073,15 @@ class DiscordAutomation:
     async def _solve_turnstile_if_present(self) -> bool:
         """Bypass a Cloudflare Turnstile widget with a humanized click.
 
-        Clicks the widget checkbox with a real locator click on the truedriver
+        Clicks the widget checkbox with a real locator click on the Chrome
         page, then confirms the challenge cleared via the cf_clearance
         cookie or the widget frame disappearing."""
         try:
             if not await self._detect_turnstile():
                 return False
             self._log("[Turnstile] Widget present - clicking it...")
-            # Humanized click on the widget checkbox (truedriver drives the
-            # pointer with its humanize layer — never a synthetic JS event).
+            # Humanized click on the widget checkbox (nodriver drives the
+            # pointer with CDP input events — never a synthetic JS event).
             clicked = False
             for sel in self._TURNSTILE_SELECTORS:
                 try:
@@ -3684,7 +4088,7 @@ class DiscordAutomation:
             # vision model (local Ollama or remote VISION_API_BASE endpoint)
             # which tiles match, clicks them + Verify, and hCaptcha itself
             # mints the token. See vision_solver.py for the recommended
-            # model (qwen3-vl:2b).
+            # model (ahmadwaqar/smolvlm2-256m-video:q8_0).
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -3696,19 +4100,70 @@ class DiscordAutomation:
                 return False
             self._log("[Captcha] [READY] Image challenge rendered - reading prompt + tiles")
 
-            if not getattr(self, "_ollama_checked", False):
-                self._ollama_checked = True
-                ok, models = await self._vision.check()
+            # Probe the vision endpoint with RETRIES and NO permanent
+            # failure cache. Hosted endpoints (Railway etc.) cold-start on
+            # the first request after sleeping — one fast probe would mark
+            # a healthy service down for the bot's whole lifetime (the
+            # "Ollama server unreachable" that kills every captcha round).
+            # _vision_ready is only set on success, so a service that was
+            # down and comes back re-probes cleanly on the next challenge.
+            if not getattr(self, "_vision_ready", False):
+                ok, models = False, []
+                # Authentication/protocol failures are deterministic: waiting
+                # and replaying the same request cannot fix them.  Only retry
+                # transient connection, timeout, rate-limit, and 5xx failures.
+                terminal_probe_errors = {"authentication", "authorization", "protocol"}
+                probes_made = 0
+                for _probe in range(3):
+                    probes_made = _probe + 1
+                    ok, models = await self._vision.check()
+                    if ok:
+                        break
+                    check_error = getattr(self._vision, "last_check_error", "")
+                    if check_error in terminal_probe_errors:
+                        break
+                    if _probe < 2:
+                        self._log(
+                            f"[Captcha] Vision endpoint temporarily unavailable "
+                            f"(probe {_probe + 1}/3, {check_error or 'unknown error'}) - "
+                            "retrying in 10s", level="warn")
+                        await asyncio.sleep(10)
                 if not ok:
-                    self._log(
-                        "[Captcha] Ollama server unreachable - set VISION_API_BASE (or OLLAMA_BASE) "
-                        "or run 'ollama serve' (recommended model: qwen3-vl:2b)",
-                        level="error")
+                    check_error = getattr(self._vision, "last_check_error", "")
+                    http_status = getattr(self._vision, "last_check_http_status", None)
+                    if check_error == "authentication":
+                        self._log(
+                            f"[Captcha] Vision endpoint is UP but rejected authentication "
+                            f"(HTTP {http_status or 401}). This app and the Vision AI "
+                            "service have different or missing VISION_API_KEY values. "
+                            "Configure both Railway services from the same shared variable; "
+                            "do not put the secret in logs.", level="error")
+                    elif check_error == "authorization":
+                        self._log(
+                            f"[Captcha] Vision endpoint denied access "
+                            f"(HTTP {http_status or 403}); check the gateway authorization "
+                            "policy.", level="error")
+                    elif check_error == "protocol":
+                        self._log(
+                            f"[Captcha] Vision endpoint at {self._vision.base} is reachable "
+                            "but is not a compatible Ollama API; expected GET /api/tags.",
+                            level="error")
+                    else:
+                        self._log(
+                            f"[Captcha] Vision server unavailable after {probes_made} "
+                            f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
+                            "- check VISION_API_BASE / service status. Later challenges "
+                            "will re-probe automatically.", level="error")
+                    # Do not issue several expensive /api/chat requests after
+                    # the readiness probe already proved they cannot succeed.
+                    return False
                 elif self._vision.model not in models:
                     self._log(
                         f"[Captcha] Ollama model {self._vision.model} not pulled - "
                         f"run: ollama pull {self._vision.model}",
                         level="warn")
+                else:
+                    self._vision_ready = True
 
             for solve_attempt in range(3):
                 if solve_attempt:
@@ -3726,11 +4181,26 @@ class DiscordAutomation:
                 # drag, multiple choice, text) and answering a point round
                 # with tile indices (or vice versa) is a guaranteed fail —
                 # and a loud automation signal.
-                for round_i in range(6):
+                last_sig = None
+                for round_i in range(8):
                     if await self._past_captcha():
                         return True
                     chall = await self._challenge_iframe()
                     if chall is None or not await self._challenge_rendered(chall):
+                        # After Next the iframe often drops to a loader.
+                        # Wait for the next challenge to paint — do NOT
+                        # treat the dip as "challenge over".
+                        chall = await self._wait_for_image_challenge(timeout=10.0)
+                    if chall is None:
+                        if await read_hcaptcha_token(self._page):
+                            self._log(
+                                "[Captcha] [OK] hCaptcha token minted by the solved "
+                                "challenge - submitting form")
+                            await self._click_form_submit()
+                            for _ in range(8):
+                                await asyncio.sleep(1.0)
+                                if await self._past_captcha():
+                                    return True
                         break
                     frame = await self._hcaptcha_frame_for(chall)
                     if frame is None:
@@ -3748,11 +4218,30 @@ class DiscordAutomation:
                         await asyncio.sleep(2)
                         continue
                     family = hct.classify(self._challenge_payload, dom, prompt)
+                    # Live tower wording is a Move-badge drag even when
+                    # /getcaptcha labelled the round image_label_area_select.
+                    if hct.is_tower_prompt(prompt) and family != hct.DRAG_DROP:
+                        self._log(
+                            f"[Captcha] Tower wording — forcing drag-drop "
+                            f"(was {family})")
+                        family = hct.DRAG_DROP
+                    sig = (prompt, family, int((dom or {}).get("tiles") or 0))
+                    # Same prompt + same layout: we already answered this
+                    # grid. Re-clicking tiles TOGGLES them off. Just hit
+                    # Next again and wait for the next challenge.
+                    if last_sig is not None and sig == last_sig:
+                        self._log(
+                            "[Captcha] Same challenge still showing — clicking Next again")
+                        await self._click_challenge_verify(frame)
+                        await asyncio.sleep(1.2)
+                        continue
                     self._log(
                         f"[Captcha] Challenge round {round_i + 1} "
                         f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
                     if family == hct.DRAG_DROP:
-                        if hct.is_pattern_prompt(prompt):
+                        if hct.is_tower_prompt(prompt):
+                            ok = await self._solve_tower_round(frame, prompt)
+                        elif hct.is_pattern_prompt(prompt):
                             ok = await self._solve_pattern_round(frame, prompt)
                         else:
                             ok = await self._solve_drag_round(frame, prompt)
@@ -3775,13 +4264,15 @@ class DiscordAutomation:
                                   level="warn")
                         await asyncio.sleep(2)
                         continue
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.7)
                     await self._click_challenge_verify(frame)
-                    # Wait for hCaptcha to accept (token minted) or present a
-                    # new round.
+                    last_sig = sig
+                    # Wait for hCaptcha to accept (token minted) OR paint
+                    # the next challenge (new prompt / new layout).
                     token_seen = False
-                    for _ in range(10):
-                        await asyncio.sleep(1.0)
+                    advanced = False
+                    for _ in range(14):
+                        await asyncio.sleep(0.7)
                         if await self._past_captcha():
                             self._log("[Captcha] [OK] Vision solve ACCEPTED - past captcha")
                             return True
@@ -3791,6 +4282,23 @@ class DiscordAutomation:
                                 "[Captcha] [OK] hCaptcha token minted by the solved "
                                 "challenge - submitting form")
                             await self._click_form_submit()
+                            break
+                        c2 = await self._challenge_iframe()
+                        if c2 is None or not await self._challenge_rendered(c2):
+                            continue
+                        f2 = await self._hcaptcha_frame_for(c2)
+                        if f2 is None:
+                            continue
+                        p2 = await self._read_challenge_prompt(f2)
+                        if not p2:
+                            p2 = hct.question_text(self._challenge_payload or {})
+                        d2 = await self._probe_challenge_dom(f2)
+                        fam2 = hct.classify(self._challenge_payload, d2, p2)
+                        sig2 = (p2, fam2, int((d2 or {}).get("tiles") or 0))
+                        if p2 and sig2 != last_sig:
+                            self._log(
+                                f"[Captcha] Next challenge ready: {p2[:80]}")
+                            advanced = True
                             break
                     if token_seen:
                         for _ in range(8):
@@ -3804,6 +4312,8 @@ class DiscordAutomation:
                             "[Captcha] Form submitted after solve but not past captcha "
                             "yet - retrying",
                             level="warn")
+                    elif advanced:
+                        continue
                 self._log("[Captcha] Vision solve not accepted across rounds - retrying",
                           level="warn")
             self._log("[Captcha] [FAIL] Vision solver could not clear the challenge",
@@ -4023,6 +4533,10 @@ class DiscordAutomation:
                             self._log(
                                 f"[Captcha] Offline CNN grid: {labels} "
                                 f"(conf {mean_conf:.2f}, ref={ex_label}) -> {idx}")
+                            if not idx:
+                                # Understood empty round (no tile matches) —
+                                # Verify/Next with nothing selected is correct.
+                                return True
                             return await self._click_challenge_tiles(frame, idx)
                         self._log(
                             "[Captcha] Offline labels made but prompt not "
@@ -4143,6 +4657,142 @@ class DiscordAutomation:
                   f"({tx:.0f},{ty:.0f})")
         await hm.drag(self._page, (fx, fy), (tx, ty))
         return True
+
+    _TOWER_PIECE_JS = r"""() => {
+        const vis = (el) => !!(el) &&
+            (el.offsetParent !== null || el.getClientRects().length > 0);
+        const cands = [];
+        for (const el of document.querySelectorAll(
+                '[draggable="true"], [class*="drag" i], [class*="move" i], '
+                + 'button, [role="button"], span, div')) {
+            if (!vis(el)) continue;
+            const t = ((el.textContent || '') + ' '
+                + (el.getAttribute('aria-label') || '')).trim();
+            const r = el.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) continue;
+            const isMove = /^\+?\s*move\s*$/i.test(t)
+                || (/\bmove\b/i.test(t) && t.length <= 14);
+            const cls = (el.className || '').toString();
+            const isDrag = el.getAttribute('draggable') === 'true'
+                || /drag/i.test(cls);
+            if (!isMove && !isDrag) continue;
+            cands.push({
+                x: r.left, y: r.top, w: r.width, h: r.height,
+                move: isMove ? 1 : 0,
+            });
+        }
+        if (!cands.length) return null;
+        cands.sort((a, b) => b.move - a.move || (b.x - a.x));
+        return cands[0];
+    }"""
+
+    async def _tower_frame_shot(self, frame):
+        """Full challenge-iframe screenshot + page-space box.
+
+        The Move piece is often a *separate* DOM node to the right of
+        the tower photo, so cropping the largest canvas misses it.
+        """
+        try:
+            raw = await frame.screenshot()
+        except Exception as e:
+            self._log(f"[Captcha] Tower frame screenshot failed: {e}",
+                      level="debug")
+            raw = None
+        if not raw:
+            return None, None
+        box = None
+        try:
+            el = await frame.frame_element()
+            box = await el.bounding_box()
+        except Exception:
+            box = None
+        if not box or not box.get("width"):
+            ox, oy = await self._frame_origin(frame)
+            try:
+                wh = await frame.evaluate(
+                    "() => ({w: window.innerWidth, h: window.innerHeight})")
+                box = {"x": ox, "y": oy,
+                       "width": float(wh.get("w") or 0),
+                       "height": float(wh.get("h") or 0)}
+            except Exception:
+                box = None
+        if not box or float(box.get("width") or 0) < 40:
+            return None, None
+        return raw, box
+
+    async def _tower_piece_hint(self, frame, box):
+        """Normalised centre of the Move / draggable control, if visible."""
+        try:
+            info = await frame.evaluate(self._TOWER_PIECE_JS)
+        except Exception:
+            info = None
+        if not info or not info.get("w"):
+            return None
+        bw = float(box.get("width") or 0) or 1.0
+        bh = float(box.get("height") or 0) or 1.0
+        # Badge sits on/above the wood piece — grab slightly below centre.
+        cx = (float(info["x"]) + float(info["w"]) / 2.0) / bw
+        cy = (float(info["y"]) + float(info["h"]) / 2.0) / bh + 0.05
+        return (max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)))
+
+    async def _solve_tower_round(self, frame, prompt) -> bool:
+        """Wooden-block tower: drag the Move piece onto the incomplete stack.
+
+        Live prompt: "Move the correct missing block segment onto the
+        incomplete tower". hCaptcha serves this under area_select, but
+        the answer is a real press/move/release drag — a point click
+        never picks up the piece. NEVER uses DragLocator (punched-slot
+        geometry is the wrong puzzle). Offline wood-mask heuristic
+        first; a SHORT vision ``shape="tower"`` call is last resort
+        (a long 504 expires the challenge).
+        """
+        shot, box = await self._tower_frame_shot(frame)
+        if not shot or not box:
+            shot, box = await self._challenge_surface(frame)
+        if not shot or not box:
+            self._log("[Captcha] Tower: no screenshot", level="warn")
+            return False
+        hint = await self._tower_piece_hint(frame, box)
+        debug = {}
+        got = None
+        try:
+            got = hct.locate_tower_drag(shot, piece_hint=hint, debug=debug)
+        except Exception as e:
+            debug["reason"] = "error:%s" % type(e).__name__
+            self._log(f"[Captcha] Offline tower error: {e}", level="debug")
+            got = None
+        self._log(f"[Captcha] Tower heuristic: {debug}")
+        if got and got.get("from") and got.get("to"):
+            fx, fy = self._denorm(got["from"], box)
+            tx, ty = self._denorm(got["to"], box)
+            self._log(
+                f"[Captcha] Offline tower drag "
+                f"({got['from'][0]:.2f},{got['from'][1]:.2f}) -> "
+                f"({got['to'][0]:.2f},{got['to'][1]:.2f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        # Do not sit on a 180s 504 — that expires the challenge.
+        answer = await self._vision.solve(
+            prompt, [shot], shape="tower", timeout=18.0)
+        if answer and answer.get("type") == "drag":
+            fx, fy = self._denorm(answer["from"], box)
+            tx, ty = self._denorm(answer["to"], box)
+            self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
+                      f"({tx:.0f},{ty:.0f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        # Last resort: DOM piece + heuristic drop (even if `from` was missing).
+        best = debug.get("best") if isinstance(debug, dict) else None
+        if hint and isinstance(best, dict) and best.get("to"):
+            fx, fy = self._denorm(hint, box)
+            tx, ty = self._denorm(best["to"], box)
+            self._log(
+                f"[Captcha] Tower last-resort drag "
+                f"({hint[0]:.2f},{hint[1]:.2f}) -> "
+                f"({best['to'][0]:.2f},{best['to'][1]:.2f})")
+            await hm.drag(self._page, (fx, fy), (tx, ty))
+            return True
+        return False
 
     async def _solve_pattern_round(self, frame, prompt) -> bool:
         """Pattern completion ("put one of the animals into the empty spot
@@ -4505,54 +5155,103 @@ class DiscordAutomation:
                 return True
         return False
 
+    _NEXT_VERIFY_JS = r"""() => {
+        const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const vis = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (!r || r.width < 8 || r.height < 8) return false;
+            if (el.offsetParent === null && el.getClientRects().length === 0) return false;
+            try {
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+            } catch (e) {}
+            return true;
+        };
+        const disabled = (el) => !!(el.disabled
+            || el.getAttribute('aria-disabled') === 'true'
+            || /\bdisabled\b/i.test((el.className || '').toString()));
+        const nextRe = /(^|[^a-z])(next|continue|weiter|volgende|continuer|continuar)([^a-z]|$)/;
+        const verifyRe = /(^|[^a-z])(verify|check|submit|confirm|valider|verificar|bestätigen|bevestigen)([^a-z]|$)/;
+        const cands = [];
+        const sels = '.button-submit, #button-submit, .button-arrow, '
+            + '[class*="button-arrow" i], [class*="next" i], '
+            + 'button[type="submit"], [role="button"], button, .button, '
+            + '[class*="submit" i], [aria-label*="next" i], '
+            + '[aria-label*="verify" i], [title*="Next" i], [title*="Verify" i]';
+        for (const el of document.querySelectorAll(sels)) {
+            if (!vis(el) || disabled(el)) continue;
+            const t = norm((el.textContent || '') + ' '
+                + (el.getAttribute('aria-label') || '') + ' '
+                + (el.getAttribute('title') || ''));
+            const cls = norm((el.className || '').toString());
+            let kind = '';
+            if (nextRe.test(t) || cls.includes('arrow') || /\bnext\b/.test(cls)) kind = 'next';
+            else if (verifyRe.test(t) || cls.includes('verify')) kind = 'verify';
+            else if (cls.includes('button-submit') || cls.includes('submit')) kind = 'submit';
+            else continue;
+            const r = el.getBoundingClientRect();
+            cands.push({
+                kind, x: r.left, y: r.top, width: r.width, height: r.height,
+                t: t.slice(0, 40)
+            });
+        }
+        if (!cands.length) return null;
+        const pick = cands.find(c => c.kind === 'next')
+            || cands.find(c => c.kind === 'submit')
+            || cands[0];
+        return pick;
+    }"""
+
     async def _click_challenge_verify(self, frame) -> bool:
-        """Click hCaptcha's Verify/Submit button inside the challenge frame."""
-        try:
-            await frame.locator('.button-submit, #button-submit').first.click(
-                timeout=4000)
-            self._log("[Captcha] Clicked Verify")
-            return True
-        except Exception:
-            pass
-        # MIXED rounds advance with a "Next" arrow button (no Verify yet) —
-        # click it so the second stage renders and the round loop re-probes.
-        try:
-            nxt = frame.locator('.button-arrow, [class*="button-arrow" i], '
-                                '[class*="next" i] button')
-            if await nxt.count() > 0:
-                await nxt.first.click(timeout=4000)
-                self._log("[Captcha] Clicked Next (mixed-round stage)")
+        """Click hCaptcha's Next or Verify control inside the challenge frame.
+
+        Attribute/material grids and mixed rounds advance with a Next
+        button (often `.button-submit` whose label is "Next" or an arrow,
+        enabled only after tiles are selected). A disabled click is a
+        miss — wait for enablement, then humanize the click so the next
+        challenge can paint.
+        """
+        pick = None
+        for _wait in range(6):
+            try:
+                pick = await frame.evaluate(self._NEXT_VERIFY_JS)
+            except Exception:
+                pick = None
+            if pick and pick.get("width"):
+                break
+            await asyncio.sleep(0.28)
+        if pick and pick.get("width"):
+            try:
+                ox, oy = await self._frame_origin(frame)
+                await hm.click_box(self._page, {
+                    "x": float(pick["x"]) + ox,
+                    "y": float(pick["y"]) + oy,
+                    "width": float(pick["width"]),
+                    "height": float(pick["height"]),
+                })
+                kind = pick.get("kind") or "submit"
+                label = "Next" if kind == "next" else "Verify"
+                extra = f" ({pick.get('t')!r})" if pick.get("t") else ""
+                self._log(f"[Captcha] Clicked {label}{extra}")
                 return True
-        except Exception:
-            pass
-        # Fallback: any visible verify-like control, clicked by coordinates
-        # (frame offset + local coords mapped to page coordinates).
-        try:
-            pos = await frame.evaluate("""() => {
-                const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-                const re = /(^|[^a-z])(verify|check|submit|continue|next|weiter|valider|v\\u00e9rifier|verificar|confirmar|confirm|best\\u00e4tigen|bevestigen|volgende)([^a-z]|$)/;
-                for (const el of document.querySelectorAll(
-                        '.button-submit, #button-submit, button[type="submit"], [role="button"]')) {
-                    if (el.offsetParent === null) continue;
-                    const t = norm(el.textContent || el.getAttribute('aria-label'));
-                    if (!t || !re.test(t)) continue;
-                    const r = el.getBoundingClientRect();
-                    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-                }
-                return null;
-            }""")
-            if not pos or not pos.get("x"):
-                return False
-            fbox = await (await frame.frame_element()).bounding_box()
-            if not fbox:
-                return False
-            x = fbox["x"] + float(pos["x"])
-            y = fbox["y"] + float(pos["y"])
-            await self._page.mouse.click(x, y)
-            self._log("[Captcha] Clicked Verify (coordinate fallback)")
-            return True
-        except Exception:
-            return False
+            except Exception as e:
+                self._log(f"[Captcha] Next/Verify humanized click failed: {e}",
+                          level="debug")
+        for sel, label in (
+                ('.button-submit, #button-submit', "Verify"),
+                ('.button-arrow, [class*="button-arrow" i], '
+                 '[class*="next" i], [aria-label*="next" i]', "Next"),
+        ):
+            try:
+                loc = frame.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=3000)
+                    self._log(f"[Captcha] Clicked {label}")
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _type_challenge_answer(self, frame, text: str) -> bool:
         """Fill the answer input for 'type the characters' challenges."""
@@ -4639,27 +5338,63 @@ class DiscordAutomation:
             if is_select:
                 try:
                     ctrl = self._page.locator(f'[data-dob-target="{label}"]')
+                    # Exact index into the <select>'s OWN option list.
+                    # (The generic _DOB_OPTION_INDEX_JS only counts
+                    # offsetParent!==null elements — in a CLOSED native
+                    # select no <option> is rendered, so it always
+                    # returns -1 and the select gets silently skipped.)
                     idx = await self._page.evaluate(
-                        _DOB_OPTION_INDEX_JS.replace("__OPT_SEL__", json.dumps(_DOB_OPTION_SEL)),
-                        [option_text, _MONTH_ALIASES])
+                        """([sel, value, monthAliases]) => {
+                            const el = document.querySelector(sel);
+                            if (!el || el.tagName !== 'SELECT') return -1;
+                            const norm = s => (s == null ? '' : String(s)).toLowerCase().replace(/\\s+/g, ' ').trim();
+                            const want = norm(value);
+                            const wantNum = (monthAliases && monthAliases[want]) || 0;
+                            for (let i = 0; i < el.options.length; i++) {
+                                const o = el.options[i];
+                                const t = norm(o.text), v = norm(o.value);
+                                if (t === want || v === want) return i;
+                                if (wantNum &&
+                                    ((monthAliases && monthAliases[t]) === wantNum ||
+                                     (monthAliases && monthAliases[v]) === wantNum)) return i;
+                            }
+                            return -1;
+                        }""",
+                        [f'[data-dob-target="{label}"]', option_text, _MONTH_ALIASES])
                     if isinstance(idx, int) and idx >= 0:
                         await ctrl.select_option(index=idx)
                         await asyncio.sleep(0.3)
                         self._log(f"Selected {label} (native select index {idx})")
                         return True
+                    self._log(f"[DOB] native select for {label}: no option matched '{option_text}' (idx={idx})", level="warn")
                 except Exception as e:
                     self._log(f"[DOB] native select failed for {label}: {e}", level="warn")
                 return await self._dob_js_fallback(label, option_text)
 
             # ── Custom dropdown: open the menu, then pick the option ──
             # Discord re-renders the form while credentials are being written
-            # (React controlled inputs) and truedriver's humanized cursor moves
-            # slowly, so a single Playwright click can hang on 'performing
-            # click action' for the full 30s default even though the element
+            # (React controlled inputs) and a humanized cursor moves
+            # slowly, so a single click can hang on 'performing click
+            # action' for the full 30s default even though the element
             # resolved visible+stable — the exact stall from the field logs.
             # Rule: SHORT click timeouts + verify the menu actually opened +
             # layered fallbacks (coordinate click -> trusted locator click
             # -> JS dispatch -> keyboard) so no single step can ever eat 30s.
+            #
+            # Center the control in the viewport BEFORE opening: the Year
+            # menu is the longest (~110 options) and the DOB row sits near
+            # the bottom of the 1280x720 viewport — opened from the row's
+            # natural position the menu runs PAST the viewport bottom, the
+            # page can't scroll it back in, and the option click lands in
+            # empty space. That is why Month/Day filled and Year didn't.
+            # Centering leaves room for the menu to drop below the control.
+            try:
+                await self._page.evaluate(
+                    "() => { const el = document.querySelector('[data-dob-target=\""
+                    + label + "\"]'); if (el) { try { el.scrollIntoView({ block: 'center' }); } catch (e) {} } }")
+                await asyncio.sleep(0.25)
+            except Exception:
+                pass
             deadline = time.monotonic() + 25.0
             opened = False
             for open_method in ("coords", "click", "dispatch", "keyboard"):
@@ -4690,7 +5425,7 @@ class DiscordAutomation:
                         self._log(f"[DOB] open click {label}: {str(e)[:150]}", level="warn")
                 elif open_method == "coords":
                     # Trusted input at the control's center — engine-
-                    # humanized by truedriver (bezier, no added delay), no
+                    # engine-driven (real CDP input), with no
                     # actionability re-checks to stall on.
                     try:
                         await ctrl.scroll_into_view_if_needed(timeout=3000)
@@ -4722,28 +5457,35 @@ class DiscordAutomation:
                     except Exception as e:
                         self._log(f"[DOB] open keyboard {label}: {str(e)[:120]}", level="warn")
                         continue
-                # Did the menu actually open? Poll for any visible option /
-                # menu element — a timed-out click may still have opened it.
+                # Did THIS control's menu actually open? Poll with the
+                # scoped check (adjacent to the marked control, >=2 visible
+                # parts) — a timed-out click may still have opened it, but a
+                # stale Month/Day menu or page chrome must NOT count.
                 for _poll in range(8):
                     await asyncio.sleep(0.25)
                     try:
                         opened = bool(await self._page.evaluate(
-                            "() => Array.from(document.querySelectorAll("
-                            "'[role=\"option\"], [role=\"menuitem\"], "
-                            "[id*=\"option\" i], [class*=\"option\" i], "
-                            "[class*=\"menu\" i]'))"
-                            ".some(e => e.offsetParent !== null)"))
+                            _DOB_MENU_OPEN_JS, label))
                     except Exception:
                         opened = False
                     if opened:
                         break
+            if opened:
+                self._log(f"[DOB] {label}: menu opened via {open_method}")
             if not opened:
                 self._log(f"[DOB] menu for {label} never opened — JS fallback", level="warn")
                 return await self._dob_js_fallback(label, option_text)
 
             # ── Pick the option ──
+            # Order: TYPEAHEAD first — it is geometry-independent and the
+            # only reliable path for a DEEP option in a long menu (Year's
+            # ~110 options vs Day's option sitting 4th). A human does
+            # exactly this: focus the control, type "1995", hit Enter.
+            # Works for native <select> AND custom React-Select; Enter
+            # commits through the component's own keyboard flow (no
+            # stale-DOM selection that a re-render would revert).
             picked = False
-            for sel_method in ("coords", "index", "dispatch", "keyboard"):
+            for sel_method in ("typeahead", "coords", "index", "keyboard", "dispatch"):
                 if picked or time.monotonic() > deadline:
                     break
                 idx = -1
@@ -4761,7 +5503,23 @@ class DiscordAutomation:
                             _DOB_OPTION_POS_JS, [option_text, _MONTH_ALIASES])
                     except Exception:
                         pos = None
-                if sel_method == "index":
+                if sel_method == "typeahead":
+                    try:
+                        # The control that opened the menu holds focus.
+                        # Type the option text with quick human cadence —
+                        # typeahead jumps to the first option whose label
+                        # starts with the accumulated string ("1"->1999,
+                        # "19"->1999, "1995"->1995) — then Enter confirms.
+                        for ch in str(option_text):
+                            await self._page.keyboard.type(ch)
+                            await asyncio.sleep(random.uniform(0.08, 0.18))
+                        await asyncio.sleep(0.25)
+                        await self._page.keyboard.press("Enter")
+                        picked = True
+                        self._log(f"[DOB] option for {label} by typeahead ({option_text})")
+                    except Exception as e:
+                        self._log(f"[DOB] option typeahead {label}: {str(e)[:120]}", level="warn")
+                elif sel_method == "index":
                     if isinstance(idx, int) and idx >= 0:
                         try:
                             # index is over VISIBLE options only (see
@@ -4791,14 +5549,43 @@ class DiscordAutomation:
                 elif sel_method == "keyboard":
                     if isinstance(idx, int) and idx >= 0 and idx <= 300:
                         try:
-                            # The combobox still holds focus from the open;
-                            # Home normalizes the highlight to the first
-                            # visible option, then idx ArrowDowns land on
-                            # the wanted one and Enter selects it.
+                            # Guarantee the menu is actually open: if the
+                            # open-check was a false positive, Home on a
+                            # closed combobox does nothing and the first
+                            # ArrowDown (which opens the menu) desyncs the
+                            # highlight. One ArrowDown opens it when closed.
+                            menu_up = False
+                            try:
+                                menu_up = bool(await self._page.evaluate(
+                                    _DOB_MENU_OPEN_JS, label))
+                            except Exception:
+                                menu_up = False
                             await ctrl.focus()
-                            await self._page.keyboard.press("Home")
-                            for _k in range(max(idx, 0)):
+                            if not menu_up:
                                 await self._page.keyboard.press("ArrowDown")
+                                await asyncio.sleep(0.2)
+                            # Navigate from the NEAR end: Home + idx downs
+                            # for the top half, End + (count-1-idx) ups for
+                            # the bottom half — the Year menu has ~110
+                            # options, and each press is a CDP round-trip.
+                            count = idx + 1
+                            try:
+                                count = int(await self._page.evaluate(
+                                    "(sel) => Array.from(document"
+                                    ".querySelectorAll(sel)).filter("
+                                    "e => e.offsetParent !== null).length",
+                                    _DOB_OPTION_SEL)) or (idx + 1)
+                            except Exception:
+                                count = idx + 1
+                            if idx * 2 <= count:
+                                await self._page.keyboard.press("Home")
+                                for _k in range(max(idx, 0)):
+                                    await self._page.keyboard.press("ArrowDown")
+                            else:
+                                await self._page.keyboard.press("End")
+                                for _k in range(max(count - 1 - idx, 0)):
+                                    await self._page.keyboard.press("ArrowUp")
+                            await asyncio.sleep(0.15)
                             await self._page.keyboard.press("Enter")
                             picked = True
                         except Exception as e:
@@ -4819,6 +5606,11 @@ class DiscordAutomation:
                 await asyncio.sleep(0.3)
 
             self._log(f"[DOB] selection methods failed for {label} — JS fallback", level="warn")
+            try:
+                cur = await self._dob_current_value(label)
+                self._log(f"[DOB] {label} control still shows '{cur}' after all pick methods", level="warn")
+            except Exception:
+                pass
             return await self._dob_js_fallback(label, option_text)
 
         except Exception as e:
@@ -5056,7 +5848,7 @@ class DiscordAutomation:
     async def _type_humanly(self, sel: str, val: str) -> bool:
         """Type one field like a real person instead of pasting it.
 
-        Real click focuses the input (truedriver humanizes the cursor path),
+        Real click focuses the input (real Chrome cursor via nodriver),
         then character-by-character keyboard input with variable rhythm,
         one mid-field "thinking" pause, and an occasional typo corrected
         with backspace. Returns True only when the field holds `val` —
@@ -5151,11 +5943,11 @@ class DiscordAutomation:
             loc = self._page.locator(sel)
             if (await loc.count()) == 0 or not (await loc.first.is_visible()):
                 return False
-            # truedriver fill() APPENDS to a non-empty field instead of
-            # replacing (probed on the engine: re-filling a filled input
-            # yields old+new concatenated - the "email shows the address
-            # twice/mangled" corruption). Clear FIRST, then write, then
-            # verify; the JS-setter fallback below is the guaranteed-
+            # Clear FIRST, then write, then verify. Playwright fill() already
+            # replaces the value, but an explicit empty fill guards against
+            # any engine build that appends to a non-empty field (that
+            # concatenation was the "email shows the address twice/mangled"
+            # corruption); the JS-setter fallback below is the guaranteed-
             # replace path for anything that still slips.
             await loc.first.fill("")
             await asyncio.sleep(0.05)
@@ -5481,6 +6273,24 @@ class DiscordAutomation:
             # re-writes are safe — nothing can leak into another field now),
             # then read once more; if anything is STILL missing, rotate
             # instead of "faking" a Create Account on a blank form.
+            #
+            # DOB included: a select can show its value in the DOM yet have
+            # the React state revert it on the ToS-triggered re-render
+            # (the "Required" error on the DOB row at submit). Re-verify all
+            # three right here and re-select anything that reverted — this
+            # is the last chance before the click.
+            for dob_label, dob_opt in (("Month", month_name),
+                                       ("Day", day_val),
+                                       ("Year", year_val)):
+                try:
+                    if not await self._dob_verify(dob_label, dob_opt):
+                        self._log(f"[DOB] {dob_label} reverted to placeholder before submit — re-selecting {dob_opt}", level="warn")
+                        await self._select_dob(dob_label, dob_opt)
+                        await self._human_pause()
+                        if not await self._dob_verify(dob_label, dob_opt):
+                            self._log(f"[DOB] {dob_label} still not holding '{dob_opt}' after re-select", level="error")
+                except Exception as _de:
+                    self._log_exception(f"[DOB] Final {dob_label} re-verify failed", _de)
             await self._stabilize_credential_fields(
                 self._build_cred_fields(self._display_name or self._username or ""))
             final_vals = await self._read_form_values()
@@ -6257,4 +7067,3 @@ async def run_discord_automation():
 
 if __name__ == "__main__":
     asyncio.run(run_discord_automation())
-

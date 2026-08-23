@@ -21,6 +21,8 @@ the vision model as fallback.
 | `counting` | "how many X are in this image?" | one number | **unhandled** — a photo + numeric options was misread as multiple choice |
 | **pattern completion** | "put one of the animals into the empty spot to complete the pattern" | drag candidate → empty cell | **misrouted** — prompt regex missed it and the tile-rich DOM fell through to binary |
 | **mixed binary + point** | "click each image containing X, then click on Y" | tiles then (x, y) | **misrouted** — payload tier saw `area_select` and treated the grid stage as a point round |
+| **wooden-block tower** | "move the correct missing block segment onto the incomplete tower" | drag piece → short/gapped stack | **misrouted** — payload `image_label_area_select` committed to a point click; the Move badge (`+ Move`) was missed; DragLocator punched-slot geometry is the wrong puzzle |
+| **set-down / spatial-ref** | "find places safe for setting down the item in the reference" | tile indices (surfaces) | **misread** — treated as a tool-affordance or point click; clicked balloons/leaves instead of nightstand/bench/deck |
 
 The mixed round shares the `image_label_area_select` request type: hCaptcha
 serves a binary tile-grid stage followed by an area stage under one payload.
@@ -48,10 +50,55 @@ classifier, and runs the Latin-square resolver — confidence-gated, with
 the vision model as fallback (which answers as a candidate→hole drag and
 can also handle multi-candidate variants the offline logic refuses).
 
+Wooden-block tower rounds ("Move the correct missing block segment onto
+the incomplete tower") are also served under `image_label_area_select`
+even though the answer is a Move-badge drag: three wood stacks plus a
+1–2 block piece on the right. The live prompt forces `DRAG_DROP` (the
+payload tier only commits when the question is *only* the tower, so a
+mixed "select items, then move the block…" payload still defers). The
+DOM "Move" probe accepts `+ Move` / short labels with an icon child.
+The round loop dispatches to `_solve_tower_round` — **not**
+`DragLocator`. It screenshots the **whole challenge iframe** (the Move
+piece is often a separate DOM node beside the photo), takes a Move-badge
+hint from the DOM, then finds warm/wood columns and drops onto the
+shortest stack or the largest internal gap. Vision (`shape="tower"`) is
+a 18s last resort only — a long 504 expires the challenge.
+
+Set-down / spatial-reference grids ("Find places safe for setting down
+the item in the reference") are a **binary tile grid with a header
+photo** (a mug, a tool, …). The live prompt forces `BINARY` (it is not
+a point click). Offline, `is_setdown_prompt()` + `FLAT_SURFACES`
+(`table` / `chair` / `wood`, with nightstand/dresser/desk → table,
+bench/sofa → chair, deck → wood) clicks every furniture/lumber tile
+and skips balloons, balls, leaves, and building facades. No matching
+surface returns `None` so the vision model answers — an empty Verify
+almost never wins this family. The wording is tight on purpose:
+`"place where it fits"` is a drag puzzle and bare `"in the reference"`
+matches every affordance grid. The default vision model is
+**SmolVLM2-256M** (`ahmadwaqar/smolvlm2-256m-video:q8_0`): it cannot
+do a 9-image JSON contract (that 504s in ~180s), so the client asks
+**one tile at a time** ("is this a table/nightstand/bench/deck?") at
+256 px / 12s / no `format: json`. Offline surfaces stay the first path
+— a 256M yes/no on a tennis-ball-on-deck photo is unreliable.
+
+This is how the long tail of the ~1000-prompt catalog is covered:
+**routing + aliases + the 60-class CNN + vision**, not a 1000-class
+retrain. The offline tile model still only emits the 60 trained
+classes; unmapped nouns (tennis ball, hot-air balloon, plastic, glass,
+3-D views, odd-one-out, actions) fall through to the vision model.
+
 The prompt tier also understands the **select-all** wording variants
-("select/choose/pick/check/mark all the images/tiles with…") and the
-**drag-puzzle** wording variants ("complete the puzzle", "missing piece",
-"matching outline", "empty space", "move the piece…").
+("select/choose/pick/check/mark all the images/tiles with…"), the
+**attribute/material** wording variants ("select items that are primarily
+metal", "made of wood", "have fur" — resolved offline against METAL /
+WOODEN / FURRY class sets, unknown materials like plastic/glass fall
+through to the vision model), and the **drag-puzzle** wording variants
+("complete the puzzle", "missing piece", "matching outline", "empty
+space", "move the piece…"). After every answered round the solver clicks
+the enabled **Next** or **Verify** control and waits for the next
+challenge to paint (it does not treat the brief iframe-loader dip as
+"challenge over", and it will not re-click the same tiles — that would
+toggle them off).
 
 ## Architecture
 
@@ -75,7 +122,9 @@ The prompt tier also understands the **select-all** wording variants
         │  TEXT_ENTRY → _solve_text_round                    │
         │  COUNT      → _solve_count_round (number options)  │
         │  PATTERN*   → _solve_pattern_round (Latin square)  │
-        │   (* DRAG_DROP flagged by is_pattern_prompt)       │
+        │  TOWER*     → _solve_tower_round (wood-mask drag)  │
+        │   (* DRAG_DROP flagged by is_pattern_prompt /      │
+        │      is_tower_prompt; tower never uses DragLocator)│
         └───────────────────────────────────────────────────┘
                        │
         ┌──────────────┴───────────────┐
@@ -85,8 +134,8 @@ The prompt tier also understands the **select-all** wording variants
         └──────────────┬───────────────┘
                        │ fallback
         ┌──────────────┴───────────────┐
-        │ vision model (vision_solver) │  per-shape system prompts,
-        │  Ollama / OpenAI-compatible   │  strict JSON-repair parsing
+        │ vision model (vision_solver) │  SmolVLM2: per-tile yes/no;
+        │  Ollama / OpenAI-compatible   │  larger VLMs: JSON + repair
         └──────────────────────────────┘
                        │
               human_mouse.py on every
@@ -97,7 +146,8 @@ The prompt tier also understands the **select-all** wording variants
 
 1. **payload** — `classify_from_payload` reads `request_type` from the
    `/getcaptcha` JSON (captured by the page's response hook); `area_select`
-   is split point/bbox by question wording or `request_config`, and **mixed
+   is split point/bbox by question wording or `request_config`; **tower /
+   pattern-only** area_select payloads route to drag; and **mixed
    binary+point rounds defer to the DOM tier** when the payload question is
    binary-grid wording. Helpers: `question_text()`, `example_urls()` (the
    `requester_question_example` reference images), `task_urls()`
@@ -142,10 +192,17 @@ The prompt tier also understands the **select-all** wording variants
   (opposite labels).
 * `EDIBLE` / `WHEELED` / `MOTORISED` / `ANIMALS` / `TOOLS` — set
   predicates for "click each image containing an animal" style prompts.
+* `METAL` / `WOODEN` / `FURRY` / `PLANTS` — dominant-material sets for
+  "select items that are primarily metal / made of wood / have fur".
+  `is_attribute_prompt()` / `attribute_members()` gate them; unknown
+  materials return `None` so the vision model (which reads the object
+  itself, not the background) answers.
 * `resolve_semantic(prompt, tile_labels, example_label) →` 1-based
-  indices, trying superlatives → affordance → same-category-as-example →
-  set predicates → plain noun. Returns **`None`** when the prompt is not
-  understood (server falls back to the vision model) and **`[]`** for a
+  indices, trying superlatives → set-down surfaces → comparative vs the
+  reference ("larger than the item shown") → affordance →
+  same-category-as-example → material/attribute sets → set predicates →
+  plain noun. Returns **`None`** when the prompt is not understood
+  (server falls back to the vision model) and **`[]`** for a
   legitimately empty round (they exist — clicking nothing and Verify is the
   right answer).
 * `resolve_pattern(grid_labels, hole_index, candidates) →` candidate
@@ -326,10 +383,13 @@ metrics). The models directory IS committed (~2.7 MB total).
 |---|---|---|
 | `VISION_API_BASE` | vision endpoint (Ollama-compatible) | `http://localhost:11434` |
 | `VISION_API_KEY` | Bearer token for the endpoint | — |
-| `OLLAMA_MODEL` | vision model name | `qwen3-vl:2b` |
+| `OLLAMA_MODEL` | vision model name | `ahmadwaqar/smolvlm2-256m-video:q8_0` |
+| `OLLAMA_TIMEOUT` | per-solve timeout (seconds) | `30` |
+| `OLLAMA_TILE_TIMEOUT` | per-tile yes/no timeout for tiny VLMs | `12` |
+| `OLLAMA_IMAGE_SIDE` | max image side (px) sent to tiny VLMs | `256` |
 | `SOLVER_CNN_MIN_CONF` | mean per-tile confidence to trust the offline grid path | `0.62` |
 | `SOLVER_MODELS_DIR` | where the `.pt`/`.json` live | `./models` |
-| `FULLPAGE_SHOTS` | capture FULL-PAGE dashboard camera frames | `1` |
+| `FULLPAGE_SHOTS` | whole scrollable page camera frames (default: full browser-view frames with the register form revealed when out of sight) | `0` |
 | `FULLPAGE_MAX_PX` | max page height (px) worth a full-page frame; taller pages fall back to viewport frames | `8000` |
 
 ## Measured results (`python test_solver.py`, held-out rounds, disjoint
@@ -392,6 +452,16 @@ path keeps the confidence gate and falls back to the vision model below
   of candidate vs grid elements) is conservative — any doubt and the
   vision model answers the drag instead. Icon styles outside the 60
   painted classes are vision territory.
+* Tower rounds are a geometric heuristic on wood-coloured pixels: unusual
+  palettes (grey stone, neon plastic), four-plus equal-height stacks, or
+  a piece that is not in the right strip fall through to the vision
+  model (`shape="tower"`). The locator never guesses when every stack is
+  the same height and there is no gap.
+* Set-down grids need the CNN to label nightstands as `table`, benches
+  as `chair`, and wooden decks as `wood`. A tennis-ball-on-deck photo
+  whose subject the 60-class model does not know is vision territory.
+  Do **not** retrain a 1000-class tile CNN for the prompt catalog — there
+  is no corpus, and the existing 60-class pass already takes 1.5–2 h.
 * The alias table is deliberately conservative: nouns that are NOT
   visually defensible at tile scale are left unmapped so the vision model
   (which reads arbitrary prompt text) answers them. The offline models

@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import aiohttp
 import requests as _requests
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, send_file
 
 # Database removed - no token persistence
 
@@ -43,6 +43,7 @@ TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
 import live_ui
+import trainer
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -190,7 +191,7 @@ def _init_worker(wid: str) -> dict:
     return {
         "id": wid,
         "bot": None,
-        "status": "idle",          # idle | starting | running | done | error
+        "status": "idle",          # idle | starting | running | live | demo | done | error
         "step": "",
         "email": "",
         "username": "",
@@ -250,7 +251,7 @@ async def _probe_gated_proxy(wid: str, bot, tries: int = 2):
     """Draw the next session and only accept it if it probes live against
     discord.com (the same gate the worker loop uses). Dead sessions are
     blacklisted as they're found, so an expired proxies.txt can't trap the
-    LIVE tab in a chrome-error loop. Returns a proven-live proxy or None."""
+    LIVE tab in a browser-error loop. Returns a proven-live proxy or None."""
     for _ in range(tries):
         try:
             proxy = await _next_proxy(force=PROXY_FORCE)
@@ -729,9 +730,10 @@ async def _start_all_async(cfg: dict) -> None:
             _worker_tasks[wid] = task
 
         # A 530-session TLS sweep at the default 250-way concurrency can use
-        # most of the 1 GB container while Camoufox is also hydrating React.
-        # Run optional pool-wide validation only after browser work is idle;
-        # the active worker still probes its chosen session before every use.
+        # most of the 1 GB container while real Chrome is also hydrating
+        # React. Run optional pool-wide validation only after browser work
+        # is idle; the active worker still probes its chosen session before
+        # every use.
         asyncio.create_task(_deferred_proxy_sweep(n_sessions), name="deferred-proxy-sweep")
         asyncio.create_task(_proxy_validate_loop(), name="proxy-validation-summary")
 
@@ -802,15 +804,15 @@ async def _live_navigate_robust(wid: str, bot, url: str) -> dict:
     discord.com then shows 'site can't be reached' (ERR_TUNNEL_CONNECTION_FAILED).
     Probe-gate the next session exactly like the worker loop, then fall back
     to TOR, then to a direct connection, so the LIVE tab never stays stuck on
-    chrome-error://chromewebdata/.
+    a browser error page.
     """
     st = await live_control.live_navigate(bot, url)
     if not st.get("error"):
         return st
     first_err = st.get("error", "")
     _log(f"[{wid}] [Live] Navigate failed ({first_err}) — rotating session and retrying", level="warn")
-    # The session the browser is currently on just produced chrome-error:
-    # blacklist it so it is never handed out again this run.
+    # The session the browser is currently on just produced a browser error
+    # page: blacklist it so it is never handed out again this run.
     if bot.proxy and proxy_pool is not None:
         try:
             proxy_pool.release(bot.proxy, ok=False)
@@ -868,8 +870,9 @@ async def _start_live_browser(wid: str, url: str = "",
     a running signup off the page it is filling."""
     state = _workers.get(wid) or _init_worker(wid)
     _workers[wid] = state
-    if not url:
-        url = "https://discord.com/register"
+    wanted = (url or "").strip()
+    # Opening LIVE never yanks a parked demo/signup tab. A cold launch with
+    # no URL still lands on Discord register so the camera can go there.
     # The gen is already driving this SAME browser — never relaunch a second
     # one on top of it and never yank it off the page it is filling.
     # Just report what the worker is doing so the LIVE tab shows it live.
@@ -912,7 +915,8 @@ async def _start_live_browser(wid: str, url: str = "",
             alive = False
         if not alive:
             # Probe-gate the first session: launching straight onto an expired
-            # residential tunnel is what left the LIVE tab on chrome-error.
+            # residential tunnel is what left the LIVE tab on a browser error
+            # page.
             proxy = await _probe_gated_proxy(wid, bot)
             if proxy is not None:
                 bot.proxy = proxy
@@ -930,19 +934,34 @@ async def _start_live_browser(wid: str, url: str = "",
             await asyncio.wait_for(bot.initialize(), timeout=90)
             _log(f"[{wid}] [Live] Browser launched ({via})")
             launched = True
-        if url:
-            # Navigate whenever the page isn't already where the operator
-            # asked it to be. A parked browser on about:blank (or a stale
-            # error page) must NOT be treated as "still filling a signup" —
-            # that was leaving the LIVE tab on a permanent white screen.
+        if launched and not wanted:
+            wanted = live_control.DISCORD_REGISTER_URL
+        if wanted:
+            # Navigate when the operator asked for a URL (REGISTER) or this
+            # is a cold launch. A parked demo tab stays put unless force=1.
             cur = ""
             try:
                 cur = str(bot._page.url or "") if bot._page else ""
             except Exception:
                 cur = ""
-            if force or launched or cur.rstrip("/") != url.rstrip("/"):
-                return await _live_navigate_robust(wid, bot, url)
-        return await live_control.get_live_state(bot)
+            busy = state.get("status") in ("starting", "running", "demo")
+            should_go = force or launched or (
+                cur.rstrip("/") != wanted.rstrip("/") and not busy)
+            if should_go:
+                st = await _live_navigate_robust(wid, bot, wanted)
+                if state.get("status") not in ("starting", "running"):
+                    state["status"] = "live"
+                    state["step"] = "live camera · discord register"
+                if st.get("screenshot"):
+                    state["last_shot_b64"] = st["screenshot"]
+                st["status"] = state.get("status", "")
+                return st
+        if state.get("status") in ("idle", "stopped", "error", ""):
+            state["status"] = "live"
+            state["step"] = "live camera"
+        st = await live_control.get_live_state(bot)
+        st["status"] = state.get("status", "")
+        return st
     except Exception as e:
         import traceback
         tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -970,6 +989,79 @@ async def _close_live_browser(wid: str) -> bool:
     state["bot"] = None
     state["last_shot_b64"] = ""
     return True
+
+
+async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
+    """Prepare B1's shared LIVE browser for the official hCaptcha demo.
+
+    The demo runner intentionally uses a direct connection.  It does not
+    rotate proxies, use TOR, or borrow the Discord signup worker's transport;
+    this is a small, transparent QA flow against hCaptcha's public demo.
+    """
+    state = _workers.get(wid) or _init_worker(wid)
+    _workers[wid] = state
+    if state.get("status") in ("starting", "running"):
+        return {"error": "worker is busy with another browser task"}
+    if state.get("launching"):
+        return {"error": "browser is still launching"}
+
+    state["launching"] = True
+    try:
+        bot = state.get("bot")
+        if bot is None:
+            bot = DiscordAutomation(
+                headless=bool(cfg.get("headless", True)),
+                worker_id=wid,
+                domain=DEFAULT_MAIL_DOMAIN,
+            )
+            state["bot"] = bot
+        try:
+            alive = await bot.is_alive()
+        except Exception:
+            alive = False
+        if not alive:
+            bot.proxy = None
+            bot._direct = True
+            _log(f"[{wid}] [Demo] Launching direct real Chrome for {trainer.TARGET_DEMO_URL}")
+            await asyncio.wait_for(bot.initialize(), timeout=90)
+        elif not getattr(bot, "_direct", False) or bot.proxy:
+            # A parked signup browser may have a proxy attached.  Rebuild it
+            # directly before using it for the public demo.
+            if not await bot.switch_direct():
+                return {"error": "could not switch the shared browser to direct mode"}
+        st = await live_control.live_navigate(bot, trainer.TARGET_DEMO_URL)
+        if st.get("error"):
+            return st
+        state["status"] = "demo"
+        state["step"] = "official hCaptcha demo"
+        state["proxy"] = "direct"
+        if st.get("screenshot"):
+            state["last_shot_b64"] = st["screenshot"]
+        return st
+    except Exception as exc:
+        _log(f"[{wid}] [Demo] Browser setup failed: {type(exc).__name__}: {exc}", level="error")
+        return {"error": f"real demo browser failed: {exc}"}
+    finally:
+        state["launching"] = False
+
+
+async def _start_real_demo_runner(speed: float, one_shot: bool = False) -> dict:
+    """Attach the trainer to B1's browser on the app asyncio loop."""
+    if trainer.trainer_engine.is_busy():
+        return {"ok": False, "message": "Real demo runner already running or stopping"}
+    cfg = load_config()
+    browser = await _start_real_demo_browser("B1", cfg)
+    if browser.get("error"):
+        return {"ok": False, "message": browser["error"], "browser": browser}
+    state = _workers.get("B1") or _init_worker("B1")
+    bot = state.get("bot")
+    result = trainer.trainer_engine.start_external(
+        getattr(bot, "_page", None), speed=speed, one_shot=one_shot,
+    )
+    if result.get("ok"):
+        state["status"] = "demo"
+        state["step"] = "official hCaptcha demo"
+    return {**result, "browser": browser}
 
 # ── Flask app ─────────────────────────────────────────────
 
@@ -1204,6 +1296,8 @@ def handle_browser_action():
     if st is None:
         return jsonify({"connected": False, "worker_id": wid,
                         "error": "event loop unavailable"}), 503
+    if st.get("screenshot"):
+        s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
 @app.route('/browser/start', methods=['POST'])
@@ -1216,6 +1310,9 @@ def handle_browser_start():
     if st is None:
         return jsonify({"connected": False, "worker_id": wid,
                         "error": "event loop unavailable"}), 503
+    s = _workers.get(wid)
+    if s is not None and st.get("screenshot"):
+        s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
 @app.route('/browser/close', methods=['POST'])
@@ -1354,9 +1451,110 @@ def handle_config():
 
 # ── Background event loop ─────────────────────────────────
 
+
+# ── Trainer Endpoints ─────────────────────────────────────
+
+@app.route('/trainer/status')
+def handle_trainer_status():
+    return jsonify(trainer.trainer_engine.get_state())
+
+@app.route('/trainer/start', methods=['POST'])
+def handle_trainer_start():
+    data = request.get_json(silent=True) or {}
+    try:
+        speed = float(data.get('speed', 2.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "speed must be a number"}), 400
+    result = _run_in_loop(_start_real_demo_runner(speed, one_shot=False))
+    if result is None:
+        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
+    return jsonify(result)
+
+@app.route('/trainer/stop', methods=['POST'])
+def handle_trainer_stop():
+    return jsonify(trainer.trainer_engine.stop())
+
+@app.route('/trainer/step', methods=['POST'])
+def handle_trainer_step():
+    result = _run_in_loop(_start_real_demo_runner(
+        trainer.trainer_engine.speed, one_shot=True,
+    ))
+    if result is None:
+        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
+    return jsonify(result)
+
+@app.route('/trainer/clear', methods=['POST'])
+def handle_trainer_clear():
+    return jsonify(trainer.trainer_engine.clear())
+
+@app.route('/trainer/questions')
+def handle_trainer_questions():
+    st = trainer.trainer_engine.get_state()
+    return jsonify(st.get('questions', []))
+
+@app.route('/trainer/speed', methods=['POST'])
+def handle_trainer_speed():
+    data = request.get_json(silent=True) or {}
+    try:
+        speed = float(data.get('speed', 2.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "speed must be a number"}), 400
+    return jsonify(trainer.trainer_engine.set_speed(speed))
+
+
+@app.route('/challenges/<name>')
+def handle_challenge_file(name):
+    """Serve a saved challenge / companion browser PNG. Never deleted."""
+    path = live_control.challenge_file_path(name)
+    if not path:
+        return Response(status=404)
+    return send_file(path, mimetype="image/png")
+
+
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+async def _vision_keepalive(interval: float = 240.0) -> None:
+    """Keep a HOSTED vision endpoint warm so the platform doesn't stop it.
+
+    The bot only calls vision when a captcha appears. Between captchas the
+    service idles — and on Railway's Hobby plan a deployment with no traffic
+    is STOPPED after ~15 minutes. The next captcha then hits a dead edge
+    (TLS reset in <0.1s, not a cold start) and every round fails until
+    someone manually restarts the deploy. A tiny GET / every 4 minutes
+    counts as traffic and keeps the deployment running. Local Ollama
+    (localhost) is skipped — it never idles out.
+    """
+    import vision_solver as _vs
+    base = (_vs.OLLAMA_BASE or "").rstrip("/")
+    if not base:
+        return
+    host = base.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]",
+                "host.docker.internal"):
+        return
+    headers = {}
+    if _vs.VISION_API_KEY:
+        headers["Authorization"] = f"Bearer {_vs.VISION_API_KEY}"
+    was_up: Optional[bool] = None
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=25)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(base + "/", headers=headers) as r:
+                    up = (r.status == 200)
+        except Exception:
+            up = False
+        if was_up is not None and up != was_up:
+            if up:
+                _log(f"[Vision] Endpoint back UP at {base}", level="warn")
+            else:
+                _log(f"[Vision] Endpoint DOWN at {base} — captcha rounds "
+                     "will fail until it answers (check the hosted deploy)",
+                     level="warn")
+        was_up = up
+        await asyncio.sleep(interval)
 
 def main() -> None:
     global _loop
@@ -1370,6 +1568,13 @@ def main() -> None:
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=_run_event_loop, args=(_loop,), daemon=True)
     t.start()
+
+    # Keep the hosted vision endpoint from being stopped for inactivity
+    # (no-op when VISION_API_BASE is unset or points at localhost).
+    try:
+        asyncio.run_coroutine_threadsafe(_vision_keepalive(), _loop)
+    except Exception as e:
+        print(f"[app] vision keepalive not started: {e}", flush=True)
 
     # Auto-migrate DB (DATABASE_URL from env)
 
@@ -1391,7 +1596,7 @@ DASHBOARD_HTML = r'''
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0a0a0b">
 <meta charset="utf-8">
-<title>EY3 - Token Forge</title>
+<title>EY3 - Token Forge & Trainer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html{background:#0a0a0b}
@@ -1442,12 +1647,48 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 .badge{display:inline-block;font-size:10px;padding:3px 10px;border-radius:99px;
   font-family:'JetBrains Mono','Courier New',monospace;letter-spacing:1px}
 .badge-ok{background:rgba(52,211,153,.15);color:#34d399}
+.badge-warn{background:rgba(251,191,36,.15);color:#fbbf24}
 .badge-err{background:rgba(248,113,113,.15);color:#f87171}
 .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .hide{display:none!important}
 .mt{margin-top:12px}.mb{margin-bottom:12px}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1e;
-  border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999}
+  border:1px solid #34343a;border-radius:10px;padding:12px 22px;font-size:13px;z-index:999;box-shadow:0 12px 30px rgba(0,0,0,.6)}
+
+/* Live official-demo dashboard layout */
+.trainer-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px;align-items:start}
+@media(max-width:820px){.trainer-grid{grid-template-columns:1fr}}
+
+.trainer-ss-box{background:#0b0c10;border:1px solid #272a3a;border-radius:12px;padding:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:340px;position:relative;overflow:hidden}
+#trainerModalImg{max-width:100%;height:auto;max-height:480px;border-radius:8px;border:1px solid #33374b;box-shadow:0 12px 36px rgba(0,0,0,.6);object-fit:contain}
+.trainer-ph{color:#8a8a92;font-family:'JetBrains Mono',monospace;font-size:12px;text-align:center;padding:34px 16px;line-height:1.6}
+
+.q-list-wrap{max-height:480px;overflow-y:auto;background:#08080a;border:1px solid #26262b;border-radius:10px;padding:6px}
+.q-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #1a1a1f;transition:.15s ease}
+.q-row:last-child{border-bottom:none}
+.q-row:hover{background:#131318}
+.q-num{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:13px;color:#34d399;min-width:24px}
+.q-body{flex:1;min-width:0}
+.q-title{font-size:13px;font-weight:600;color:#fff;margin-bottom:3px;word-break:break-word}
+.q-meta{font-size:10px;color:#8a8a92;font-family:'JetBrains Mono',monospace;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.btn-copy-q{padding:5px 11px;font-size:11px;font-weight:700;background:#1a1a22;border:1px solid #323547;color:#34d399;border-radius:7px;cursor:pointer;white-space:nowrap;transition:.15s}
+.btn-copy-q:hover{background:#232738;border-color:#34d399}
+.btn-copy-q.copied{background:#059669;color:#fff;border-color:#34d399}
+
+.badge-tag{font-size:9px;padding:2px 6px;border-radius:4px;background:#232738;color:#93c5fd;font-weight:600;letter-spacing:.5px}
+
+.stage-banner{background:#16171d;border:1px solid #2a2d3d;border-radius:10px;padding:11px 16px;font-size:12px;font-family:'JetBrains Mono',monospace;color:#a1a1aa;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.stage-dot{width:9px;height:9px;border-radius:50%;background:#52525b;display:inline-block;flex-shrink:0}
+.stage-dot.active{background:#34d399;box-shadow:0 0 10px #34d399;animation:pulseDot 1.2s infinite}
+@keyframes pulseDot{0%{opacity:.4}50%{opacity:1}100%{opacity:.4}}
+
+/* Real official-demo status card */
+.demo-form-stage{background:#101116;border:1px solid #262835;border-radius:10px;padding:14px}
+.demo-input-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+@media(max-width:500px){.demo-input-row{grid-template-columns:1fr}}
+.demo-input-box{background:#181920;border:1px solid #2a2c3a;border-radius:8px;padding:7px 10px;font-size:12px;color:#d4d4d8;font-family:'JetBrains Mono',monospace}
+.demo-link{color:#34d399;text-decoration:none;word-break:break-all}
+.demo-note{color:#94a3b8;font-size:11px;line-height:1.55;margin-top:10px}
 </style></head><body>
 
 <h1>EY3 <span style="font-size:11px;color:#8a8a92;border:1px solid #26262b;border-radius:99px;padding:4px 10px;font-weight:500;letter-spacing:2px">TOKEN FORGE</span></h1>
@@ -1457,6 +1698,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <nav id="tabNav">
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
+<button data-tab="trainer" onclick="showTab('trainer')">Live Demo</button>
 </nav>
 
 <div id="tabmain">
@@ -1494,6 +1736,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <div class="log-box" id="logBox">Waiting for logs...</div>
 <div class="flex mt">
 <button onclick="viewAllLogs()">ALL LOGS</button>
+<button onclick="copyLogs()">COPY LOGS</button>
 </div>
 </div>
 </div>
@@ -1504,6 +1747,104 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <div class="flex mb"><button onclick="refreshTokens()">Refresh</button></div>
 <div id="tokenList"><p style="color:#8a8a92">No tokens yet.</p></div>
 </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TRAINER TAB: REAL OFFICIAL DEMO (HUMAN-IN-THE-LOOP)
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tabtrainer" class="hide">
+  <div class="row mb">
+    <div class="col stat"><div class="n" id="statCaptured">0</div><div class="l">Captured Challenges</div></div>
+    <div class="col stat"><div class="n" id="statBypassed">0</div><div class="l">Completed Checks</div></div>
+    <div class="col stat"><div class="n" id="statCycles">0</div><div class="l">Demo Cycles</div></div>
+    <div class="col stat"><div class="n" id="statSpeed">2.0s</div><div class="l">Poll Delay</div></div>
+  </div>
+
+  <div class="card">
+    <div class="flex" style="justify-content:space-between;margin-bottom:12px">
+      <h3 style="margin:0">Real hCaptcha Demo Controls</h3>
+      <span id="trainerStatusBadge" class="badge badge-warn">IDLE</span>
+    </div>
+    <div class="flex">
+      <button class="primary" id="btnTrainerStart" onclick="startTrainer()">▶ START REAL DEMO</button>
+      <button class="danger" id="btnTrainerStop" onclick="stopTrainer()" disabled>⏸ STOP</button>
+      <button id="btnTrainerStep" onclick="stepTrainer()">⏭ RUN ONCE</button>
+      <button onclick="openLive()">👁 OPEN LIVE BROWSER</button>
+      <select id="trainerSpeedSelect" style="width:auto;min-width:130px" onchange="updateTrainerSpeed(this.value)">
+        <option value="1.0">Fast (1.0s)</option>
+        <option value="2.0" selected>Normal (2.0s)</option>
+        <option value="3.5">Relaxed (3.5s)</option>
+      </select>
+      <button onclick="clearTrainerQuestions()">🗑 Clear</button>
+    </div>
+    <div class="demo-note">
+      The runner uses a real Chrome tab and the official demo below. It fills the optional field,
+      clicks the real checkbox, captures a real challenge, and waits for you to complete it.
+      Open LIVE BROWSER to interact with that same tab. It never fabricates a challenge,
+      creates a token, or selects challenge answers.
+    </div>
+  </div>
+
+  <div class="stage-banner">
+    <span class="stage-dot" id="trainerStageDot"></span>
+    <span id="trainerStageText">Ready to open the official hCaptcha demo.</span>
+  </div>
+
+  <div class="trainer-grid">
+    <div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+          <h3 style="margin:0">Latest Real Challenge</h3>
+          <button class="btn-copy-q" id="btnCopyLatest" onclick="copyLatestQuestion()" style="display:none">📋 Copy Question</button>
+        </div>
+        <div class="trainer-ss-box">
+          <div id="trainerPlaceholder" class="trainer-ph">
+            Start the real demo runner.<br>A live Chrome screenshot refreshes here every 3 seconds.
+          </div>
+          <img id="trainerModalImg" style="display:none" alt="Screenshot of the real hCaptcha challenge">
+        </div>
+        <div id="trainerPointerLog" class="demo-note" style="margin-top:10px;min-height:18px;font-family:monospace"></div>
+      </div>
+
+      <div class="card">
+        <h3>Official hCaptcha Demo</h3>
+        <div class="demo-form-stage">
+          <div style="font-size:11px;color:#8a8a92;margin-bottom:8px;font-family:monospace">TARGET</div>
+          <a class="demo-link" href="https://accounts.hcaptcha.com/demo" target="_blank" rel="noopener">https://accounts.hcaptcha.com/demo</a>
+          <div class="demo-input-row" style="margin-top:12px">
+            <div>
+              <label>Generated sample</label>
+              <input class="demo-input-box" id="demoFormComment" readonly placeholder="Filled in the real demo">
+            </div>
+            <div>
+              <label>Current runner value</label>
+              <input class="demo-input-box" id="demoFormName" readonly placeholder="Waiting for runner">
+            </div>
+          </div>
+          <label>Browser form field</label>
+          <input class="demo-input-box" id="demoFormEmail" readonly placeholder="The official page has one optional field">
+          <div class="demo-note">Checkbox interaction and challenge rendering happen in Chrome, not in this dashboard.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+          <h3 style="margin:0">Captured Questions <span id="qCountBadge" class="badge badge-ok" style="margin-left:6px">0</span></h3>
+          <div class="flex" style="gap:6px">
+            <button class="btn-copy-q" onclick="copyAllQuestions()">📋 Copy All</button>
+            <button class="btn-copy-q" onclick="exportQuestionsJson()">⬇️ JSON</button>
+          </div>
+        </div>
+        <div class="q-list-wrap" id="trainerQuestionsList">
+          <div style="color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace">
+            No real challenge captured yet.<br>Start the runner to open the official demo.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="logOverlay" role="dialog" aria-modal="true" aria-labelledby="allLogsTitle">
@@ -1532,7 +1873,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens'];
+  var ids=['main','tokens','trainer'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -1540,6 +1881,9 @@ function showTab(name){
   document.querySelectorAll('#tabNav button').forEach(function(b){
     b.classList.toggle('act',b.getAttribute('data-tab')===name);
   });
+  if(name==='trainer'){
+    refreshTrainer();
+  }
 }
 window.showTab=showTab;
 
@@ -1605,7 +1949,6 @@ function renderLogs(box,logs,compact){
     var cutoff=Date.now()/1000-300;
     rendered=items.filter(function(l){return(l.timestamp||l.time||0)>=cutoff;})
       .map(compactLogLine).filter(Boolean);
-    // Collapse repeated browser-crash summaries while full detail remains in ALL LOGS.
     rendered=rendered.filter(function(line,index,all){return index===0||line!==all[index-1];}).slice(-30);
   }else{
     rendered=items.map(function(l){return (l.time||'')+' '+(l.message||l.m||'');});
@@ -1668,24 +2011,243 @@ function closeAllLogs(){
 }
 window.viewAllLogs=viewAllLogs;
 window.closeAllLogs=closeAllLogs;
-(function(){
-  var overlay=$('logOverlay');
-  if(overlay)overlay.addEventListener('click',function(e){if(e.target===overlay)closeAllLogs();});
-  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAllLogs();});
-})();
+
+function copyLogs(){
+  fetch('/worker/B1/logs').then(function(r){return r.json()}).then(function(d){
+    var logs=(d&&d.all_logs||d&&d.logs||[]);
+    var text=logs.map(function(l){return(l.time||'')+' '+(l.message||l.m||'')}).join('\n');
+    copyToClipboard(text, 'Logs copied to clipboard');
+  }).catch(function(e){alert('Error: '+e.message);});
+}
+window.copyLogs=copyLogs;
+
+// ── Generic Clipboard Helper ──
+function copyToClipboard(text, successMsg, btn){
+  function done(){
+    if(successMsg)toast(successMsg);
+    if(btn){
+      btn.classList.add('copied');
+      var old = btn.textContent;
+      btn.textContent = '✓ Copied!';
+      setTimeout(function(){btn.classList.remove('copied');btn.textContent=old;}, 1500);
+    }
+  }
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(function(){fallbackCopy(text,done);});
+  }else{
+    fallbackCopy(text,done);
+  }
+}
+function fallbackCopy(text,cb){
+  var ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try{document.execCommand('copy');cb();}
+  catch(e){alert('Copy failed');}
+  document.body.removeChild(ta);
+}
+
+// ═══════════════════════════════════════════════════════════
+// REAL OFFICIAL-DEMO RUNNER UI
+// ═══════════════════════════════════════════════════════════
+var trainerState = {
+  running: false,
+  questions: [],
+  latestQuestion: '',
+  speed: 2.0
+};
+
+function startTrainer(){
+  var speed = parseFloat($('trainerSpeedSelect').value) || 2.0;
+  api('/trainer/start', {body: {speed: speed}}).then(function(r){return r.json();})
+    .then(function(d){
+      toast(d.message||'Real demo runner started');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function stopTrainer(){
+  api('/trainer/stop').then(function(r){return r.json();})
+    .then(function(d){
+      toast(d.message||'Real demo runner stopped');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function stepTrainer(){
+  toast('Opening the real hCaptcha demo once...');
+  api('/trainer/step').then(function(r){return r.json();})
+    .then(function(d){
+      toast(d.message||'Real demo cycle queued');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function clearTrainerQuestions(){
+  api('/trainer/clear').then(function(r){return r.json();})
+    .then(function(d){
+      toast('Captured questions cleared');
+      refreshTrainer();
+    }).catch(function(e){toast('Error: '+e.message);});
+}
+function updateTrainerSpeed(val){
+  var speed = parseFloat(val) || 2.0;
+  $('statSpeed').textContent = speed.toFixed(1) + 's';
+  api('/trainer/speed', {body: {speed: speed}}).catch(function(){});
+}
+window.startTrainer = startTrainer;
+window.stopTrainer = stopTrainer;
+window.stepTrainer = stepTrainer;
+window.clearTrainerQuestions = clearTrainerQuestions;
+window.updateTrainerSpeed = updateTrainerSpeed;
+
+function copySingleQuestion(qText, btn){
+  copyToClipboard(qText, 'Copied: "' + qText + '"', btn);
+}
+window.copySingleQuestion = copySingleQuestion;
+
+function copyLatestQuestion(){
+  if(trainerState.latestQuestion){
+    copyToClipboard(trainerState.latestQuestion, 'Copied question: ' + trainerState.latestQuestion);
+  }
+}
+window.copyLatestQuestion = copyLatestQuestion;
+
+function copyAllQuestions(){
+  if(!trainerState.questions||!trainerState.questions.length){
+    toast('No questions to copy');
+    return;
+  }
+  var fullText = trainerState.questions.map(function(q, i){
+    return (i+1) + '. ' + (q.question || q.full_prompt || '');
+  }).join('\n');
+  copyToClipboard(fullText, 'Copied ' + trainerState.questions.length + ' questions to clipboard');
+}
+window.copyAllQuestions = copyAllQuestions;
+
+function exportQuestionsJson(){
+  if(!trainerState.questions||!trainerState.questions.length){
+    toast('No questions to export');
+    return;
+  }
+  var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(trainerState.questions, null, 2));
+  var dlAnchor = document.createElement('a');
+  dlAnchor.setAttribute("href", dataStr);
+  dlAnchor.setAttribute("download", "hcaptcha_demo_questions.json");
+  document.body.appendChild(dlAnchor);
+  dlAnchor.click();
+  dlAnchor.remove();
+  toast('Exported captured questions JSON');
+}
+window.exportQuestionsJson = exportQuestionsJson;
+
+function renderQuestionsList(questions){
+  var wrap = $('trainerQuestionsList');
+  if(!wrap) return;
+  wrap.textContent = '';
+  if(!questions || !questions.length){
+    var empty = document.createElement('div');
+    empty.style.cssText = 'color:#8a8a92;font-size:12px;padding:28px 16px;text-align:center;font-family:monospace';
+    empty.textContent = 'No real challenge captured yet.\nStart the runner to open the official demo.';
+    wrap.appendChild(empty);
+    return;
+  }
+  questions.forEach(function(q, idx){
+    var row = document.createElement('div'); row.className = 'q-row';
+    var num = document.createElement('div'); num.className = 'q-num'; num.textContent = (idx + 1) + '.';
+    var body = document.createElement('div'); body.className = 'q-body';
+    var title = document.createElement('div'); title.className = 'q-title';
+    title.textContent = q.question || q.full_prompt || 'Challenge prompt unavailable';
+    var meta = document.createElement('div'); meta.className = 'q-meta';
+    var tag = document.createElement('span'); tag.className = 'badge-tag'; tag.textContent = q.type || 'REAL HCAPTCHA';
+    var time = document.createElement('span'); time.textContent = q.time || '';
+    meta.appendChild(tag); meta.appendChild(time);
+    if(q.url){ var url = document.createElement('span'); url.style.color='#64748b'; url.textContent = '· ' + q.url; meta.appendChild(url); }
+    body.appendChild(title); body.appendChild(meta);
+    var btn = document.createElement('button'); btn.className = 'btn-copy-q'; btn.textContent = '📋 Copy';
+    btn.addEventListener('click', function(){copySingleQuestion(title.textContent, btn);});
+    row.appendChild(num); row.appendChild(body); row.appendChild(btn); wrap.appendChild(row);
+  });
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function refreshTrainer(){
+  fetch('/trainer/status?t=' + Date.now()).then(function(r){return r.json();})
+    .then(function(s){
+      trainerState.running = !!s.running;
+      trainerState.questions = s.questions || [];
+      trainerState.latestQuestion = s.latest_question || '';
+      trainerState.speed = parseFloat(s.speed) || trainerState.speed;
+      $('statCaptured').textContent = s.captured_count || 0;
+      $('statBypassed').textContent = s.pass_count || 0;
+      $('statCycles').textContent = s.total_cycles || 0;
+      $('statSpeed').textContent = trainerState.speed.toFixed(1) + 's';
+      $('qCountBadge').textContent = (s.questions && s.questions.length) || 0;
+      $('btnTrainerStart').disabled = !!s.running;
+      $('btnTrainerStop').disabled = !s.running;
+      var badge = $('trainerStatusBadge');
+      badge.className = s.running ? 'badge badge-ok' : 'badge badge-warn';
+      badge.textContent = s.running ? 'REAL BROWSER ACTIVE' : 'IDLE';
+      var dot = $('trainerStageDot');
+      dot.className = s.running ? 'stage-dot active' : 'stage-dot';
+      $('trainerStageText').textContent = s.status_text || 'Ready to open the official hCaptcha demo.';
+      if(s.form){
+        $('demoFormName').value = s.form.name || '';
+        $('demoFormEmail').value = s.form.field || '';
+        $('demoFormComment').value = s.form.comment || s.form.field || '';
+      }
+      var img = $('trainerModalImg');
+      var ph = $('trainerPlaceholder');
+      var btnCopyLatest = $('btnCopyLatest');
+      var shot = s.latest_challenge_image || s.latest_screenshot;
+      if(shot){
+        if(img.getAttribute('data-src') !== shot){
+          img.src = shot;
+          img.setAttribute('data-src', shot);
+        }
+        img.style.display = 'block';
+        if(ph) ph.style.display = 'none';
+        if(btnCopyLatest) btnCopyLatest.style.display = 'inline-block';
+      } else {
+        img.removeAttribute('src');
+        img.removeAttribute('data-src');
+        img.style.display = 'none';
+        if(ph) ph.style.display = 'block';
+        if(btnCopyLatest) btnCopyLatest.style.display = 'none';
+      }
+      renderQuestionsList(s.questions);
+      var ptr = $('trainerPointerLog');
+      if(ptr){
+        var items = s.pointer_log || [];
+        if(!items.length){
+          ptr.textContent = '';
+        }else{
+          ptr.textContent = items.slice(-6).map(function(p){
+            var t = p.t ? p.t + ' ' : '';
+            if(p.kind === 'click') return t + 'click ' + Math.round(p.x||0) + ', ' + Math.round(p.y||0) + (p.selector ? ' ' + p.selector : '');
+            if(p.kind === 'drag') return t + 'drag ' + Math.round(p.x1||0) + ',' + Math.round(p.y1||0) + ' -> ' + Math.round(p.x2||0) + ',' + Math.round(p.y2||0);
+            return t + (p.kind || '');
+          }).join('  |  ');
+        }
+      }
+    }).catch(function(){});
+}
+window.refreshTrainer = refreshTrainer;
 
 // Init
 refreshStatus();
 refreshLogs();
 refreshTokens();
+refreshTrainer();
 setInterval(refreshStatus,5000);
 setInterval(refreshLogs,2200);
 setInterval(refreshTokens,12000);
+setInterval(function(){
+  var tabTrainer = $('tabtrainer');
+  if(tabTrainer && !tabTrainer.classList.contains('hide')){
+    refreshTrainer();
+  }
+}, 3000);
 </script>
 </body></html>
-
 '''
-
 
 if __name__ == "__main__":
     main()

@@ -25,11 +25,31 @@ VISION_API_KEY=<generate-a-long-random-secret>
 you set both, make their values identical. Do not set `PORT` because Railway
 provides it automatically.
 
+`VISION_API_KEY` must be identical in every client and in this gateway. For two
+services in one Railway project, define it once under **Project Settings →
+Shared Variables**, then attach/reference that shared value from both services:
+
+```text
+VISION_API_KEY=${{ shared.VISION_API_KEY }}
+```
+
+Do not create two service-local values with the same name: they can drift and
+produce HTTP 401 even though both services report the variable as configured.
+Saving the shared reference redeploys the affected services. Never paste the
+secret into application logs, source code, or support messages. A probe that
+returns HTTP 401 means the endpoint is running and the keys do not match; it is
+not a cold-start or reachability failure.
+
 ### Optional variables
 
 ```text
 VISION_API_BASE=https://your-service.up.railway.app
+OLLAMA_REQUEST_TIMEOUT=45
 ```
+
+`OLLAMA_REQUEST_TIMEOUT` is the gateway→Ollama wait (default 45s). The
+bot asks SmolVLM2 one tile at a time with a 12s client timeout; a 180s
+gateway wait is how the old 9-image JSON path 504'd.
 
 Set `VISION_API_BASE` to the public URL of this service. When provided, the
 gateway returns it in the `base_url` field of its `GET /` health-check
@@ -56,7 +76,34 @@ are faster when the `/data` volume is attached.
 
 ## API
 
-### Analyze an image
+### Ollama-compatible (for the bot's vision_solver)
+
+The bot speaks Ollama's native API; the gateway proxies it to local Ollama
+with the model forced to `OLLAMA_MODEL` (fixed-model server-side). Both
+endpoints require the API key:
+
+```bash
+# health / model list (the bot probes this before solving)
+curl https://YOUR-SERVICE.up.railway.app/api/tags \
+  -H "Authorization: Bearer $VISION_API_KEY"
+
+# chat (native Ollama payload: messages[], base64 images).
+# The bot's SmolVLM2 path does NOT send format:"json" — it hangs 256M models.
+curl -X POST https://YOUR-SERVICE.up.railway.app/api/chat \
+  -H "Authorization: Bearer $VISION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ignored-forced-server-side","messages":[{"role":"user","content":"What is this?","images":["<base64>"]}],"stream":false}'
+```
+
+Point the bot at this service with `VISION_API_BASE` + `VISION_API_KEY`.
+The bot's configured `OLLAMA_MODEL` name does not need to match — the
+gateway forces the local model.
+
+### Analyze an image (legacy safe endpoint)
+
+Note: `POST /v1/analyze` refuses CAPTCHA / security-challenge prompts
+(its contract is lawful captioning / OCR / visual Q&A). Use the
+Ollama-compatible `/api/chat` above for the bot.
 
 ```bash
 IMAGE=$(base64 < photo.jpg | tr -d '\n')

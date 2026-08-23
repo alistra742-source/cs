@@ -1,21 +1,20 @@
-"""
-truedriver_engine.py — Playwright-compatible async facade backed by truedriver
-(https://pypi.org/project/truedriver — a blazing fast, async-first,
-undetectable web automation framework built directly on Chrome DevTools
-Protocol, no Selenium/WebDriver layer to flag).
+"""nodriver_engine.py — Playwright-compatible async facade backed by nodriver
+on a REAL Google Chrome (google-chrome-stable).
 
 The rest of the application imports ``async_playwright`` and ``ENGINE`` from
 ``browser_engine`` and drives everything through Playwright's async API. This
-module re-implements the *subset* of that API the code actually uses on top of
-truedriver's CDP primitives, so every caller (server.py workers,
-captcha_solver.py, drag_solver.py, live_control.py) is unchanged:
+module re-implements the *subset* of that API the code actually uses on top
+of nodriver's CDP primitives, so every caller (server.py workers,
+captcha_solver.py, drag_solver.py, live_control.py) is unchanged.
 
-    pw  = await async_playwright().start()
-    b   = await pw.chromium.launch(headless=..., proxy={...})
-    ctx = await b.new_context(**opts)
-    page = await ctx.new_page()
+Why nodriver + google-chrome-stable:
+  · REAL Chrome — the fingerprint IS a real user's: genuine Chrome JS/TLS/HTTP2
+    fingerprints, real fonts, real plugin/NTP surface. No engine-injected
+    spoofing to get flagged; nodriver only strips the automation tells
+    (navigator.webdriver, CDP hooks, headless UA artifacts).
+  · nodriver drives Chrome directly over CDP — no Selenium/WebDriver layer.
 
-Mapping notes:
+Mapping notes (same contract as the previous engines):
 
   · ``page.evaluate(js)`` accepts both bare JS expressions (``location.href``)
     and arrow/function bodies (``() => {...}``); function bodies are wrapped
@@ -23,10 +22,13 @@ Mapping notes:
   · ``page.locator(sel)`` -> ``_Locator`` supports the chained surface used in
     the code: ``.count()``, ``.first``, ``.nth(i)``, ``.filter(visible=True)``,
     ``.click()``, ``.fill()``, ``.press()``, ``.inner_text()``,
-    ``.input_value()``, ``.is_visible()``, ``.bounding_box()``,
-    ``.screenshot()``, ``.content_frame()``, ``.element_handle()``.
+    ``.input_value()``, ``.is_visible()``, ``.is_disabled()``,
+    ``.bounding_box()``, ``.screenshot()``, ``.content_frame()``,
+    ``.element_handle()``.
   · Frames are first-class objects (``page.frames``, ``frame.locator``,
-    ``frame.frame_element()``, ``frame.screenshot()``) via CDP frame switching.
+    ``frame.frame_element()``, ``frame.screenshot()``) — an iframe is a
+    nodriver IFrame, which is itself a CDP connection, so frame-scoped
+    selectors/evaluation run in the frame's own session (no frame switching).
   · ``page.on("request"/"response"/"crash")`` maps to CDP Network / Inspector
     events, so the rqdata + payload capture and crash flag keep working.
 """
@@ -42,20 +44,17 @@ import re
 import time
 from typing import Any, Callable, List, Optional
 
-ENGINE = "truedriver"
+ENGINE = "nodriver"
 CHANNEL = None
 
 try:  # pragma: no cover - raised as a clear error at launch
-    from truedriver import cdp
-    from truedriver.core.config import Config
-    from truedriver.core.element import Position
-    from truedriver.core.util import start as _td_start
+    import nodriver as uc
+    from nodriver import cdp
+    from nodriver.core import util as _nd_util
 except Exception:  # pragma: no cover
+    uc = None
     cdp = None
-    Config = None
-    Position = None
-    _td_start = None
-
+    _nd_util = None
 
 __all__ = ["async_playwright", "ENGINE", "CHANNEL"]
 
@@ -92,7 +91,7 @@ def _wrap_new_document(src: str) -> str:
 
     ``Page.addScriptToEvaluateOnNewDocument`` wants a *statement*; arrow
     function bodies like ``() => {...}`` would otherwise just define (and
-    drop) the function. Comments (the stealth placeholder) pass through.
+    drop) the function. Comments pass through unchanged.
     """
     s = (src or "").strip()
     if not s or s.startswith("//") or s.startswith("/*"):
@@ -102,61 +101,144 @@ def _wrap_new_document(src: str) -> str:
     return s
 
 
+def _quad_to_box(quad) -> Optional[dict]:
+    """CDP content quad ([x1,y1,...x4,y4] floats) -> CSS box dict."""
+    try:
+        xs = quad[0::2]
+        ys = quad[1::2]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        return {"x": float(x0), "y": float(y0),
+                "width": float(x1 - x0), "height": float(y1 - y0)}
+    except Exception:
+        return None
+
+
+async def _element_box(el) -> Optional[dict]:
+    """Bounding box (page CSS pixels) of a nodriver Element, or None."""
+    try:
+        pos = await el.get_position()
+        if pos is None:
+            return None
+        return {"x": float(pos.left), "y": float(pos.top),
+                "width": float(pos.width), "height": float(pos.height)}
+    except Exception:
+        return None
+
+
+async def _element_shot(tab, box: dict) -> bytes:
+    """Clipped beyond-viewport capture of an element box (PNG bytes)."""
+    try:
+        clip = cdp.page.Viewport(x=box["x"], y=box["y"],
+                                 width=box["width"], height=box["height"],
+                                 scale=1.0)
+        data = await tab.send(cdp.page.capture_screenshot(
+            format_="png", capture_beyond_viewport=True, clip=clip))
+        if data:
+            return base64.b64decode(data)
+    except Exception:
+        pass
+    return b""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mouse
 # ─────────────────────────────────────────────────────────────────────────────
+_BUTTON_MASK = {"left": 1, "right": 2, "middle": 4}
+
+
+def mouse_move_points(sx: float, sy: float, x: float, y: float,
+                      steps: Optional[int] = None) -> List[tuple]:
+    """Waypoints from the current cursor to (x, y).
+
+    Playwright interpolates from the *current* position. The previous
+    implementation scaled toward the origin, so a drag with ``steps>1``
+    jumped to (0,0) mid-gesture and hCaptcha never saw a real press-move.
+    """
+    n = int(steps) if steps and int(steps) > 1 else 1
+    x, y = float(x), float(y)
+    sx, sy = float(sx), float(sy)
+    if n <= 1:
+        return [(x, y)]
+    return [(sx + (x - sx) * i / n, sy + (y - sy) * i / n)
+            for i in range(1, n + 1)]
+
+
 class _Mouse:
-    """Playwright page.mouse over CDP Input.dispatchMouseEvent. Tracks the
-    current cursor position so down()/up() (drag gestures) land where the
-    pointer already is, like Playwright."""
+    """Playwright page.mouse over CDP Input.dispatchMouseEvent.
+
+    Tracks cursor position *and* pressed buttons so ``move()`` after
+    ``down()`` emits ``buttons=1`` mouseMoved events — required for
+    hCaptcha drag challenges. ``down()``/``up()`` land where the pointer
+    already is, like Playwright.
+    """
 
     def __init__(self, page: "_Page"):
         self._page = page
         self._tab = page._tab
         self._x = 0.0
         self._y = 0.0
+        self._buttons = 0
+
+    def _button_name(self, button: str) -> str:
+        return button if button in ("left", "right", "middle") else "left"
+
+    def _mask_for(self, button: str) -> int:
+        return _BUTTON_MASK.get(self._button_name(button), 1)
+
+    async def _dispatch_move(self, x: float, y: float) -> None:
+        held = "left" if (self._buttons & 1) else (
+            "right" if (self._buttons & 2) else (
+                "middle" if (self._buttons & 4) else "none"))
+        await self._tab.send(cdp.input_.dispatch_mouse_event(
+            "mouseMoved", x=float(x), y=float(y),
+            button=cdp.input_.MouseButton(held), buttons=int(self._buttons)))
 
     async def move(self, x: float, y: float, steps: Optional[int] = None) -> None:
-        x, y = float(x), float(y)
-        none = cdp.input_.MouseButton("none")
-        n = int(steps) if steps and steps > 1 else 1
-        if n > 1:
-            for i in range(1, n + 1):
-                await self._tab.send(cdp.input_.dispatch_mouse_event(
-                    "mouseMoved", x=x * i / n, y=y * i / n, button=none, buttons=0))
-        else:
-            await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mouseMoved", x=x, y=y, button=none, buttons=0))
-        self._x, self._y = x, y
+        for mx, my in mouse_move_points(self._x, self._y, x, y, steps):
+            await self._dispatch_move(mx, my)
+            self._x, self._y = float(mx), float(my)
+        self._x, self._y = float(x), float(y)
 
     async def click(self, x: float, y: float, button: str = "left", **kwargs) -> None:
         await self.move(x, y, steps=1)
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=1))
+        await self.down(button)
         await asyncio.sleep(random.uniform(0.03, 0.09))
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=1))
+        await self.up(button)
 
     async def dblclick(self, x: float, y: float, button: str = "left", **kwargs) -> None:
         await self.move(x, y, steps=1)
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        b = cdp.input_.MouseButton(name)
+        mask = self._mask_for(name)
         for _ in range(2):
+            self._buttons |= mask
             await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=2))
+                "mousePressed", x=self._x, y=self._y, button=b,
+                buttons=self._buttons, click_count=2))
             await asyncio.sleep(random.uniform(0.02, 0.06))
+            self._buttons &= ~mask
             await self._tab.send(cdp.input_.dispatch_mouse_event(
-                "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=2))
+                "mouseReleased", x=self._x, y=self._y, button=b,
+                buttons=self._buttons, click_count=2))
 
     async def down(self, button: str = "left", **kwargs) -> None:
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        mask = self._mask_for(name)
+        self._buttons |= mask
         await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mousePressed", x=self._x, y=self._y, button=b, buttons=1, click_count=1))
+            "mousePressed", x=self._x, y=self._y,
+            button=cdp.input_.MouseButton(name),
+            buttons=self._buttons, click_count=1))
 
     async def up(self, button: str = "left", **kwargs) -> None:
-        b = cdp.input_.MouseButton(button if button in ("left", "right", "middle") else "left")
+        name = self._button_name(button)
+        mask = self._mask_for(name)
+        self._buttons &= ~mask
         await self._tab.send(cdp.input_.dispatch_mouse_event(
-            "mouseReleased", x=self._x, y=self._y, button=b, buttons=0, click_count=1))
+            "mouseReleased", x=self._x, y=self._y,
+            button=cdp.input_.MouseButton(name),
+            buttons=self._buttons, click_count=1))
 
     async def wheel(self, delta_x: float = 0, delta_y: float = 0) -> None:
         await self._tab.send(cdp.input_.dispatch_mouse_event(
@@ -300,11 +382,11 @@ class _Keyboard:
 # Locator
 # ─────────────────────────────────────────────────────────────────────────────
 class _Locator:
-    """Playwright locator re-implemented over truedriver Element resolution.
+    """Playwright locator over nodriver Element resolution.
 
-    A locator is a selector (optionally scoped to a frame or to frames reached
-    through an iframe selector), an optional index, and optional visibility
-    filtering. Resolution happens lazily on each operation.
+    A locator is a selector (optionally scoped to a frame or to frames
+    reached through an iframe selector), an optional index, and optional
+    visibility filtering. Resolution happens lazily on each operation.
     """
 
     def __init__(self, page: "_Page", selector: str, *, frame: Any = None,
@@ -354,19 +436,15 @@ class _Locator:
             out: list = []
             for fr in frames:
                 try:
-                    await self._tab.switch_to_frame(fr)
-                    out.extend(await self._tab.query_selector_all(self._selector))
+                    out.extend(await fr._conn().query_selector_all(self._selector))
                 except Exception:
                     pass
-            await self._tab.switch_to_main_frame()
             return out
         if self._frame is not None:
-            await self._tab.switch_to_frame(self._frame)
             try:
-                return await self._tab.query_selector_all(self._selector)
-            finally:
-                await self._tab.switch_to_main_frame()
-        await self._tab.switch_to_main_frame()
+                return await self._frame._conn().query_selector_all(self._selector)
+            except Exception:
+                return []
         return await self._tab.query_selector_all(self._selector)
 
     async def _resolve_elements(self) -> list:
@@ -441,7 +519,7 @@ class _Locator:
         if el is None:
             return None
         try:
-            return el.get(name)
+            return el[name]
         except Exception:
             return None
 
@@ -507,13 +585,7 @@ class _Locator:
         el = await self._pick()
         if el is None:
             return None
-        try:
-            pos = await el.get_position()
-        except Exception:
-            return None
-        if not pos:
-            return None
-        return {"x": pos.left, "y": pos.top, "width": pos.width, "height": pos.height}
+        return await _element_box(el)
 
     async def click(self, timeout: Optional[float] = None, force: bool = False, **kwargs) -> None:
         el = await self._wait_element(timeout)
@@ -529,12 +601,26 @@ class _Locator:
             pos = await el.get_position()
         if not pos:
             raise TimeoutError(f"locator click: element not visible for '{self._selector}'")
+        # Playwright auto-scrolls the element into view BEFORE clicking —
+        # a center below the viewport edge would click empty space. That is
+        # exactly how the DOB Year option (its menu opens past the 720px
+        # viewport bottom) went unclicked while Month/Day filled fine.
+        if not force:
+            try:
+                await el.scroll_into_view()
+                await asyncio.sleep(0.12)
+                fresh = await el.get_position()
+                if fresh:
+                    pos = fresh
+            except Exception:
+                pass
         x, y = pos.center
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
+        tab = el.tab if el.tab is not None else self._tab
+        await tab.send(cdp.input_.dispatch_mouse_event(
             "mousePressed", x=float(x), y=float(y),
             button=cdp.input_.MouseButton("left"), buttons=1, click_count=1))
         await asyncio.sleep(random.uniform(0.04, 0.09))
-        await self._tab.send(cdp.input_.dispatch_mouse_event(
+        await tab.send(cdp.input_.dispatch_mouse_event(
             "mouseReleased", x=float(x), y=float(y),
             button=cdp.input_.MouseButton("left"), buttons=0, click_count=1))
 
@@ -549,6 +635,7 @@ class _Locator:
         el = await self._wait_element(timeout)
         if el is None:
             raise TimeoutError(f"locator fill: element not found for '{self._selector}'")
+        tab = el.tab if el.tab is not None else self._tab
         try:
             await el.focus()
         except Exception:
@@ -575,8 +662,8 @@ class _Locator:
         except Exception:
             # Last-resort clear via keyboard (now correctly non-typing Ctrl+A).
             try:
-                await _dispatch_press(self._tab, "Control+a")
-                await _dispatch_press(self._tab, "Backspace")
+                await _dispatch_press(tab, "Control+a")
+                await _dispatch_press(tab, "Backspace")
             except Exception:
                 pass
         text = str(text)
@@ -584,15 +671,15 @@ class _Locator:
             return
         # Single trusted insert — no per-char doubling risk.
         try:
-            await self._tab.send(cdp.input_.insert_text(text))
+            await tab.send(cdp.input_.insert_text(text))
             return
         except Exception:
             pass
         for ch in text:
             if ch == "\n":
-                await _dispatch_press(self._tab, "Enter")
+                await _dispatch_press(tab, "Enter")
             else:
-                await _dispatch_press(self._tab, ch)
+                await _dispatch_press(tab, ch)
 
     async def press(self, key: str, timeout: Optional[float] = None, **kwargs) -> None:
         el = await self._pick()
@@ -601,17 +688,18 @@ class _Locator:
                 await el.focus()
             except Exception:
                 pass
-        await _dispatch_press(self._tab, str(key))
+        tab = el.tab if (el is not None and el.tab is not None) else self._tab
+        await _dispatch_press(tab, str(key))
 
     async def screenshot(self, timeout: Optional[float] = None, **kwargs) -> bytes:
         el = await self._wait_element(timeout)
         if el is None:
             return b""
-        try:
-            b64 = await el.screenshot_b64("png")
-            return base64.b64decode(b64)
-        except Exception:
+        box = await _element_box(el)
+        if not box:
             return b""
+        tab = el.tab if el.tab is not None else self._tab
+        return await _element_shot(tab, box)
 
     async def content_frame(self) -> Optional["_Frame"]:
         el = await self._pick()
@@ -634,6 +722,8 @@ class _ElementHandle:
         self._el = el
 
     def __await__(self):
+        # truedriver-era callers may `await` the handle; Playwright handles
+        # aren't awaitable, so resolve to ourselves.
         async def _self():
             return self
         return _self().__await__()
@@ -648,7 +738,6 @@ class _FrameLocator:
 
     def __init__(self, page: "_Page", frame_selector: str):
         self._page = page
-        self._tab = page._tab
         self._frame_selector = frame_selector
 
     def locator(self, selector: str) -> "_Locator":
@@ -659,7 +748,7 @@ class _OwnerLocator:
     """Locator for the <iframe> element that owns a given frame, resolved via
     DOM.getFrameOwner."""
 
-    def __init__(self, page: "_Page", frame: Any):
+    def __init__(self, page: "_Page", frame: "_Frame"):
         self._page = page
         self._tab = page._tab
         self._frame = frame
@@ -674,13 +763,18 @@ class _OwnerLocator:
 
     async def bounding_box(self):
         try:
-            owner, _ = await self._tab.send(cdp.dom.get_frame_owner(self._frame.id_))
-            ro = await self._tab.send(cdp.dom.resolve_node(backend_node_id=owner))
+            frame_id = await self._frame._page_frame_id()
+            if not frame_id:
+                return None
+            owner = await _frame_owner_bnode(self._tab, frame_id)
+            if not owner:
+                return None
+            ro = await self._tab.send(cdp.dom.resolve_node(
+                backend_node_id=cdp.dom.BackendNodeId(owner)))
             quads = await self._tab.send(cdp.dom.get_content_quads(object_id=ro.object_id))
             if not quads:
                 return None
-            p = Position(quads[0])
-            return {"x": p.left, "y": p.top, "width": p.width, "height": p.height}
+            return _quad_to_box(quads[0])
         except Exception:
             return None
 
@@ -689,51 +783,77 @@ class _OwnerLocator:
 # Frame
 # ─────────────────────────────────────────────────────────────────────────────
 class _Frame:
-    def __init__(self, page: "_Page", frame: Any):
+    """One frame (main or iframe). For iframes the underlying object is a
+    nodriver IFrame — itself a CDP connection (its own flattened session) —
+    so evaluation and selectors run in-frame without any frame switching."""
+
+    def __init__(self, page: "_Page", frame: Any, page_frame_id: Optional[str] = None):
         self._page = page
         self._tab = page._tab
-        self._frame = frame
+        self._frame = frame          # nodriver IFrame (a Tab) or None for main
+        self._frame_id = page_frame_id
+
+    def _conn(self):
+        """The CDP connection to send in-frame commands on."""
+        return self._frame if self._frame is not None else self._tab
+
+    async def _page_frame_id(self) -> Optional[str]:
+        return self._frame_id
 
     @property
     def url(self) -> str:
         try:
-            return self._frame.url or ""
+            t = getattr(self._frame, "target", None)
+            return (getattr(t, "url", None) or "") if t else ""
         except Exception:
             return ""
 
     @property
     def name(self) -> str:
         try:
-            return self._frame.name or ""
+            t = getattr(self._frame, "target", None)
+            return (getattr(t, "title", None) or "") if t else ""
         except Exception:
             return ""
 
     def locator(self, selector: str) -> "_Locator":
-        return _Locator(self._page, selector, frame=self._frame)
+        return _Locator(self._page, selector, frame=self)
 
     async def evaluate(self, js: Any, arg: Any = None) -> Any:
-        await self._tab.switch_to_frame(self._frame)
-        try:
-            return await self._page._eval(js, arg)
-        finally:
-            await self._tab.switch_to_main_frame()
+        return await _eval_on(self._conn(), js, arg)
 
     def frame_element(self) -> "_OwnerLocator":
-        return _OwnerLocator(self._page, self._frame)
+        return _OwnerLocator(self._page, self)
 
     async def screenshot(self, timeout: Optional[float] = None, **kwargs) -> bytes:
-        fe = _OwnerLocator(self._page, self._frame)
+        fe = _OwnerLocator(self._page, self)
         box = await fe.bounding_box()
         if not box:
             return b""
-        try:
-            clip = cdp.page.Viewport(x=box["x"], y=box["y"],
-                                     width=box["width"], height=box["height"])
-            data = await self._tab.send(cdp.page.capture_screenshot(
-                format_="png", capture_beyond_viewport=True, clip=clip))
-            return base64.b64decode(data)
-        except Exception:
-            return b""
+        return await _element_shot(self._tab, box)
+
+
+async def _frame_owner_bnode(tab, frame_id: str):
+    """DOM.getFrameOwner -> backend node id of the <iframe> element (or None).
+
+    The generated CDP binding wants a FrameId object, not a bare string."""
+    try:
+        owner, _ = await tab.send(cdp.dom.get_frame_owner(cdp.page.FrameId(str(frame_id))))
+        return int(owner) if owner else None
+    except Exception:
+        return None
+
+
+async def _eval_on(conn, js: Any, arg: Any = None) -> Any:
+    """Runtime.evaluate on any connection (tab or frame) with Playwright
+    string semantics (bare expression vs function body, arg forwarded)."""
+    expr, await_promise = _wrap_js(js, arg)
+    ro, errs = await conn.send(cdp.runtime.evaluate(
+        expression=expr, user_gesture=True, await_promise=await_promise,
+        return_by_value=True, allow_unsafe_eval_blocked_by_csp=True))
+    if errs:
+        raise RuntimeError(str(errs))
+    return ro.value if ro is not None else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -792,13 +912,41 @@ class _Page:
         self._mouse = _Mouse(self)
         self._keyboard = _Keyboard(self)
         # `page.frames` is a sync property (the code reads it without await),
-        # so it serves from a cache that every async operation refreshes.
+        # so it serves from a cache that navigation / on-demand lookups
+        # refresh (throttled — see _refresh_frames).
         self._frames_cache: List["_Frame"] = []
+        self._frames_refreshed_at: float = 0.0
 
-    async def _refresh_frames(self) -> None:
+    async def _refresh_frames(self, force: bool = False) -> None:
+        # Throttled: the nav-poll loop evaluates every ~150 ms, and a full
+        # refresh costs two CDP round-trips (Target.getTargets +
+        # Page.getFrameTree) — over a slow residential proxy that triples
+        # the poll latency. Frames only change on navigation (force) or on
+        # demand; a 2s minimum interval keeps the cache warm cheaply.
+        now = time.monotonic()
+        if not force and now - self._frames_refreshed_at < 2.0:
+            return
+        self._frames_refreshed_at = now
         try:
             fobs = await self._tab.get_frames()
-            self._frames_cache = [_Frame(self, f) for f in fobs]
+            frames = [_Frame(self, f) for f in fobs]
+            # Map each iframe's CDP target to its Page-domain frame id so
+            # DOM.getFrameOwner works (owner lookup for bounding boxes).
+            try:
+                tree = await self._tab.send(cdp.page.get_frame_tree())
+                by_parent = {}
+                for fr in _nd_util.flatten_frame_tree(tree):
+                    pid = getattr(fr, "parent_id", None)
+                    if pid:
+                        by_parent[str(pid)] = getattr(fr, "id_", None)
+                for f, wrapped in zip(fobs, frames):
+                    t = getattr(f, "target", None)
+                    pid = getattr(t, "parent_frame_id", None) if t else None
+                    if pid and str(pid) in by_parent:
+                        wrapped._frame_id = by_parent[str(pid)]
+            except Exception:
+                pass
+            self._frames_cache = frames
         except Exception:
             pass
 
@@ -806,9 +954,12 @@ class _Page:
     @property
     def url(self) -> str:
         try:
-            return (self._tab.target.url or "") if getattr(self._tab, "target", None) else ""
+            t = getattr(self._tab, "target", None)
+            if t is not None:
+                return (getattr(t, "url", None) or "")
         except Exception:
-            return ""
+            pass
+        return ""
 
     async def title(self) -> str:
         try:
@@ -820,19 +971,39 @@ class _Page:
                    timeout: Optional[float] = None, **kwargs) -> None:
         t = (timeout or 30000) / 1000.0
         try:
-            await self._tab.get(url, timeout=t)
-        except Exception:
-            # truedriver get() already treats slow loads gracefully; propagate
-            # anything else so callers (which wrap goto in try/except) see it.
+            # nodriver's tab.get() has no timeout and waits for nothing;
+            # navigate directly and bound ourselves (callers additionally
+            # wrap goto in their own hard cap).
+            await asyncio.wait_for(
+                self._tab.send(cdp.page.navigate(url)), timeout=max(t, 5.0))
+        except asyncio.TimeoutError:
             raise
-        await self._refresh_frames()
+        except Exception:
+            raise
+        # wait_until="domcontentloaded" (the bot's case) -> readyState
+        # "interactive" is enough; default -> "complete". Poll briefly — the
+        # caller's form-poll is the real gate, so don't over-wait.
+        want_complete = (wait_until or "load") == "load"
+        deadline = time.monotonic() + max(t, 5.0)
+        while time.monotonic() < deadline:
+            try:
+                rs = await asyncio.wait_for(
+                    self._eval("document.readyState"), timeout=3.0)
+            except Exception:
+                rs = "loading"
+            if rs in ("interactive", "complete") and not (want_complete and rs != "complete"):
+                break
+            if rs == "complete":
+                break
+            await asyncio.sleep(0.25)
+        await self._refresh_frames(force=True)
 
     async def reload(self, timeout: Optional[float] = None, **kwargs) -> None:
         try:
             await self._tab.reload()
         except Exception:
             pass
-        await self._refresh_frames()
+        await self._refresh_frames(force=True)
 
     async def close(self) -> None:
         try:
@@ -840,28 +1011,27 @@ class _Page:
         except Exception:
             pass
 
+    def is_closed(self) -> bool:
+        try:
+            if getattr(self._tab, "socket", None) is None:
+                return True
+        except Exception:
+            pass
+        try:
+            if getattr(self._tab, "stopped", False):
+                return True
+        except Exception:
+            pass
+        return False
+
     # ---- evaluation -------------------------------------------------------
     async def _eval(self, js: Any, arg: Any = None) -> Any:
-        expr, await_promise = _wrap_js(js, arg)
-        ctx = None
-        try:
-            ctx = self._tab._get_execution_context_for_evaluate()
-        except Exception:
-            ctx = None
-        ro, errs = await self._tab.send(cdp.runtime.evaluate(
-            expression=expr, user_gesture=True, await_promise=await_promise,
-            return_by_value=True, allow_unsafe_eval_blocked_by_csp=True,
-            context_id=ctx))
-        if errs:
-            raise RuntimeError(str(errs))
-        return ro.value if ro is not None else None
+        return await _eval_on(self._tab, js, arg)
 
     async def evaluate(self, js: Any, arg: Any = None) -> Any:
-        await self._tab.switch_to_main_frame()
-        try:
-            return await self._eval(js, arg)
-        finally:
-            await self._refresh_frames()
+        out = await self._eval(js, arg)
+        await self._refresh_frames()
+        return out
 
     # ---- locating ---------------------------------------------------------
     def locator(self, selector: str) -> "_Locator":
@@ -875,7 +1045,6 @@ class _Page:
         return self._frames_cache
 
     async def _frames_for_selector(self, selector: str) -> list:
-        await self._tab.switch_to_main_frame()
         try:
             iframes = await self._tab.query_selector_all(selector)
         except Exception:
@@ -886,15 +1055,16 @@ class _Page:
                 bnodes.add(int(e.backend_node_id))
             except Exception:
                 pass
-        frames = await self._tab.get_frames()
+        if not bnodes:
+            return []
         out = []
-        for fr in frames:
-            try:
-                owner, _ = await self._tab.send(cdp.dom.get_frame_owner(fr.id_))
-                if int(owner) in bnodes:
-                    out.append(fr)
-            except Exception:
+        for fr in self._frames_cache:
+            frame_id = await fr._page_frame_id()
+            if not frame_id:
                 continue
+            owner = await _frame_owner_bnode(self._tab, frame_id)
+            if owner and owner in bnodes:
+                out.append(fr._frame)
         return out
 
     async def _frame_for_element(self, el: Any) -> Optional["_Frame"]:
@@ -902,28 +1072,38 @@ class _Page:
             bnode = int(el.backend_node_id)
         except Exception:
             return None
-        frames = await self._tab.get_frames()
-        for fr in frames:
-            try:
-                owner, _ = await self._tab.send(cdp.dom.get_frame_owner(fr.id_))
-                if int(owner) == bnode:
-                    return _Frame(self, fr)
-            except Exception:
+        for fr in self._frames_cache:
+            frame_id = await fr._page_frame_id()
+            if not frame_id:
                 continue
+            owner = await _frame_owner_bnode(self._tab, frame_id)
+            if owner == bnode:
+                return fr
         return None
 
     # ---- screenshots ------------------------------------------------------
-    async def screenshot(self, full_page: bool = False, timeout: Optional[float] = None, **kwargs) -> bytes:
+    async def screenshot(self, full_page: bool = False, timeout: Optional[float] = None,
+                         clip: Optional[dict] = None, **kwargs) -> bytes:
+        """Viewport or full-surface PNG capture.
+
+        ``clip`` ({"x","y","width","height"}) captures an explicit region and
+        may extend beyond the viewport — server.capture_page_screenshot uses
+        it for budgeted full-page frames with a known full size."""
         t = (timeout or 25000) / 1000.0 if timeout else 25.0
         try:
-            if full_page:
+            if full_page or clip:
                 try:
+                    args = {"format_": "png", "capture_beyond_viewport": True}
+                    if clip:
+                        args["clip"] = cdp.page.Viewport(
+                            x=float(clip.get("x") or 0),
+                            y=float(clip.get("y") or 0),
+                            width=float(clip.get("width") or 0),
+                            height=float(clip.get("height") or 0),
+                            scale=1.0)
                     data = await asyncio.wait_for(
-                        self._tab.send(cdp.page.capture_screenshot(
-                            format_="png", capture_beyond_viewport=True
-                        )),
-                        timeout=t
-                    )
+                        self._tab.send(cdp.page.capture_screenshot(**args)),
+                        timeout=t)
                     if data:
                         return base64.b64decode(data)
                 except Exception:
@@ -938,11 +1118,7 @@ class _Page:
                 return base64.b64decode(data)
         except Exception:
             pass
-        try:
-            b64 = await self._tab.screenshot_b64("png", full_page=bool(full_page))
-            return base64.b64decode(b64)
-        except Exception:
-            return b""
+        return b""
 
     # ---- mouse / keyboard / events ----------------------------------------
     @property
@@ -956,21 +1132,40 @@ class _Page:
     def on(self, event: str, handler: Callable) -> None:
         """Register a Playwright-style event listener.
 
-        Sync (must stay sync: callers use it without await). The truedriver
-        connection auto-enables the backing CDP domain on the next send().
+        Sync (must stay sync: callers use it without await). The Network
+        domain is enabled when the tab is prepared (see _Context._prepare_tab)
+        so these events flow; crash detection additionally needs the
+        Inspector domain, which is enabled lazily here (the bot attaches the
+        crash listener right after page creation, inside the worker loop).
         """
-        if event == "request":
-            async def _req_h(e, _conn):
-                _call_handler(handler, _Request(e))
-            self._tab.add_handler(cdp.network.RequestWillBeSent, _req_h)
-        elif event == "response":
-            async def _resp_h(e, _conn):
-                _call_handler(handler, _Response(self._tab, e))
-            self._tab.add_handler(cdp.network.ResponseReceived, _resp_h)
+        if event in ("request", "response"):
+            if event == "request":
+                def _req_h(e, _conn=None):
+                    _call_handler(handler, _Request(e))
+                self._tab.handlers[cdp.network.RequestWillBeSent].append(_req_h)
+            else:
+                def _resp_h(e, _conn=None):
+                    _call_handler(handler, _Response(self._tab, e))
+                self._tab.handlers[cdp.network.ResponseReceived].append(_resp_h)
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._tab.send(cdp.network.enable()))
+            except RuntimeError:
+                pass
         elif event == "crash":
-            async def _crash_h(e, _conn):
+            # Two sources of the same signal: Inspector.targetCrashed on the
+            # target session (needs Inspector.enable) and Target.crashed on
+            # the flattened auto-attach path. Register both; the bot's crash
+            # handler is idempotent (flag + rate-limited diagnostics).
+            def _crash_h(e, _conn=None):
                 _call_handler(handler)
-            self._tab.add_handler(cdp.inspector.TargetCrashed, _crash_h)
+            self._tab.handlers[cdp.inspector.TargetCrashed].append(_crash_h)
+            self._tab.handlers[cdp.target.TargetCrashed].append(_crash_h)
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._tab.send(cdp.inspector.enable()))
+            except RuntimeError:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1000,8 +1195,46 @@ class _Context:
     async def add_init_script(self, script: str) -> None:
         self._init_scripts.append(script)
 
+    async def _prepare_tab(self, tab: Any) -> None:
+        """Apply the context options nodriver does not take at launch.
+
+        · viewport  -> Emulation.setDeviceMetricsOverride (per tab)
+        · color_scheme -> Emulation.setEmulatedMedia
+        · ENGLISH is forced (operator request) -> Accept-Language header,
+          on top of the navigator.language init script server.py injects.
+        """
+        vp = self._opts.get("viewport") or {}
+        try:
+            w = int(vp.get("width") or 1280)
+            h = int(vp.get("height") or 720)
+            await tab.send(cdp.emulation.set_device_metrics_override(
+                width=w, height=h, device_scale_factor=1.0, mobile=False))
+        except Exception:
+            pass
+        scheme = self._opts.get("color_scheme")
+        if scheme:
+            try:
+                await tab.send(cdp.emulation.set_emulated_media(
+                    features=[cdp.emulation.MediaFeature(
+                        name="prefers-color-scheme", value=str(scheme))]))
+            except Exception:
+                pass
+        try:
+            await tab.send(cdp.network.set_extra_http_headers(
+                headers=cdp.network.Headers({"Accept-Language": "en-US,en;q=0.9"})))
+        except Exception:
+            pass
+        # nodriver does not auto-enable domains — turn on the ones the bot
+        # relies on (DOM queries, page events, frame tree, screenshots).
+        for domain in (cdp.page.enable(), cdp.dom.enable(), cdp.network.enable()):
+            try:
+                await tab.send(domain)
+            except Exception:
+                pass
+
     async def new_page(self) -> "_Page":
         tab = await self._browser._new_tab(self)
+        await self._prepare_tab(tab)
         for s in self._init_scripts:
             src = _wrap_new_document(s)
             if not src:
@@ -1074,29 +1307,60 @@ class _Browser:
 
     async def close(self) -> None:
         try:
-            await self._browser.stop()
+            res = self._browser.stop()
+            if asyncio.iscoroutine(res):
+                await res
         except Exception:
             pass
+
+
+def _proxy_args(proxy: Optional[dict]) -> List[str]:
+    """Playwright-style proxy dict -> Chrome flags.
+
+    Chrome carries proxy credentials via --proxy-user/--proxy-pass (the
+    --proxy-server URL form does not authenticate), so build those from the
+    dict server.py produces ({server: scheme://host:port, username, password}).
+    """
+    if not proxy:
+        return []
+    args = []
+    server = str(proxy.get("server") or "").strip()
+    if server:
+        args.append(f"--proxy-server={server}")
+    if proxy.get("username"):
+        args.append(f"--proxy-user={proxy['username']}")
+        args.append(f"--proxy-pass={proxy.get('password') or ''}")
+    return args
 
 
 class _Chromium:
     async def launch(self, headless: bool = True, args: Optional[list] = None,
                      proxy: Optional[dict] = None, **kwargs) -> "_Browser":
-        if _td_start is None or Config is None:
+        if uc is None:
             raise RuntimeError(
-                "truedriver is not installed — run: pip install truedriver")
-        cfg = Config(headless=bool(headless),
-                     browser_args=list(args or []),
-                     sandbox=False,
-                     proxy=proxy)
-        browser = await _td_start(cfg)
+                "nodriver is not installed — run: pip install nodriver "
+                "(and install google-chrome-stable on the machine)")
+        browser_args = list(args or [])
+        # Honor the context's ignore_https_errors (the bot always sets it) at
+        # the browser level — the CDP equivalent of Playwright's option.
+        browser_args.append("--ignore-certificate-errors")
+        browser_args.extend(_proxy_args(proxy))
+        # google-chrome-stable is on PATH in the container; CHROME_PATH
+        # overrides for odd deployments. nodriver auto-detects otherwise.
+        exe = os.environ.get("CHROME_PATH") or None
+        browser = await uc.start(
+            headless=bool(headless),
+            browser_args=browser_args,
+            sandbox=False,
+            browser_executable_path=exe,
+        )
         return _Browser(browser)
 
 
 class _Playwright:
     def __init__(self):
         self._started = False
-        self._chromium: Optional[_Chromium] = None
+        self._chromium: Optional["_Chromium"] = None
 
     async def start(self) -> "_Playwright":
         self._started = True
