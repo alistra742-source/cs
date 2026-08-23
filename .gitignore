@@ -27,3 +27,6 @@ data_real/
 
 # runtime training-sample collector output (drag_solver.py saves solved rounds)
 train/data/
+
+# live-camera / trainer challenge screenshots (kept on disk, never deleted)
+data/challenges/

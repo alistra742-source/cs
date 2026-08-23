@@ -12,16 +12,27 @@ a challenge-iframe screenshot is captured whenever hCaptcha is showing one.
 """
 import asyncio
 import base64
+import hashlib
 import json
 import math
+import os
 import time
 from typing import Optional
 
 from browser_engine import ENGINE
-from server import NAV_TIMEOUT_MS, capture_page_screenshot
+from server import (
+    NAV_TIMEOUT_MS,
+    capture_page_screenshot,
+    png_dimensions,
+    png_is_complete,
+)
 
 VIEWPORT_W = 1920
 VIEWPORT_H = 1080
+DISCORD_REGISTER_URL = "https://discord.com/register"
+_CHALLENGE_GALLERY_CAP = 80
+CHALLENGE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "challenges")
 
 CHALLENGE_IFRAME_SELECTOR = (
     'iframe[title*="hCaptcha challenge"], '
@@ -137,6 +148,106 @@ def format_hit_field(entry: dict) -> str:
     if entry.get("text"):
         lines.append(f"text: {entry['text']}")
     return "\n".join(lines)
+
+
+def decode_image_payload(image) -> bytes:
+    """PNG bytes from a data-URL, raw base64, or already-decoded bytes."""
+    if isinstance(image, (bytes, bytearray)):
+        return bytes(image)
+    text = str(image or "").strip()
+    if not text:
+        return b""
+    if text.startswith("data:image/"):
+        text = text.split(",", 1)[-1]
+    try:
+        return base64.b64decode(text)
+    except Exception:
+        return b""
+
+
+def image_src(image) -> str:
+    """A browser-usable src: data URL, /challenges/ path, or base64 prefix."""
+    text = str(image or "").strip()
+    if not text:
+        return ""
+    if text.startswith("data:image/") or text.startswith("/challenges/"):
+        return text
+    return "data:image/png;base64," + text
+
+
+def challenge_file_path(name: str) -> str:
+    """Absolute path to a saved challenge PNG, or '' if the name is unsafe."""
+    name = os.path.basename(str(name or ""))
+    if not name or not name.endswith(".png") or ".." in name:
+        return ""
+    path = os.path.join(CHALLENGE_DIR, name)
+    return path if os.path.isfile(path) else ""
+
+
+def save_challenge_png(image, question: str = "", kind: str = "challenge") -> dict:
+    """Write a complete PNG to disk and never delete it.
+
+    Same-hash images reuse the existing file. Incomplete / half frames
+    are rejected so a glitched capture cannot replace a good one.
+    """
+    raw = decode_image_payload(image)
+    if not png_is_complete(raw):
+        return {}
+    width, height = png_dimensions(raw)
+    if width < 40 or height < 40:
+        return {}
+    digest = hashlib.sha1(raw).hexdigest()[:16]
+    try:
+        os.makedirs(CHALLENGE_DIR, exist_ok=True)
+    except Exception:
+        return {}
+    existing = ""
+    try:
+        for fname in os.listdir(CHALLENGE_DIR):
+            if digest in fname and fname.endswith(".png"):
+                existing = fname
+                break
+    except Exception:
+        existing = ""
+    if existing:
+        name = existing
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe_kind = "".join(ch for ch in str(kind or "challenge") if ch.isalnum()) or "shot"
+        name = f"{stamp}-{safe_kind}-{digest}.png"
+        path = os.path.join(CHALLENGE_DIR, name)
+        try:
+            with open(path, "wb") as handle:
+                handle.write(raw)
+        except Exception:
+            return {}
+    return {
+        "id": digest,
+        "file": name,
+        "url": f"/challenges/{name}",
+        "question": str(question or "").strip()[:300],
+        "time": time.strftime("%H:%M:%S"),
+        "kind": str(kind or "challenge"),
+        "width": width,
+        "height": height,
+        "bytes": len(raw),
+    }
+
+
+def remember_saved_challenge(bot, rec: dict) -> None:
+    """Append a saved-challenge record; never drop previous files."""
+    if bot is None or not rec or not rec.get("id"):
+        return
+    gallery = list(getattr(bot, "_live_challenge_gallery", None) or [])
+    if any(item.get("id") == rec["id"] for item in gallery):
+        return
+    gallery.append(rec)
+    if len(gallery) > _CHALLENGE_GALLERY_CAP:
+        gallery = gallery[-_CHALLENGE_GALLERY_CAP:]
+    try:
+        bot._live_challenge_gallery = gallery
+    except Exception:
+        pass
 
 
 def format_pointer_dump(items) -> str:
@@ -283,7 +394,12 @@ def _attach_pointer_fields(meta: dict, bot) -> dict:
     meta = meta or {}
     meta["last_pointer"] = getattr(bot, "_live_last_pointer", None) or None
     meta["pointer_log"] = list(getattr(bot, "_live_pointer_log", None) or [])
-    meta["challenge_screenshot"] = getattr(bot, "_live_challenge_b64", "") or ""
+    gallery = list(getattr(bot, "_live_challenge_gallery", None) or [])
+    meta["challenge_shots"] = gallery
+    latest = getattr(bot, "_live_challenge_b64", "") or ""
+    if not latest and gallery:
+        latest = gallery[-1].get("url") or ""
+    meta["challenge_screenshot"] = latest
     return meta
 
 
@@ -342,12 +458,21 @@ async def live_screenshot(bot) -> str:
     last_err = ""
     try:
         shot = await capture_page_screenshot(
-            page, fullpage_timeout=10.0, viewport_timeout=6.0)
+            page, fullpage_timeout=10.0, viewport_timeout=6.0, reveal="live")
         if not shot:
             last_err = "empty capture"
+        elif not png_is_complete(shot):
+            last_err = "incomplete png"
+            shot = b""
+        else:
+            width, height = png_dimensions(shot)
+            if width < 200 or height < 200:
+                last_err = f"tiny frame {width}x{height}"
+                shot = b""
     except Exception as e:
         last_err = str(e)
-    if not last_err:
+        shot = b""
+    if shot and not last_err:
         b64 = base64.b64encode(shot).decode("utf-8")
         shots = getattr(bot, "_screenshots", None)
         if shots is not None:
@@ -426,7 +551,10 @@ async def capture_challenge_screenshot(page) -> str:
                     break
         except Exception:
             shot = b""
-    if not shot:
+    if not png_is_complete(shot):
+        return ""
+    width, height = png_dimensions(shot)
+    if width < 40 or height < 40:
         return ""
     return "data:image/png;base64," + base64.b64encode(shot).decode("ascii")
 
@@ -468,7 +596,7 @@ async def _read_challenge_prompt(page) -> str:
 
 
 async def _note_challenge_shot(bot, page) -> str:
-    """Capture the challenge iframe (if any) and publish it."""
+    """Capture the challenge iframe (if any), save it, and keep it."""
     if page is None:
         return getattr(bot, "_live_challenge_b64", "") or ""
     try:
@@ -491,19 +619,58 @@ async def _note_challenge_shot(bot, page) -> str:
             _read_challenge_prompt(page), timeout=2.0)
     except Exception:
         question = ""
+    rec = save_challenge_png(image, question, kind="challenge") or {}
+    if rec:
+        remember_saved_challenge(bot, rec)
+        try:
+            bot._live_challenge_file = rec.get("file") or ""
+        except Exception:
+            pass
+    published = rec.get("url") or image
     try:
-        bot._live_challenge_b64 = image
+        bot._live_challenge_b64 = published
     except Exception:
         pass
+    # Trainer re-saves from the original data URL (same hash reuses the file).
     _push_trainer_shot(image, question)
-    if bot is not None and not getattr(bot, "_live_challenge_logged", False):
+
+    # Companion full-viewport of the same moment. Never deletes the iframe
+    # PNG — a second hash just adds another kept file.
+    companion = ""
+    try:
+        last = ""
+        shots = getattr(bot, "_screenshots", None)
+        if shots:
+            last = shots[-1] or ""
+        raw = decode_image_payload(last)
+        if png_is_complete(raw) and png_dimensions(raw)[0] >= 200:
+            companion = last
+        else:
+            shot = await capture_page_screenshot(
+                page, reveal="live",
+                fullpage_timeout=8.0, viewport_timeout=5.0)
+            if png_is_complete(shot):
+                companion = (
+                    "data:image/png;base64,"
+                    + base64.b64encode(shot).decode("ascii")
+                )
+    except Exception:
+        companion = ""
+    if companion:
+        brow = save_challenge_png(companion, question, kind="browser") or {}
+        remember_saved_challenge(bot, brow)
+
+    digest = rec.get("id") or ""
+    if digest and digest != getattr(bot, "_live_challenge_saved_id", ""):
         try:
-            bot._live_challenge_logged = True
+            bot._live_challenge_saved_id = digest
         except Exception:
             pass
         extra = f" — {question}" if question else ""
-        _live_log(bot, f"Captured hCaptcha challenge screenshot{extra}.")
-    return image
+        fname = rec.get("file") or ""
+        where = f" saved as {fname}" if fname else ""
+        _live_log(bot, f"Captured hCaptcha challenge screenshot{where}{extra}.")
+    return published
 
 
 async def get_live_state(bot) -> dict:

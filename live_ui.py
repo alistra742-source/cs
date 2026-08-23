@@ -43,13 +43,14 @@ LIVE_INJECTION = r'''
     <div class="live-tools">
       <button id="liveKeyBtn" type="button" aria-pressed="false">KEY</button>
       <button id="liveDragBtn" type="button" aria-pressed="false">DRAG</button>
+      <button id="liveRegBtn" type="button">REGISTER</button>
       <button id="liveCopyAll" type="button">COPY ALL</button>
     </div>
     <div id="liveTypeBar" class="live-type-bar">
       <input id="liveTypeInput" type="text" inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Type into Chrome">
     </div>
     <div class="live-frame" id="liveFrame">
-      <div id="livePlaceholder" class="live-placeholder">Start the browser runner to view its camera.</div>
+      <div id="livePlaceholder" class="live-placeholder">Tap REGISTER to open Discord signup, or start the runner.</div>
       <img id="liveImage" alt="Latest real Chrome camera frame" draggable="false">
       <svg id="liveTrail" class="live-trail" aria-hidden="true"></svg>
       <div id="liveMark" class="live-mark" aria-hidden="true"></div>
@@ -63,11 +64,17 @@ LIVE_INJECTION = r'''
       <img id="liveChallengeImg" class="live-challenge-shot" alt="Latest hCaptcha challenge screenshot">
       <div id="livePointerLog" class="live-pointer-log"></div>
     </div>
-    <div class="live-foot">Real Chrome camera — refreshes every 3 seconds. KEY opens your phone keyboard. DRAG on = drag, off = click only. COPY ALL copies every logged click.</div>
+    <div class="live-foot">Real Chrome camera — refreshes every 3 seconds. REGISTER opens discord.com/register. KEY opens your phone keyboard. DRAG on = drag, off = click only. Challenge shots are saved and kept.</div>
   </div>
 </div>
 <script>
-var LC={worker:'B1',timer:null,interactive:false,dsf:1,drag:null,dragOn:false,keyOn:false,typeLast:'',lastSrc:'',lastChallenge:'',pointerLog:[]};
+var LC={worker:'B1',timer:null,interactive:false,connected:false,dsf:1,drag:null,dragOn:false,keyOn:false,typeLast:'',lastSrc:'',lastChallenge:'',pointerLog:[]};
+function lcImgSrc(src){
+  src=String(src||'');
+  if(!src)return '';
+  if(src.indexOf('data:image/')===0||src.indexOf('/challenges/')===0||src.indexOf('http')===0)return src;
+  return 'data:image/png;base64,'+src;
+}
 
 function lcSetStatus(message){
   var el=document.getElementById('liveState');
@@ -89,7 +96,7 @@ function lcSetImage(src){
     if(ph)ph.style.display='none';
   };
   img.onerror=function(){lcShowPlaceholder('Waiting for the first camera frame.');};
-  var next=src.indexOf('data:image/')===0?src:'data:image/png;base64,'+src;
+  var next=lcImgSrc(src);
   LC.lastSrc=src;
   img.src=next;
 }
@@ -169,7 +176,7 @@ function lcSetChallenge(src){
   if(!img||!src)return;
   if(src===LC.lastChallenge) return;
   LC.lastChallenge=src;
-  img.src=src.indexOf('data:image/')===0?src:'data:image/png;base64,'+src;
+  img.src=lcImgSrc(src);
   if(wrap)wrap.classList.add('on');
 }
 function lcPageXY(event){
@@ -222,6 +229,8 @@ function lcDrawTrail(x1,y1,x2,y2){
 }
 function lcApplyState(st){
   if(!st)return;
+  if(st.connected)LC.connected=true;
+  if(st.connected)LC.interactive=true;
   if(st.device_scale_factor)LC.dsf=Number(st.device_scale_factor)||1;
   if(st.screenshot)lcSetImage(st.screenshot);
   if(st.challenge_screenshot)lcSetChallenge(st.challenge_screenshot);
@@ -382,12 +391,30 @@ function lcRefresh(){
     .catch(function(){lcSetStatus('Camera status unavailable');});
   LC.timer=setTimeout(lcRefresh,3000);
 }
+function lcGoRegister(){
+  lcSetStatus('Opening Discord register…');
+  fetch('/browser/start?worker='+encodeURIComponent(LC.worker),{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:'https://discord.com/register',force:true})
+  }).then(function(r){return r.json();}).then(function(st){
+    if(st&&st.connected){LC.connected=true;LC.interactive=true;}
+    lcApplyState(st||{});
+    if(st&&st.error)lcSetStatus(st.error);
+    else lcSetStatus('Camera · register');
+  }).catch(function(){lcSetStatus('Could not open Discord register');});
+}
 function openLive(){
   var overlay=document.getElementById('liveOverlay');
   if(!overlay)return;
   overlay.classList.add('on');
   if(LC.timer)clearTimeout(LC.timer);
-  lcRefresh();
+  fetch('/browser/start?worker='+encodeURIComponent(LC.worker),{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({})
+  }).then(function(r){return r.json();}).then(function(st){
+    if(st&&st.connected){LC.connected=true;LC.interactive=true;}
+    lcApplyState(st||{});
+  }).catch(function(){}).then(function(){lcRefresh();});
 }
 function closeLive(){
   var overlay=document.getElementById('liveOverlay');
@@ -414,6 +441,8 @@ window.closeLive=closeLive;
   if(keyBtn)keyBtn.addEventListener('click',function(e){e.preventDefault();lcToggleKeyboard();});
   var dragBtn=document.getElementById('liveDragBtn');
   if(dragBtn)dragBtn.addEventListener('click',function(e){e.preventDefault();lcToggleDrag();});
+  var regBtn=document.getElementById('liveRegBtn');
+  if(regBtn)regBtn.addEventListener('click',function(e){e.preventDefault();lcGoRegister();});
   var copyBtn=document.getElementById('liveCopyAll');
   if(copyBtn)copyBtn.addEventListener('click',function(e){e.preventDefault();lcCopyAll();});
   var typeInput=document.getElementById('liveTypeInput');

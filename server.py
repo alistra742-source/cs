@@ -6,6 +6,7 @@ import os
 import random
 import re
 import socket
+import struct
 import time
 from typing import Optional
 
@@ -1264,6 +1265,60 @@ _REVEAL_FORM_JS = r"""() => {
     }
 }"""
 
+# Live-camera reveal: still never fights an open menu, but if the register
+# form is mostly below the fold we pull it up so the full browser window
+# shows the form instead of a half-empty Discord chrome shot.
+_REVEAL_FORM_LIVE_JS = r"""() => {
+    try {
+        const openMenu = document.querySelector(
+            '[role="option"], [role="menuitem"], [class*="popout" i]');
+        if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        const form = document.querySelector('form')
+            || document.querySelector(
+                'input[name="email"], input[type="email"], input[name="password"]');
+        if (!form) return 'ok';
+        const r = form.getBoundingClientRect();
+        if (!r || (r.width === 0 && r.height === 0)) return 'ok';
+        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (vh <= 0) return 'ok';
+        const entirelyOut = (r.bottom <= 0 || r.top >= vh);
+        const mostlyBelow = r.top > vh * 0.28 && r.bottom > vh;
+        if (!entirelyOut && !mostlyBelow) return 'ok';
+        form.scrollIntoView({ block: 'start', behavior: 'instant' });
+        return 'scrolled';
+    } catch (e) {
+        return 'ok';
+    }
+}"""
+
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+PNG_IEND = b"IEND\xaeB`\x82"
+
+
+def png_is_complete(data) -> bool:
+    """True when ``data`` is a finished PNG (signature + IEND), not a half frame."""
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if len(data) < 33 or bytes(data[:8]) != PNG_SIG:
+        return False
+    tail = bytes(data[-24:])
+    return tail.endswith(PNG_IEND) or PNG_IEND in tail
+
+
+def png_dimensions(data) -> tuple:
+    """(width, height) from a PNG IHDR, or (0, 0) if unreadable."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 24:
+        return (0, 0)
+    if bytes(data[:8]) != PNG_SIG:
+        return (0, 0)
+    try:
+        width, height = struct.unpack(">II", bytes(data[16:24]))
+    except Exception:
+        return (0, 0)
+    if width <= 0 or height <= 0 or width > 20000 or height > 20000:
+        return (0, 0)
+    return (int(width), int(height))
+
 # Full size of the scrollable document + the current viewport.
 _PAGE_SIZE_JS = r"""() => {
     const de = document.documentElement;
@@ -1345,9 +1400,18 @@ async def _full_page_shot(page, log=None,
         return b""
 
 
+def _png_viewport_ok(data, min_w: int = 200, min_h: int = 200) -> bool:
+    """True when ``data`` is a finished PNG large enough to be a full frame."""
+    if not png_is_complete(data):
+        return False
+    width, height = png_dimensions(data)
+    return width >= min_w and height >= min_h
+
+
 async def capture_page_screenshot(page, log=None,
                                   fullpage_timeout: float = 20.0,
-                                  viewport_timeout: float = 10.0) -> bytes:
+                                  viewport_timeout: float = 10.0,
+                                  reveal: str = "safe") -> bytes:
     """Full browser-view frame, with the register form guaranteed in sight.
 
     Primary path (default): a conservative reveal step — scroll the
@@ -1356,6 +1420,14 @@ async def capture_page_screenshot(page, log=None,
     the bot's own actions — then a FULL-VIEWPORT capture: the entire
     browser window, zero page perturbation, no blank beyond-viewport
     regions, no OOM. This is the "full browser view" the feed shows.
+
+    ``reveal="live"`` still never fights an open menu, but will also
+    pull the register form up when it is mostly below the fold so the
+    live camera shows the full Discord window instead of half chrome.
+
+    Incomplete / truncated / tiny PNGs are rejected and retried. A
+    glitched half-frame is never returned — callers keep their last
+    good image instead.
 
     Opt-in path (FULLPAGE_SHOTS=1): the whole scrollable surface,
     rendered first by a scroll-through so lazy content is in the paint
@@ -1377,10 +1449,19 @@ async def capture_page_screenshot(page, log=None,
         except Exception:
             return b""
 
-    # Reveal the form when it is entirely out of sight (see _REVEAL_FORM_JS).
+    live = str(reveal or "safe").strip().lower() == "live"
+    reveal_js = _REVEAL_FORM_LIVE_JS if live else _REVEAL_FORM_JS
     try:
-        if await asyncio.wait_for(page.evaluate(_REVEAL_FORM_JS), timeout=2.0) == "scrolled":
+        if await asyncio.wait_for(page.evaluate(reveal_js), timeout=2.0) == "scrolled":
             await asyncio.sleep(0.25)  # let the scroll + repaint settle
+    except Exception:
+        pass
+    # Two animation frames so Discord/React finish painting after a reveal.
+    try:
+        await asyncio.wait_for(page.evaluate(
+            "() => new Promise((ok) => {"
+            "requestAnimationFrame(() => requestAnimationFrame(ok));"
+            "})"), timeout=1.5)
     except Exception:
         pass
 
@@ -1388,7 +1469,7 @@ async def capture_page_screenshot(page, log=None,
         try:
             shot = await _full_page_shot(page, log=log,
                                          fullpage_timeout=fullpage_timeout)
-            if shot:
+            if _png_viewport_ok(shot):
                 return shot
         except Exception as e:
             if log:
@@ -1396,10 +1477,17 @@ async def capture_page_screenshot(page, log=None,
                     level="warn")
 
     # Primary frame: the full viewport (the entire browser window).
-    shot = await _viewport(viewport_timeout)
-    if not shot and viewport_timeout >= 8.0:
-        shot = await _viewport(10.0)
-    return shot
+    # Live register retries a couple of times so a truncated/half PNG is
+    # never published as the camera frame.
+    tries = 3 if live else 2
+    for attempt in range(tries):
+        timeout = viewport_timeout if attempt == 0 else max(4.0, float(viewport_timeout) * 0.7)
+        shot = await _viewport(timeout)
+        if _png_viewport_ok(shot):
+            return shot
+        if attempt + 1 < tries:
+            await asyncio.sleep(0.12)
+    return b""
 
 
 # ── Browser-error URL detection (engine-agnostic) ──────────────────────
@@ -2737,8 +2825,8 @@ class DiscordAutomation:
         # lives in capture_page_screenshot. Same base64 history contract
         # as before: latest frame appended, ring trimmed at 100.
         screenshot = await capture_page_screenshot(
-            self._page, log=self._log, fullpage_timeout=20.0)
-        if not screenshot:
+            self._page, log=self._log, fullpage_timeout=20.0, reveal="live")
+        if not screenshot or not png_is_complete(screenshot):
             return ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
         self._screenshots.append(b64)

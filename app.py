@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import aiohttp
 import requests as _requests
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, send_file
 
 # Database removed - no token persistence
 
@@ -191,7 +191,7 @@ def _init_worker(wid: str) -> dict:
     return {
         "id": wid,
         "bot": None,
-        "status": "idle",          # idle | starting | running | done | error
+        "status": "idle",          # idle | starting | running | live | demo | done | error
         "step": "",
         "email": "",
         "username": "",
@@ -870,8 +870,9 @@ async def _start_live_browser(wid: str, url: str = "",
     a running signup off the page it is filling."""
     state = _workers.get(wid) or _init_worker(wid)
     _workers[wid] = state
-    if not url:
-        url = "https://discord.com/register"
+    wanted = (url or "").strip()
+    # Opening LIVE never yanks a parked demo/signup tab. A cold launch with
+    # no URL still lands on Discord register so the camera can go there.
     # The gen is already driving this SAME browser — never relaunch a second
     # one on top of it and never yank it off the page it is filling.
     # Just report what the worker is doing so the LIVE tab shows it live.
@@ -933,19 +934,34 @@ async def _start_live_browser(wid: str, url: str = "",
             await asyncio.wait_for(bot.initialize(), timeout=90)
             _log(f"[{wid}] [Live] Browser launched ({via})")
             launched = True
-        if url:
-            # Navigate whenever the page isn't already where the operator
-            # asked it to be. A parked browser on about:blank (or a stale
-            # error page) must NOT be treated as "still filling a signup" —
-            # that was leaving the LIVE tab on a permanent white screen.
+        if launched and not wanted:
+            wanted = live_control.DISCORD_REGISTER_URL
+        if wanted:
+            # Navigate when the operator asked for a URL (REGISTER) or this
+            # is a cold launch. A parked demo tab stays put unless force=1.
             cur = ""
             try:
                 cur = str(bot._page.url or "") if bot._page else ""
             except Exception:
                 cur = ""
-            if force or launched or cur.rstrip("/") != url.rstrip("/"):
-                return await _live_navigate_robust(wid, bot, url)
-        return await live_control.get_live_state(bot)
+            busy = state.get("status") in ("starting", "running", "demo")
+            should_go = force or launched or (
+                cur.rstrip("/") != wanted.rstrip("/") and not busy)
+            if should_go:
+                st = await _live_navigate_robust(wid, bot, wanted)
+                if state.get("status") not in ("starting", "running"):
+                    state["status"] = "live"
+                    state["step"] = "live camera · discord register"
+                if st.get("screenshot"):
+                    state["last_shot_b64"] = st["screenshot"]
+                st["status"] = state.get("status", "")
+                return st
+        if state.get("status") in ("idle", "stopped", "error", ""):
+            state["status"] = "live"
+            state["step"] = "live camera"
+        st = await live_control.get_live_state(bot)
+        st["status"] = state.get("status", "")
+        return st
     except Exception as e:
         import traceback
         tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -1294,6 +1310,9 @@ def handle_browser_start():
     if st is None:
         return jsonify({"connected": False, "worker_id": wid,
                         "error": "event loop unavailable"}), 503
+    s = _workers.get(wid)
+    if s is not None and st.get("screenshot"):
+        s["last_shot_b64"] = st["screenshot"]
     return jsonify(st)
 
 @app.route('/browser/close', methods=['POST'])
@@ -1481,6 +1500,15 @@ def handle_trainer_speed():
     except (TypeError, ValueError):
         return jsonify({"ok": False, "message": "speed must be a number"}), 400
     return jsonify(trainer.trainer_engine.set_speed(speed))
+
+
+@app.route('/challenges/<name>')
+def handle_challenge_file(name):
+    """Serve a saved challenge / companion browser PNG. Never deleted."""
+    path = live_control.challenge_file_path(name)
+    if not path:
+        return Response(status=404)
+    return send_file(path, mimetype="image/png")
 
 
 def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -2168,13 +2196,18 @@ function refreshTrainer(){
       var img = $('trainerModalImg');
       var ph = $('trainerPlaceholder');
       var btnCopyLatest = $('btnCopyLatest');
-      if(s.latest_screenshot){
-        if(img.src !== s.latest_screenshot) img.src = s.latest_screenshot;
+      var shot = s.latest_challenge_image || s.latest_screenshot;
+      if(shot){
+        if(img.getAttribute('data-src') !== shot){
+          img.src = shot;
+          img.setAttribute('data-src', shot);
+        }
         img.style.display = 'block';
         if(ph) ph.style.display = 'none';
         if(btnCopyLatest) btnCopyLatest.style.display = 'inline-block';
       } else {
         img.removeAttribute('src');
+        img.removeAttribute('data-src');
         img.style.display = 'none';
         if(ph) ph.style.display = 'block';
         if(btnCopyLatest) btnCopyLatest.style.display = 'none';

@@ -161,6 +161,8 @@ class TrainerEngine:
 
         self.latest_challenge: Dict[str, Any] = {}
         self.latest_screenshot = ""
+        self.latest_challenge_image = ""
+        self.saved_challenges: List[Dict[str, Any]] = []
         self.latest_question = ""
         self.questions: List[Dict[str, Any]] = []
         self.logs: List[str] = []
@@ -314,7 +316,8 @@ class TrainerEngine:
             self.latest_question = ""
             self.latest_challenge = {}
             self.pointer_log.clear()
-            self._add_log("Captured question list cleared.")
+            # Saved challenge PNG files stay on disk and in saved_challenges.
+            self._add_log("Captured question list cleared (saved challenge images kept).")
             return {"ok": True, "message": "Captured questions cleared"}
 
     def get_state(self) -> dict:
@@ -331,6 +334,8 @@ class TrainerEngine:
                 "latest_question": self.latest_question,
                 "latest_challenge": dict(self.latest_challenge),
                 "latest_screenshot": self.latest_screenshot,
+                "latest_challenge_image": self.latest_challenge_image,
+                "saved_challenges": [dict(s) for s in self.saved_challenges[-40:]],
                 "questions": [dict(q) for q in self.questions],
                 "logs": list(self.logs[-20:]),
                 "pointer_log": [dict(p) for p in self.pointer_log[-20:]],
@@ -378,7 +383,20 @@ class TrainerEngine:
         question = str(question or "").strip()
         if not image and not question:
             return
+        rec: Dict[str, Any] = {}
+        if image:
+            try:
+                import live_control
+                rec = live_control.save_challenge_png(
+                    image, question, kind="challenge") or {}
+            except Exception:
+                rec = {}
         with self._lock:
+            if rec:
+                if not any(item.get("id") == rec.get("id")
+                           for item in self.saved_challenges):
+                    self.saved_challenges.append(rec)
+                self.latest_challenge_image = rec.get("url") or image
             if image:
                 self.latest_screenshot = image
             if question and question != self.latest_question:
@@ -975,6 +993,14 @@ class TrainerEngine:
                 await asyncio.sleep(0.2)
 
     async def _record_challenge(self, image: str, question: str, full_text: str) -> None:
+        rec: Dict[str, Any] = {}
+        if image:
+            try:
+                import live_control
+                rec = live_control.save_challenge_png(
+                    image, question, kind="challenge") or {}
+            except Exception:
+                rec = {}
         with self._lock:
             q_id = len(self.questions) + 1
             now = time.strftime("%H:%M:%S")
@@ -986,19 +1012,29 @@ class TrainerEngine:
                 "time": now,
                 "url": TARGET_DEMO_URL,
                 "display": f"{q_id}. {question}",
+                "image_url": rec.get("url") or "",
             }
             self.questions.append(entry)
             self.captured_count += 1
             self.latest_question = question
             self.latest_screenshot = image
+            if rec:
+                if not any(item.get("id") == rec.get("id")
+                           for item in self.saved_challenges):
+                    self.saved_challenges.append(rec)
+                self.latest_challenge_image = rec.get("url") or image
+            elif image and not self.latest_challenge_image:
+                self.latest_challenge_image = image
             self.latest_challenge = {
                 "id": q_id,
                 "question": question,
                 "type": "REAL HCAPTCHA",
                 "timestamp": now,
                 "url": TARGET_DEMO_URL,
+                "image_url": rec.get("url") or "",
             }
-        self._add_log(f"Captured real challenge #{q_id}: {question}")
+        extra = f" saved as {rec.get('file')}" if rec.get("file") else ""
+        self._add_log(f"Captured real challenge #{q_id}: {question}{extra}")
 
     async def _wait_for_human_completion(self, page) -> str:
         """Wait for a real user to finish; return success or stopped."""

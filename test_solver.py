@@ -27,7 +27,7 @@ NO browser, NO network, NO model server. Covers:
     (data_real/val); skipped when models/ weights are absent — train with
     train_models.py.
 
-Expected: 100 collected (92 passed + 8 skipped when the models are not trained yet).
+Expected: 109 collected (101 passed + 8 skipped when the models are not trained yet).
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -1453,6 +1453,144 @@ class TestPerformLiveAction(unittest.IsolatedAsyncioTestCase):
         self.assertIn("down", kinds)
         self.assertIn("up", kinds)
         self.assertLess(kinds.index("down"), kinds.index("up"))
+
+
+class TestPngComplete(unittest.TestCase):
+
+    def test_complete_vs_truncated(self):
+        import io
+        from PIL import Image
+        from server import png_dimensions, png_is_complete
+
+        im = Image.new("RGB", (64, 48), (10, 20, 30))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        raw = buf.getvalue()
+        self.assertTrue(png_is_complete(raw))
+        self.assertEqual(png_dimensions(raw), (64, 48))
+        self.assertFalse(png_is_complete(raw[:-8]))
+        self.assertFalse(png_is_complete(b""))
+        self.assertFalse(png_is_complete(b"\x89PNG\r\n\x1a\nnot-enough"))
+        self.assertFalse(png_is_complete("not-bytes"))
+
+    def test_capture_accepts_reveal(self):
+        import inspect
+        from server import capture_page_screenshot
+        params = inspect.signature(capture_page_screenshot).parameters
+        self.assertIn("reveal", params)
+        self.assertEqual(params["reveal"].default, "safe")
+
+
+class TestSaveChallengePng(unittest.TestCase):
+
+    def test_saves_two_hashes_and_reuses(self):
+        import io
+        import shutil
+        import tempfile
+        from PIL import Image
+        import live_control as lc
+
+        td = tempfile.mkdtemp()
+        old = lc.CHALLENGE_DIR
+        lc.CHALLENGE_DIR = td
+        try:
+            def png(color):
+                im = Image.new("RGB", (80, 80), color)
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                return buf.getvalue()
+
+            first = lc.save_challenge_png(png((255, 0, 0)), "q1")
+            second = lc.save_challenge_png(png((0, 255, 0)), "q2")
+            again = lc.save_challenge_png(png((255, 0, 0)), "q1-again")
+            self.assertTrue(first and second)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertEqual(first["id"], again["id"])
+            self.assertEqual(first["file"], again["file"])
+            files = [name for name in os.listdir(td) if name.endswith(".png")]
+            self.assertEqual(len(files), 2)
+            self.assertTrue(os.path.isfile(os.path.join(td, first["file"])))
+            self.assertTrue(os.path.isfile(os.path.join(td, second["file"])))
+        finally:
+            lc.CHALLENGE_DIR = old
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_rejects_incomplete(self):
+        import live_control as lc
+        self.assertEqual(lc.save_challenge_png("data:image/png;base64,abc"), {})
+        self.assertEqual(lc.save_challenge_png(b"\x89PNG\r\n\x1a\nxxxx"), {})
+
+    def test_image_src_keeps_challenge_url(self):
+        import live_control as lc
+        self.assertEqual(lc.image_src("/challenges/foo.png"), "/challenges/foo.png")
+        self.assertTrue(lc.image_src("abc").startswith("data:image/png;base64,"))
+
+
+class TestChallengeFilePath(unittest.TestCase):
+
+    def test_rejects_traversal(self):
+        import live_control as lc
+        self.assertEqual(lc.challenge_file_path("../secret.png"), "")
+        self.assertEqual(lc.challenge_file_path(".."), "")
+        self.assertEqual(lc.challenge_file_path("ok.txt"), "")
+        self.assertEqual(lc.challenge_file_path("not-there.png"), "")
+        self.assertEqual(lc.challenge_file_path(""), "")
+
+    def test_discord_register_url(self):
+        import live_control as lc
+        self.assertEqual(lc.DISCORD_REGISTER_URL, "https://discord.com/register")
+        self.assertTrue(os.path.isabs(lc.CHALLENGE_DIR))
+
+
+class TestTrainerChallengePersist(unittest.TestCase):
+
+    def test_clear_keeps_saved_files(self):
+        import base64
+        import io
+        import shutil
+        import tempfile
+        from PIL import Image
+        import live_control as lc
+        import trainer
+
+        td = tempfile.mkdtemp()
+        old = lc.CHALLENGE_DIR
+        lc.CHALLENGE_DIR = td
+        try:
+            im = Image.new("RGB", (80, 60), (1, 2, 3))
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            image = ("data:image/png;base64,"
+                     + base64.b64encode(buf.getvalue()).decode("ascii"))
+            eng = trainer.TrainerEngine()
+            eng.note_live_challenge(image, "Select all boats")
+            self.assertTrue(eng.saved_challenges)
+            rec = eng.saved_challenges[0]
+            path = os.path.join(td, rec["file"])
+            self.assertTrue(os.path.isfile(path))
+            url = eng.latest_challenge_image
+            self.assertTrue(url.startswith("/challenges/"))
+            kept = list(eng.saved_challenges)
+            eng.clear()
+            self.assertEqual(eng.latest_screenshot, "")
+            self.assertEqual(eng.saved_challenges, kept)
+            self.assertEqual(eng.latest_challenge_image, url)
+            self.assertTrue(os.path.isfile(path))
+        finally:
+            lc.CHALLENGE_DIR = old
+            shutil.rmtree(td, ignore_errors=True)
+
+
+class TestLiveUiRegister(unittest.TestCase):
+
+    def test_register_button_and_helper(self):
+        import live_ui
+        html = live_ui.LIVE_INJECTION
+        self.assertIn('id="liveRegBtn"', html)
+        self.assertIn("function lcGoRegister", html)
+        self.assertIn("https://discord.com/register", html)
+        self.assertIn("/challenges/", html)
+        self.assertIn("force:true", html)
 
 
 if __name__ == "__main__":
