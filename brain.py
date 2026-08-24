@@ -1669,10 +1669,11 @@ if __name__ == "__main__" and _in_notebook():
     if _TORCH:
         _dev = "cuda (GPU)" if torch.cuda.is_available() else "cpu (no GPU detected - enable the GPU accelerator)"
         print("[brain.py] ready. torch %s | device: %s" % (torch.__version__, _dev))
-        print("[brain.py] TRAIN in the NEXT cell with one of:")
-        print("              brain.main(['train', '--device', 'cuda', '--epochs', '12'])")
-        print("              brain.train_brain(device='cuda', epochs=12)")
-        print("[brain.py] quick smoke first:  brain.main(['smoke'])")
+        print("[brain.py] You PASTED this cell, so the functions are GLOBALS - call them")
+        print("[brain.py] directly with NO 'brain.' prefix. In the NEXT cell run:")
+        print("              main(['smoke'])                                        # quick check")
+        print("              main(['train', '--device', 'cuda', '--epochs', '12'])  # the ~98MB brain")
+        print("              train_brain(device='cuda', epochs=12)                  # ...or call directly")
     else:
         print("[brain.py] code loaded, but torch is NOT installed. Run this cell:")
         print("              !pip install torch numpy Pillow")
