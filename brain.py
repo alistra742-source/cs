@@ -98,7 +98,11 @@ import os
 import random
 import time
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# Works both as a script (ROOT = brain.py's dir) AND when pasted into a
+# Kaggle/Jupyter cell (where __file__ is undefined -> ROOT = the notebook's
+# working directory, so models/ and data land next to the notebook).
+ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() \
+    else os.getcwd()
 MODELS_DIR = os.environ.get("SOLVER_MODELS_DIR", os.path.join(ROOT, "models"))
 
 # torch is optional at import time: the inference wrapper degrades to

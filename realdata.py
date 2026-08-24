@@ -42,7 +42,8 @@ import random
 
 from PIL import Image, ImageEnhance, ImageFilter
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() \
+    else os.getcwd()
 SEARCH_DIR = os.path.join(ROOT, "image-search")
 REAL_DIR = os.environ.get("SOLVER_REAL_DIR", os.path.join(ROOT, "data_real"))
 
