@@ -863,6 +863,34 @@ def _move(t, device):
     return t.to(device, non_blocking=True)
 
 
+def _checkpoint(model, corpus, models_dir, epoch, verbose=True):
+    """Save brain.pt + brain.json after every epoch so an interrupt (Ctrl+C) or
+    a session timeout never loses progress. Writes weights + the full arch
+    sidecar (no held-out metrics - those are added by the final _save_brain).
+    BrainSolver can load this checkpoint as-is at any time."""
+    os.makedirs(models_dir, exist_ok=True)
+    pt = os.path.join(models_dir, "brain.pt")
+    torch.save(model.state_dict(), pt)
+    sidecar = {
+        "kind": "brain", "classes": CLASSES, "families": FAMILIES,
+        "n_classes": N_CLASSES,
+        "arch": {
+            "width": model.width,
+            "prompt_dim": model.prompt_dim,
+            "prompt_layers": model.prompt_layers,
+            "d_concept": model.d_concept,
+            "pattern_d": model.pattern_d,
+            "pattern_layers": model.pattern_layers,
+        },
+        "tile_size": corpus["tile_size"], "scene_size": corpus["scene_size"],
+        "epoch": epoch, "metrics": {}, "size_mb": os.path.getsize(pt) / 1e6,
+    }
+    with open(os.path.join(models_dir, "brain.json"), "w") as f:
+        json.dump(sidecar, f, indent=2)
+    if verbose:
+        print("    [checkpoint] models/brain.pt saved (after epoch %d)" % epoch)
+
+
 def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
                 device="cpu", corpus=None, corpus_kwargs=None,
                 models_dir=MODELS_DIR, verbose=True,
@@ -1104,6 +1132,9 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
         sched.step()
         log("  epoch %d/%d  mean_loss %.4f  (%d steps, %.0fs)" % (
             ep + 1, epochs, ep_loss / max(1, n_steps), n_steps, time.time() - t0))
+        # checkpoint after every epoch: an interrupt or session timeout then
+        # only costs the in-progress epoch, never the whole run.
+        _checkpoint(model, corpus, models_dir, ep + 1, verbose=verbose)
 
     metrics = eval_brain(model, corpus, device=device,
                          tile_va=tile_va, point_va_single=point_va_single,
