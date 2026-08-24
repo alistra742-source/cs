@@ -487,8 +487,8 @@ if _TORCH:
         """
 
         def __init__(self, n_classes=N_CLASSES, width=48,
-                     prompt_dim=496, prompt_layers=5, d_concept=256,
-                     pattern_d=256, pattern_layers=3,
+                     prompt_dim=512, prompt_layers=8, d_concept=320,
+                     pattern_d=320, pattern_layers=4,
                      n_families=len(FAMILIES)):
             super().__init__()
             self.n_classes = n_classes
@@ -594,8 +594,8 @@ def make_bbox_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     return img, meta
 
 
-def build_brain_corpus(per_class=600, n_point=7000, n_count=2000,
-                       n_drag=4000, n_grid=1500, n_pattern=600, n_bbox=3000,
+def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
+                       n_drag=9000, n_grid=3000, n_pattern=1500, n_bbox=7000,
                        tile_size=DEFAULT_TILE_SIZE, scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
     """Build the full multi-task corpus in memory.
@@ -732,12 +732,18 @@ def _prep_geom(batch_u8, targets, rng, flip=True):
     """Apply the SAME affine (rotate/scale/translate/flip) to images AND
     coordinate targets, so one round teaches a continuum of poses. Returns
     (float batch in [-1,1], augmented targets clamped 0..1) and per-sample
-    `scale` (so bbox sizes can be scaled consistently)."""
+    `scale` (so bbox sizes can be scaled consistently).
+
+    Device-safe: all auxiliary tensors are built on the batch's device and the
+    targets are moved there too, so it works on CUDA (the CPU-default
+    torch.zeros/eye/full/rand would otherwise mismatch a CUDA batch)."""
     B = batch_u8.shape[0]
-    theta = torch.zeros(B)
-    scale = torch.zeros(B)
-    txy = torch.zeros(B, 2)
-    flipm = torch.zeros(B, dtype=torch.bool)
+    dev = batch_u8.device
+    targets = targets.to(dev)
+    theta = torch.zeros(B, device=dev)
+    scale = torch.zeros(B, device=dev)
+    txy = torch.zeros(B, 2, device=dev)
+    flipm = torch.zeros(B, dtype=torch.bool, device=dev)
     for i in range(B):
         theta[i] = rng.uniform(-0.26, 0.26)        # +-15 deg
         scale[i] = rng.uniform(0.78, 1.28)
@@ -746,33 +752,37 @@ def _prep_geom(batch_u8, targets, rng, flip=True):
         flipm[i] = flip and rng.random() < 0.5
     cos, sin = torch.cos(theta), torch.sin(theta)
     R = torch.stack([cos, -sin, sin, cos], dim=1).view(B, 2, 2)
-    Fm = torch.eye(2).repeat(B, 1, 1)
+    Fm = torch.eye(2, device=dev).repeat(B, 1, 1)
     Fm[flipm, 0, 0] = -1.0
-    f = torch.zeros(B, 2)
+    f = torch.zeros(B, 2, device=dev)
     f[flipm, 0] = 1.0
-    c = torch.full((B, 2), 0.5)
+    c = torch.full((B, 2), 0.5, device=dev)
     A = scale.view(B, 1, 1) * (R @ Fm)
     b = (scale.view(B, 1, 1) * (R @ (f - c).unsqueeze(-1))).squeeze(-1) + c + txy
     tout = torch.einsum("bij,bkj->bki", A, targets) + b.unsqueeze(1)
     Ainv = torch.inverse(A)
-    M = torch.zeros(B, 2, 3)
+    M = torch.zeros(B, 2, 3, device=dev)
     M[:, :, :2] = Ainv
     M[:, :, 2] = (Ainv @ (1.0 - 2.0 * b).unsqueeze(-1)).squeeze(-1) - 1.0
     grid = F.affine_grid(M, batch_u8.shape, align_corners=False)
     xf = F.grid_sample(batch_u8.float() / 255.0, grid,
                        align_corners=False, padding_mode="border")
-    gain = 0.85 + 0.30 * torch.rand(B, 1, 1, 1)
+    gain = 0.85 + 0.30 * torch.rand(B, 1, 1, 1, device=dev)
     xf = (xf * gain).clamp(0, 1)
     return (xf - 0.5) / 0.5, tout.clamp(0.0, 1.0), scale
 
 
 def _jitter(batch_u8, flip=True):
-    """Photometric jitter + optional flip for the tile head (no coordinates)."""
+    """Photometric jitter + optional flip for the tile head (no coordinates).
+    Device-safe: every auxiliary tensor is created on the input's device, so it
+    works on CUDA (the default torch.rand/zeros land on CPU and would otherwise
+    mismatch a CUDA batch)."""
+    dev = batch_u8.device
     x = batch_u8.float() / 255.0
     if flip:
-        m = torch.rand(x.shape[0]) < 0.5
+        m = torch.rand(x.shape[0], device=dev) < 0.5
         x[m] = torch.flip(x[m], dims=[3])
-    gain = 0.85 + 0.30 * torch.rand(x.shape[0], 1, 1, 1)
+    gain = 0.85 + 0.30 * torch.rand(x.shape[0], 1, 1, 1, device=dev)
     x = (x * gain).clamp(0, 1)
     return (x - 0.5) / 0.5
 
@@ -840,8 +850,8 @@ def _move(t, device):
 def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
                 device="cpu", corpus=None, corpus_kwargs=None,
                 models_dir=MODELS_DIR, verbose=True,
-                prompt_dim=496, prompt_layers=5, d_concept=256,
-                pattern_d=256, pattern_layers=3):
+                prompt_dim=512, prompt_layers=8, d_concept=320,
+                pattern_d=320, pattern_layers=4):
     """Train every head of the Brain jointly.
 
     Each epoch cycles through the families (tile, point, count, drag, bbox,
@@ -894,16 +904,18 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
     router = corpus["router"]
     router_tr, router_va = _split(len(router))
 
-    def _step_count_metas(metas, ids):
-        """Build (target_cls, masks, l1_xy, single_rows) for a point/count batch."""
+    def _step_count_metas(metas, ids, device):
+        """Build (target_cls, masks-ready pts, valid, K) for a point/count
+        batch, on ``device``. pts carries -1 padding for unused instance
+        slots; valid marks the real ones (used to build the heatmap masks)."""
         K = 1
         for i in ids:
             K = max(K, len(_instances(metas[i])))
-        pts = torch.full((len(ids), K, 2), -1.0)
-        tc = torch.zeros(len(ids), dtype=torch.long)
+        pts = torch.full((len(ids), K, 2), -1.0, device=device)
+        tc = torch.zeros(len(ids), dtype=torch.long, device=device)
         for row, i in enumerate(ids):
             inst = _instances(metas[i])
-            pts[row, :len(inst)] = torch.tensor(inst)
+            pts[row, :len(inst)] = torch.tensor(inst, device=device)
             tc[row] = metas[i]["target_id"]
         valid = (pts >= 0).all(dim=2)
         return pts, tc, valid, K
@@ -935,7 +947,7 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
         # 2) POINT head — single + relational point rounds
         for s in range(math.ceil(len(point_tr) / batch)):
             b = point_tr[s * batch:(s + 1) * batch]
-            pts, tc, valid, K = _step_count_metas(corpus["point_m"], b)
+            pts, tc, valid, K = _step_count_metas(corpus["point_m"], b, device)
             x, tpts, _ = _prep_geom(_move(corpus["point_x"][b], device), pts,
                                     random.Random(seed * 100000 + ep * 1000 + s))
             feat = model.features(x)
@@ -943,12 +955,12 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
             masks = torch.zeros(len(b), Sfeat, Sfeat, device=device)
             cx = (tpts[:, :, 0] * Sfeat).long().clamp(0, Sfeat - 1)
             cy = (tpts[:, :, 1] * Sfeat).long().clamp(0, Sfeat - 1)
-            rows = torch.arange(len(b)).view(-1, 1).expand(len(b), K)
+            rows = torch.arange(len(b), device=device).view(-1, 1).expand(len(b), K)
             keep = valid.reshape(len(b), K)
             masks[rows[keep], cy[keep], cx[keep]] = 1.0
             single = masks.sum(dim=(1, 2)) == 1
             l1_xy = tpts.sum(dim=1) / keep.sum(dim=1, keepdim=True).clamp(min=1)
-            loss = _spatial_ce(hm, _move(tc, device), masks, l1_xy, single)
+            loss = _spatial_ce(hm, tc, masks, l1_xy, single)
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); n_steps += 1
 
@@ -956,7 +968,7 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
         if count_tr:
             for s in range(math.ceil(len(count_tr) / batch)):
                 b = count_tr[s * batch:(s + 1) * batch]
-                pts, tc, valid, K = _step_count_metas(corpus["count_m"], b)
+                pts, tc, valid, K = _step_count_metas(corpus["count_m"], b, device)
                 x, tpts, _ = _prep_geom(_move(corpus["count_x"][b], device), pts,
                                         random.Random(seed * 100000 + ep * 2000 + s))
                 feat = model.features(x)
@@ -964,12 +976,12 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
                 masks = torch.zeros(len(b), Sfeat, Sfeat, device=device)
                 cx = (tpts[:, :, 0] * Sfeat).long().clamp(0, Sfeat - 1)
                 cy = (tpts[:, :, 1] * Sfeat).long().clamp(0, Sfeat - 1)
-                rows = torch.arange(len(b)).view(-1, 1).expand(len(b), K)
+                rows = torch.arange(len(b), device=device).view(-1, 1).expand(len(b), K)
                 keep = valid.reshape(len(b), K)
                 masks[rows[keep], cy[keep], cx[keep]] = 1.0
                 single = masks.sum(dim=(1, 2)) == 1
                 l1_xy = tpts.sum(dim=1) / keep.sum(dim=1, keepdim=True).clamp(min=1)
-                loss = _spatial_ce(hm, _move(tc, device), masks, l1_xy, single)
+                loss = _spatial_ce(hm, tc, masks, l1_xy, single)
                 opt.zero_grad(); loss.backward(); opt.step()
                 ep_loss += loss.item(); n_steps += 1
 
@@ -996,7 +1008,7 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
             ctr = torch.tensor([[corpus["bbox_m"][i]["cx"],
                                  corpus["bbox_m"][i]["cy"]] for i in b])
             wh = torch.tensor([[corpus["bbox_m"][i]["w"],
-                                corpus["bbox_m"][i]["h"]] for i in b])
+                                corpus["bbox_m"][i]["h"]] for i in b], device=device)
             x, tctr, scl = _prep_geom(_move(corpus["bbox_x"][b], device),
                                       ctr.unsqueeze(1),
                                       random.Random(seed * 100000 + ep * 4000 + s))
@@ -1141,7 +1153,7 @@ def eval_brain(model, corpus, device="cpu", tile_va=None, point_va_single=None,
             x = _to_float(_move(corpus["point_x"][ids], device))
             feat = model.features(x)
             hm = model.heatmaps(feat)
-            sel = hm.gather(1, tc[list(b)].view(-1, 1, 1, 1).expand(
+            sel = hm.gather(1, tc[list(b)].to(device).view(-1, 1, 1, 1).expand(
                 -1, 1, *hm.shape[2:])).squeeze(1)
             pred = soft_argmax2d(sel)
             errs.extend(torch.linalg.norm(pred - ty[list(b)].to(device), dim=1).tolist())
@@ -1600,21 +1612,21 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default=None)
-    t.add_argument("--per_class", type=int, default=600)
-    t.add_argument("--n_point", type=int, default=7000)
-    t.add_argument("--n_count", type=int, default=2000)
-    t.add_argument("--n_drag", type=int, default=4000)
-    t.add_argument("--n_grid", type=int, default=1500)
-    t.add_argument("--n_pattern", type=int, default=600)
-    t.add_argument("--n_bbox", type=int, default=3000)
+    t.add_argument("--per_class", type=int, default=1000)
+    t.add_argument("--n_point", type=int, default=14000)
+    t.add_argument("--n_count", type=int, default=5000)
+    t.add_argument("--n_drag", type=int, default=9000)
+    t.add_argument("--n_grid", type=int, default=3000)
+    t.add_argument("--n_pattern", type=int, default=1500)
+    t.add_argument("--n_bbox", type=int, default=7000)
     # architecture knobs (the knowledge capacity). Defaults are sized so the
-    # saved checkpoint is ~98 MB, the bulk of it in the language brain + class
-    # ontology rather than a padded conv backbone.
-    t.add_argument("--prompt_dim", type=int, default=496)
-    t.add_argument("--prompt_layers", type=int, default=5)
-    t.add_argument("--d_concept", type=int, default=256)
-    t.add_argument("--pattern_d", type=int, default=256)
-    t.add_argument("--pattern_layers", type=int, default=3)
+    # saved checkpoint is ~150 MB (under the 200 MB cap), the bulk of it in the
+    # language brain + class ontology rather than a padded conv backbone.
+    t.add_argument("--prompt_dim", type=int, default=512)
+    t.add_argument("--prompt_layers", type=int, default=8)
+    t.add_argument("--d_concept", type=int, default=320)
+    t.add_argument("--pattern_d", type=int, default=320)
+    t.add_argument("--pattern_layers", type=int, default=4)
 
     e = sub.add_parser("eval", help="load models/brain.pt + held-out self-test")
     e.add_argument("--device", default=None)
@@ -1700,7 +1712,7 @@ if __name__ == "__main__" and _in_notebook():
         print("[brain.py] You PASTED this cell, so the functions are GLOBALS - call them")
         print("[brain.py] directly with NO 'brain.' prefix. In the NEXT cell run:")
         print("              main(['smoke'])                                        # quick check")
-        print("              main(['train', '--device', 'cuda', '--epochs', '12'])  # the ~98MB brain")
+        print("              main(['train', '--device', 'cuda', '--epochs', '12'])  # the ~150MB brain")
         print("              train_brain(device='cuda', epochs=12)                  # ...or call directly")
     else:
         print("[brain.py] code loaded, but torch is NOT installed. Run this cell:")
