@@ -20,6 +20,12 @@ data/used_proxies.json
 # regenerable solver corpora (make_dataset.py / make_challenges.py) - don't commit
 data_v2/
 
+# the Brain (brain.py) is a ~98 MB trained artifact — fully regenerable via
+# `python brain.py train`, so it is not committed (like the corpora above).
+# The three small offline models (tile/point/drag .pt) ARE committed (~2.7 MB).
+models/brain.pt
+models/brain.json
+
 # real photo corpus fetched via image search (docs: SOLVER.md);
 # third-party photos - never committed
 image-search/
