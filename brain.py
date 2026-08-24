@@ -851,7 +851,21 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
     """
     assert _TORCH, "torch is required to train the Brain"
     log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    # Resolve the device gracefully: if the user asked for cuda but this torch
+    # build has no CUDA (e.g. the CPU wheel got installed on a GPU machine),
+    # warn clearly and fall back to CPU instead of crashing on .to('cuda').
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif device.startswith("cuda") and not torch.cuda.is_available():
+        log("  [brain] WARNING: --device cuda requested, but this torch build has")
+        log("  [brain] no CUDA (it's the CPU wheel: %s)." % torch.__version__)
+        log("  [brain] On Kaggle: do NOT 'pip install torch' (CUDA torch is")
+        log("  [brain] preinstalled on GPU images) - restart the session to restore")
+        log("  [brain] it, or run:  !pip install -q torch --index-url "
+            "https://download.pytorch.org/whl/cu121")
+        log("  [brain] Falling back to CPU for now (will be slow).")
+        device = "cpu"
+    n_gpu = torch.cuda.device_count() if device.startswith("cuda") else 0
     if corpus is None:
         corpus = build_brain_corpus(seed=seed,
                                      **(corpus_kwargs or {}))
@@ -864,9 +878,10 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(1, epochs), eta_min=lr * 0.05)
-    log("== Brain: %.1fM params (%.1f MB fp32) | device %s ==" % (
+    log("== Brain: %.1fM params (%.1f MB fp32) | device %s%s ==" % (
         sum(p.numel() for p in model.parameters()) / 1e6,
-        model.param_mb(), device))
+        model.param_mb(), device,
+        (" (%d GPU)" % n_gpu) if n_gpu else ""))
 
     # held-out splits per family (every 20th index)
     tile_tr, tile_va = _split(len(corpus["tile_y"]))
@@ -1667,8 +1682,21 @@ if __name__ == "__main__" and _in_notebook():
     # never looks like it silently died, and tell the user exactly what to run
     # next.
     if _TORCH:
-        _dev = "cuda (GPU)" if torch.cuda.is_available() else "cpu (no GPU detected - enable the GPU accelerator)"
+        _n_gpu = torch.cuda.device_count()
+        if _n_gpu:
+            _dev = "cuda (%d GPU ready)" % _n_gpu
+        elif "+cpu" in torch.__version__:
+            _dev = "CPU-only torch build (%s) - GPU will NOT be used" % torch.__version__
+        else:
+            _dev = "cpu (no GPU detected - enable the GPU accelerator)"
         print("[brain.py] ready. torch %s | device: %s" % (torch.__version__, _dev))
+        if _n_gpu == 0 and "+cpu" in torch.__version__:
+            print("[brain.py] *** You installed the CPU-only torch wheel. On Kaggle,")
+            print("[brain.py]     don't 'pip install torch' - CUDA torch is preinstalled")
+            print("[brain.py]     on GPU images. Fix with EITHER:")
+            print("[brain.py]       (a) restart the session (reloads preinstalled CUDA torch), or")
+            print("[brain.py]       (b) !pip install -q torch --index-url https://download.pytorch.org/whl/cu121")
+            print("[brain.py]     then re-run this cell.")
         print("[brain.py] You PASTED this cell, so the functions are GLOBALS - call them")
         print("[brain.py] directly with NO 'brain.' prefix. In the NEXT cell run:")
         print("              main(['smoke'])                                        # quick check")
