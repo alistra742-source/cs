@@ -121,6 +121,49 @@ except Exception:  # pragma: no cover
     nn = None
     F = None
 
+
+def _bootstrap_siblings():
+    """Make brain.py self-sufficient when run outside the repo.
+
+    brain.py normally lives inside the repo next to hcaptcha_types.py,
+    make_dataset.py, make_challenges.py and realdata.py. When it is pasted
+    into a Kaggle/Jupyter cell (or copied elsewhere) those siblings are
+    missing and the imports below raise ModuleNotFoundError. Here we detect
+    that and clone the repo next to the notebook, then put it on sys.path —
+    so paste-and-run just works (Kaggle has internet on by default). All four
+    siblings are self-contained (stdlib + Pillow), so the clone is all that's
+    needed.
+    """
+    import sys
+    try:
+        import hcaptcha_types  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+    import subprocess
+    repo = "https://github.com/alistra742-source/cs.git"
+    branch = "arena/01a033e0-cs"
+    dst = os.path.join(ROOT, "_cs_repo")
+    if not os.path.isfile(os.path.join(dst, "hcaptcha_types.py")):
+        os.makedirs(ROOT, exist_ok=True)
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", branch, repo, dst],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:  # pragma: no cover
+            raise SystemExit(
+                "brain.py needs hcaptcha_types.py / make_dataset.py / "
+                "make_challenges.py / realdata.py from the repo and they "
+                "weren't importable. Auto-clone failed (%r).\n"
+                "Make sure internet is ON, or clone the repo first:\n"
+                "    !git clone -b %s %s\n"
+                "    import sys; sys.path.insert(0, 'cs')" % (e, branch, repo))
+    if dst not in sys.path:
+        sys.path.insert(0, dst)
+
+
+_bootstrap_siblings()
+
 import hcaptcha_types as hct
 import make_dataset as md
 
