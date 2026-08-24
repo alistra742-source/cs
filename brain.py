@@ -1573,7 +1573,7 @@ class BrainSolver:
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="The Brain — one unified model "
                                  "for every hCaptcha challenge family.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1607,7 +1607,7 @@ def main():
 
     s = sub.add_parser("smoke", help="tiny corpus, 1 epoch, CPU sanity check")
 
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     assert _TORCH, "torch is required: pip install torch numpy Pillow"
 
     if a.cmd == "train":
@@ -1648,5 +1648,21 @@ def main():
                                        n_bbox=120))
 
 
-if __name__ == "__main__":
+def _running_as_real_script():
+    """True only when launched as `python brain.py ...`, NOT when pasted into a
+    Kaggle/Jupyter cell.
+
+    In a notebook cell __name__ IS "__main__", so the usual guard would
+    auto-run main() and argparse would choke on Jupyter's kernel-JSON argv.
+    get_ipython() exists only in an interactive kernel, so we use it to tell
+    the two apart.
+    """
+    try:
+        get_ipython  # noqa: F821  (injected by IPython/Jupyter kernels)
+        return False
+    except NameError:
+        return True
+
+
+if __name__ == "__main__" and _running_as_real_script():
     main()
