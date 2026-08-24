@@ -1648,21 +1648,34 @@ def main(argv=None):
                                        n_bbox=120))
 
 
-def _running_as_real_script():
-    """True only when launched as `python brain.py ...`, NOT when pasted into a
-    Kaggle/Jupyter cell.
-
-    In a notebook cell __name__ IS "__main__", so the usual guard would
-    auto-run main() and argparse would choke on Jupyter's kernel-JSON argv.
-    get_ipython() exists only in an interactive kernel, so we use it to tell
-    the two apart.
-    """
+def _in_notebook():
+    """True inside an IPython/Jupyter kernel, False for a real `python
+    brain.py` launch. In a notebook cell __name__ IS "__main__", so the usual
+    guard would auto-run main() and argparse would choke on Jupyter's
+    kernel-JSON argv; get_ipython() exists only in an interactive kernel."""
     try:
         get_ipython  # noqa: F821  (injected by IPython/Jupyter kernels)
-        return False
-    except NameError:
         return True
+    except NameError:
+        return False
 
 
-if __name__ == "__main__" and _running_as_real_script():
+if __name__ == "__main__" and _in_notebook():
+    # Pasted into a Kaggle/Jupyter cell: this cell only DEFINES the Brain
+    # (it does NOT auto-train — auto-running the CLI here used to crash
+    # argparse on the kernel-JSON). Print a clear ready-message so the cell
+    # never looks like it silently died, and tell the user exactly what to run
+    # next.
+    if _TORCH:
+        _dev = "cuda (GPU)" if torch.cuda.is_available() else "cpu (no GPU detected - enable the GPU accelerator)"
+        print("[brain.py] ready. torch %s | device: %s" % (torch.__version__, _dev))
+        print("[brain.py] TRAIN in the NEXT cell with one of:")
+        print("              brain.main(['train', '--device', 'cuda', '--epochs', '12'])")
+        print("              brain.train_brain(device='cuda', epochs=12)")
+        print("[brain.py] quick smoke first:  brain.main(['smoke'])")
+    else:
+        print("[brain.py] code loaded, but torch is NOT installed. Run this cell:")
+        print("              !pip install torch numpy Pillow")
+        print("[brain.py] then restart the kernel and re-run the brain.py cell.")
+elif __name__ == "__main__":
     main()
