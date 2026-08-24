@@ -594,7 +594,7 @@ def make_bbox_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     return img, meta
 
 
-def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
+def build_brain_corpus(per_class=600, n_point=14000, n_count=5000,
                        n_drag=9000, n_grid=3000, n_pattern=1500, n_bbox=7000,
                        tile_size=DEFAULT_TILE_SIZE, scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
@@ -612,7 +612,8 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
     t0 = time.time()
 
     # ── tile classification: single painted tiles + real photos (fallback ok) ─
-    log("  tiles: %d/class x %d classes" % (per_class, N_CLASSES))
+    log("  tiles: %d/class x %d classes  (generating %d images...)" % (
+        per_class, N_CLASSES, per_class * N_CLASSES))
     tx = torch.empty((per_class * N_CLASSES, 3, tile_size, tile_size), dtype=torch.uint8)
     ty = torch.empty(per_class * N_CLASSES, dtype=torch.long)
     i = 0
@@ -622,10 +623,13 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
             tx[i] = _img_to_u8(md.render(name, tile_size, rng), tile_size)
             ty[i] = cid
             i += 1
+        if (cid + 1) % 5 == 0 or cid == N_CLASSES - 1:
+            log("    tiles: %d/%d classes done (%d images)" % (
+                cid + 1, N_CLASSES, i))
 
     # ── grid rounds: feed their 9 tiles through the SAME tile head ─────────
     grid_tiles, grid_labels = [], []
-    log("  grids: %d (each contributes 9 tile samples)" % n_grid)
+    log("  grids: generating %d (9 tiles each)..." % n_grid)
     for k in range(n_grid):
         rng = random.Random("grid|%d|%d" % (seed, k))
         img, meta = make_grid_round(rng, scene_size)
@@ -637,6 +641,9 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
             crop = img.crop((x0, y0, x0 + s, y0 + s))
             grid_tiles.append(_img_to_u8(crop, tile_size))
             grid_labels.append(CID[name])
+        if n_grid >= 1000 and (k + 1) % 500 == 0:
+            log("    grids: %d/%d" % (k + 1, n_grid))
+    log("    grids: done (%d)" % n_grid)
     if grid_tiles:
         gx = torch.stack(grid_tiles)
         gy = torch.tensor(grid_labels, dtype=torch.long)
@@ -645,6 +652,7 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
 
     # ── point + count rounds (heatmap head) ────────────────────────────────
     def _load_scenes(fn, n, kind):
+        log("  %s: generating %d..." % (kind, n))
         xs = torch.empty((n, 3, scene_size, scene_size), dtype=torch.uint8)
         metas = []
         for k in range(n):
@@ -652,7 +660,9 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
             img, meta = fn(rng, scene_size)
             xs[k] = _img_to_u8(img, scene_size)
             metas.append(meta)
-        log("  %s: %d" % (kind, n))
+            if n >= 4000 and (k + 1) % 2000 == 0:
+                log("    %s: %d/%d" % (kind, k + 1, n))
+        log("    %s: done (%d)" % (kind, n))
         return xs, metas
 
     point_x, point_m = _load_scenes(make_point_round, n_point, "point")
@@ -662,6 +672,7 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
     drag_x, drag_m = _load_scenes(make_drag_round, n_drag, "drag")
 
     # ── bbox rounds (bbox head) ────────────────────────────────────────────
+    log("  bbox: generating %d..." % n_bbox)
     bbox_x = torch.empty((n_bbox, 3, scene_size, scene_size), dtype=torch.uint8)
     bbox_m = []
     for k in range(n_bbox):
@@ -669,16 +680,21 @@ def build_brain_corpus(per_class=1000, n_point=14000, n_count=5000,
         img, meta = make_bbox_round(rng, scene_size)
         bbox_x[k] = _img_to_u8(img, scene_size)
         bbox_m.append(meta)
-    log("  bbox: %d" % n_bbox)
+        if n_bbox >= 4000 and (k + 1) % 2000 == 0:
+            log("    bbox: %d/%d" % (k + 1, n_bbox))
+    log("    bbox: done (%d)" % n_bbox)
 
     # ── pattern rounds (pattern reasoner): keep the big image + boxes ──────
+    log("  pattern: generating %d..." % n_pattern)
     pat_imgs, pat_m = [], []
     for k in range(n_pattern):
         rng = random.Random("pattern|%d|%d" % (seed, k))
         img, meta = make_pattern_round(rng, scene_size)
         pat_imgs.append(img)
         pat_m.append(meta)
-    log("  pattern: %d" % n_pattern)
+        if n_pattern >= 400 and (k + 1) % 200 == 0:
+            log("    pattern: %d/%d" % (k + 1, n_pattern))
+    log("    pattern: done (%d)" % n_pattern)
 
     # ── router training pairs (prompt -> family) from every round + extras ─
     router = []
@@ -1612,7 +1628,7 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default=None)
-    t.add_argument("--per_class", type=int, default=1000)
+    t.add_argument("--per_class", type=int, default=600)
     t.add_argument("--n_point", type=int, default=14000)
     t.add_argument("--n_count", type=int, default=5000)
     t.add_argument("--n_drag", type=int, default=9000)
