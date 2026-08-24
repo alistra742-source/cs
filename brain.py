@@ -947,9 +947,11 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
         ep_loss = 0.0
         n_steps = 0
         t0 = time.time()
+        log("  epoch %d/%d  training on %s ..." % (ep + 1, epochs, device))
 
         # 1) TILE head — single tiles + grid tiles
-        for s in range(math.ceil(len(tile_tr) / batch)):
+        n_tile_steps = math.ceil(len(tile_tr) / batch)
+        for s in range(n_tile_steps):
             b = tile_tr[s * batch:(s + 1) * batch]
             x = _jitter(_move(corpus["tile_x"][b], device))
             with torch.no_grad():
@@ -959,9 +961,13 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
                                    label_smoothing=0.05)
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); n_steps += 1
+            if n_tile_steps >= 300 and (s + 1) % 300 == 0:
+                log("    epoch %d  tiles %d/%d  loss %.3f" % (
+                    ep + 1, s + 1, n_tile_steps, loss.item()))
 
         # 2) POINT head — single + relational point rounds
-        for s in range(math.ceil(len(point_tr) / batch)):
+        n_pt_steps = math.ceil(len(point_tr) / batch)
+        for s in range(n_pt_steps):
             b = point_tr[s * batch:(s + 1) * batch]
             pts, tc, valid, K = _step_count_metas(corpus["point_m"], b, device)
             x, tpts, _ = _prep_geom(_move(corpus["point_x"][b], device), pts,
@@ -979,6 +985,9 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
             loss = _spatial_ce(hm, tc, masks, l1_xy, single)
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); n_steps += 1
+            if n_pt_steps >= 200 and (s + 1) % 200 == 0:
+                log("    epoch %d  point %d/%d  loss %.3f" % (
+                    ep + 1, s + 1, n_pt_steps, loss.item()))
 
         # 3) COUNT head — multi-instance count rounds through the same heatmap head
         if count_tr:
