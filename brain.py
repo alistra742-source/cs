@@ -420,6 +420,21 @@ if _TORCH:
             wh = torch.sigmoid(self.size(pooled))         # (B, 2) in 0..1
             return ctr, wh
 
+    class TextHead(nn.Module):
+        """text_entry ("Type the text you see"): pooled features -> one
+        36-way (A-Z0-9) classification per character position. Fixed 5-char
+        codes - the shape hCaptcha's text rounds use."""
+
+        def __init__(self, c_in, text_len=5, n_chars=36):
+            super().__init__()
+            self.text_len = text_len
+            self.n_chars = n_chars
+            self.fc = nn.Linear(c_in, text_len * n_chars)
+
+        def forward(self, feat):
+            pooled = F.adaptive_avg_pool2d(feat, 1).flatten(1)
+            return self.fc(pooled)
+
     class RouterHead(nn.Module):
         """Learned (prompt + image) -> family classifier.
 
@@ -489,6 +504,7 @@ if _TORCH:
         def __init__(self, n_classes=N_CLASSES, width=48,
                      prompt_dim=512, prompt_layers=8, d_concept=320,
                      pattern_d=320, pattern_layers=4,
+                     text_len=5,
                      n_families=len(FAMILIES)):
             super().__init__()
             self.n_classes = n_classes
@@ -498,6 +514,7 @@ if _TORCH:
             self.d_concept = d_concept
             self.pattern_d = pattern_d
             self.pattern_layers = pattern_layers
+            self.text_len = text_len
             self.n_families = n_families
             self.backbone = BrainBackbone(width)
             c = self.backbone.out_channels
@@ -507,6 +524,7 @@ if _TORCH:
             self.heatmap_head = HeatmapHead(c, n_classes)
             self.drag_head = DragHead(c)
             self.bbox_head = BBoxHead(c)
+            self.text_head = TextHead(c, text_len)
             self.router_head = RouterHead(c, prompt_dim, n_families)
             self.pattern_reasoner = PatternReasoner(
                 c, prompt_dim, d_concept, pattern_d, layers=pattern_layers)
@@ -527,6 +545,10 @@ if _TORCH:
 
         def bbox(self, feat):
             return self.bbox_head(feat)            # center (B,H,W), wh (B,2)
+
+        def text_logits(self, feat):
+            """(B, text_len*36) per-character logits for text rounds."""
+            return self.text_head(feat)
 
         def route(self, img_feat, prompt_vec):
             pool = F.adaptive_avg_pool2d(img_feat, 1).flatten(1)
@@ -573,6 +595,43 @@ def _img_to_u8(im, size):
 
 def _to_float(x):
     return (x.float() / 255.0 - 0.5) / 0.5
+
+
+def _count_peaks(chan, min_peak=0.08, min_sep=0.16, weak_gate=0.20,
+                 max_n=9, margin=0.04):
+    """Count instances from one class's presence channel (H, W).
+
+    Same self-gating peak counter as the production PointLocator.count: a
+    count answer is graded EXACTLY, so border-touching peaks, fragmented maps
+    or a weak weakest-peak return None (defer to the vision model). Shared by
+    BrainSolver.count and the held-out eval so both measure the same thing."""
+    H, W = chan.shape
+    peaks = []
+    for y in range(H):
+        for x in range(W):
+            v = float(chan[y, x])
+            if v < min_peak:
+                continue
+            y0, y1 = max(0, y - 1), min(H, y + 2)
+            x0, x1 = max(0, x - 1), min(W, x + 2)
+            if v < float(chan[y0:y1, x0:x1].max()):
+                continue
+            peaks.append((v, x, y))
+    peaks.sort(reverse=True)
+    kept = []
+    for v, x, y in peaks:
+        if all(max(abs(x - kx), abs(y - ky)) >= min_sep * W
+               for _, kx, ky in kept):
+            kept.append((v, x, y))
+    if not kept:
+        return None
+    for _, x, y in kept:
+        if (x / W) < margin or (x / W) > 1 - margin \
+                or (y / H) < margin or (y / H) > 1 - margin:
+            return None
+    if len(kept) >= max_n or kept[-1][0] < weak_gate:
+        return None
+    return len(kept)
 
 
 def make_bbox_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
@@ -749,9 +808,138 @@ def make_tower_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     return img, meta
 
 
+SHAPE_KINDS = ["star", "hexagon", "diamond", "cross", "arrow", "semicircle"]
+
+
+def _shape_points(kind, w, h):
+    """Polygon points for a drag-piece shape inside a w x h box."""
+    cx, cy = w / 2, h / 2
+    if kind == "star":
+        R, r = w * 0.48, w * 0.20
+        return [(cx + (R if i % 2 == 0 else r) * math.cos(-math.pi / 2 + i * math.pi / 5),
+                 cy + (R if i % 2 == 0 else r) * math.sin(-math.pi / 2 + i * math.pi / 5))
+                for i in range(10)]
+    if kind == "hexagon":
+        R = w * 0.46
+        return [(cx + R * math.cos(-math.pi / 2 + i * math.pi / 3),
+                 cy + R * math.sin(-math.pi / 2 + i * math.pi / 3))
+                for i in range(6)]
+    if kind == "diamond":
+        return [(cx, cy - h * 0.48), (cx + w * 0.48, cy),
+                (cx, cy + h * 0.48), (cx - w * 0.48, cy)]
+    if kind == "cross":
+        a, b = w * 0.30, w * 0.48
+        return [(cx - a, cy - b), (cx + a, cy - b), (cx + a, cy - a),
+                (cx + b, cy - a), (cx + b, cy + a), (cx + a, cy + a),
+                (cx + a, cy + b), (cx - a, cy + b), (cx - a, cy + a),
+                (cx - b, cy + a), (cx - b, cy - a), (cx - a, cy - a)]
+    if kind == "arrow":
+        return [(cx - w * 0.48, cy - h * 0.14), (cx, cy - h * 0.14),
+                (cx, cy - h * 0.48), (cx + w * 0.48, cy),
+                (cx, cy + h * 0.48), (cx, cy + h * 0.14),
+                (cx - w * 0.48, cy + h * 0.14)]
+    # semicircle: top-half arc + flat base
+    pts = [(cx + w * 0.46 * math.cos(math.pi + i * math.pi / 12),
+            cy + h * 0.46 * math.sin(math.pi + i * math.pi / 12))
+           for i in range(13)]
+    pts += [(cx + w * 0.46, cy + h * 0.34), (cx - w * 0.46, cy + h * 0.34)]
+    return pts
+
+
+def make_shape_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
+    """Extended-shape drag round: a punched slot of a less common shape (star,
+    hexagon, diamond, cross, arrow, semicircle) plus a matching loose piece
+    with a Move badge. Same piece->slot from/to supervision as the classic
+    drag rounds - this widens the drag head's shape vocabulary beyond
+    circle/square/triangle/puzzle."""
+    from make_challenges import _scene_bg
+    from PIL import ImageDraw, ImageFont
+    S = size
+    img = _scene_bg(S, rng)
+    d = ImageDraw.Draw(img)
+    kind = rng.choice(SHAPE_KINDS)
+    pw = S * rng.uniform(0.18, 0.28)
+    ph = pw * rng.uniform(0.9, 1.2)
+    tx, ty = rng.uniform(0.38, 0.72), rng.uniform(0.28, 0.68)
+    while True:
+        fx, fy = rng.uniform(0.15, 0.85), rng.uniform(0.15, 0.75)
+        if math.hypot(fx - tx, fy - ty) >= 0.34:
+            break
+    # punched slot: dark shape with a light outline ring
+    base = _shape_points(kind, pw, ph)
+    slot = [(x + tx * S - pw / 2, y + ty * S - ph / 2) for x, y in base]
+    d.polygon(slot, fill=(28, 28, 34), outline=(250, 250, 252))
+    # loose piece: vivid fill, same silhouette
+    col = tuple(rng.randint(60, 235) for _ in range(3))
+    piece = [(x + fx * S - pw / 2, y + fy * S - ph / 2) for x, y in base]
+    d.polygon(piece, fill=col, outline=tuple(int(v * 0.6) for v in col))
+    # "Move" badge above the piece
+    try:
+        font = ImageFont.load_default(size=max(9, S // 9))
+    except TypeError:
+        font = ImageFont.load_default()
+    tb = d.textbbox((0, 0), "Move", font=font)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    bx = int(fx * S - tw / 2)
+    by = max(2, int(fy * S - ph / 2 - th - 8))
+    d.rounded_rectangle([bx - 5, by - 3, bx + tw + 5, by + th + 4],
+                        radius=4, fill=(250, 250, 252),
+                        outline=(60, 60, 66))
+    d.text((bx, by), "Move", font=font, fill=(40, 40, 46))
+    prompt = rng.choice([
+        "Drag the element to the place where it fits best",
+        "Move the shape to the matching hole",
+        "Drag the piece to where it fits",
+    ])
+    meta = {"type": "shape", "prompt": prompt, "shape": kind,
+            "fx": round(fx, 4), "fy": round(fy, 4),
+            "tx": round(tx, 4), "ty": round(ty, 4)}
+    return img, meta
+
+
+TEXT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+TEXT_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"      # no I O 0 1 (ambiguous)
+
+
+def make_text_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
+    """text_entry round ("Type the text you see"): a 5-char code on a light
+    noisy background. Label = the code, one class per character position."""
+    from PIL import ImageDraw, ImageFont, ImageFilter
+    S = size
+    img = Image.new("RGB", (S, S), (rng.randint(232, 246),) * 3)
+    d = ImageDraw.Draw(img)
+    # speckle noise
+    for _ in range(rng.randint(60, 140)):
+        x, y = rng.randrange(S), rng.randrange(S)
+        v = rng.randint(190, 225)
+        d.point((x, y), fill=(v, v, v))
+    code = "".join(rng.choice(TEXT_CHARS) for _ in range(5))
+    try:
+        font = ImageFont.load_default(size=int(S * 0.40))
+    except TypeError:
+        font = ImageFont.load_default()
+    x = S * 0.10
+    for ch in code:
+        d.text((x, S * 0.26 + rng.uniform(-0.04, 0.04) * S), ch,
+               font=font, fill=(28, 30, 40))
+        x += S * 0.16
+    # a couple of distractor lines
+    for _ in range(2):
+        x0, y0 = rng.randrange(S), rng.randrange(S)
+        x1, y1 = rng.randrange(S), rng.randrange(S)
+        d.line([x0, y0, x1, y1],
+               fill=(rng.randint(150, 190),) * 3, width=1)
+    img = img.filter(ImageFilter.GaussianBlur(0.4))
+    meta = {"type": "text", "text": code,
+            "prompt": rng.choice(["Type the text you see",
+                                  "Enter the code below",
+                                  "Type the characters you see"])}
+    return img, meta
+
+
 def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
-                       n_drag=9000, n_grid=6000, n_pattern=4000, n_bbox=7000,
-                       n_pipe=3000, n_tower=3000,
+                       n_drag=9000, n_grid=6000, n_pattern=6000, n_bbox=7000,
+                       n_pipe=3000, n_tower=3000, n_shape=3000, n_text=4000,
                        tile_size=DEFAULT_TILE_SIZE, scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
     """Build the full multi-task corpus in memory.
@@ -827,11 +1015,13 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     # ── drag rounds (drag head) ────────────────────────────────────────────
     drag_x, drag_m = _load_scenes(make_drag_round, n_drag, "drag")
 
-    # ── pipe + tower rounds: same piece->slot from/to supervision, different
-    # imagery ("drag the pipe to where it fits" / wood towers). They join the
-    # drag training pool so the drag head learns all three looks. ───────────
+    # ── pipe + tower + extended-shape rounds: same piece->slot from/to
+    # supervision, different imagery ("drag the pipe to where it fits" /
+    # wood towers / star-hexagon-diamond-cross-arrow pieces). They join the
+    # drag training pool so the drag head learns all the looks. ───────────
     for kind, fn, n in (("pipe", make_pipe_round, n_pipe),
-                        ("tower", make_tower_round, n_tower)):
+                        ("tower", make_tower_round, n_tower),
+                        ("shape", make_shape_round, n_shape)):
         if n <= 0:
             continue
         log("  %s: generating %d..." % (kind, n))
@@ -847,6 +1037,25 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         log("    %s: done (%d)" % (kind, n))
         drag_x = torch.cat([drag_x, kx])
         drag_m = drag_m + km
+
+    # ── text rounds (text head): 5-char codes ─────────────────────────────
+    if n_text > 0:
+        log("  text: generating %d..." % n_text)
+        text_x = torch.empty((n_text, 3, scene_size, scene_size),
+                             dtype=torch.uint8)
+        text_m = []
+        for k in range(n_text):
+            rng = random.Random("text|%d|%d" % (seed, k))
+            img, meta = make_text_round(rng, scene_size)
+            text_x[k] = _img_to_u8(img, scene_size)
+            text_m.append(meta)
+            if n_text >= 2000 and (k + 1) % 1000 == 0:
+                log("    text: %d/%d" % (k + 1, n_text))
+        log("    text: done (%d)" % n_text)
+    else:
+        text_x = torch.empty((0, 3, scene_size, scene_size),
+                             dtype=torch.uint8)
+        text_m = []
 
     # ── bbox rounds (bbox head) ────────────────────────────────────────────
     log("  bbox: generating %d..." % n_bbox)
@@ -890,6 +1099,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         router.append((m.get("prompt", ""), PATTERN))
     for m in bbox_m:
         router.append((m.get("prompt", ""), AREA_BBOX))
+    for m in text_m:
+        router.append((m.get("prompt", ""), TEXT_ENTRY))
     _BIN_T = ("Please click each image containing a {n}",
               "Select all tiles with a {n}",
               "Pick every image that shows a {n}")
@@ -940,6 +1151,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         "count_x": count_x, "count_m": count_m,
         "drag_x": drag_x, "drag_m": drag_m,
         "bbox_x": bbox_x, "bbox_m": bbox_m,
+        "text_x": text_x, "text_m": text_m,
         "pat_imgs": pat_imgs, "pat_m": pat_m,
         "router": router,
         "tile_size": tile_size, "scene_size": scene_size,
@@ -1087,6 +1299,7 @@ def _checkpoint(model, corpus, models_dir, epoch, verbose=True):
             "d_concept": model.d_concept,
             "pattern_d": model.pattern_d,
             "pattern_layers": model.pattern_layers,
+            "text_len": model.text_len,
         },
         "tile_size": corpus["tile_size"], "scene_size": corpus["scene_size"],
         "epoch": epoch, "metrics": {}, "size_mb": os.path.getsize(pt) / 1e6,
@@ -1147,9 +1360,11 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
     tile_tr, tile_va = _split(len(corpus["tile_y"]))
     point_tr, point_va = _split(len(corpus["point_m"]))
     point_va_single = [i for i in point_va if corpus["point_m"][i].get("type") != "count"]
-    count_tr = [i for i, m in enumerate(corpus["count_m"])]  # count joins point head
+    count_tr, count_va = _split(len(corpus["count_m"]))   # count joins point head
     drag_tr, drag_va = _split(len(corpus["drag_m"]))
     bbox_tr, bbox_va = _split(len(corpus["bbox_m"]))
+    text_tr, text_va = (_split(len(corpus["text_m"]))
+                        if len(corpus["text_m"]) else ([], []))
     pat_tr, pat_va = _split(len(corpus["pat_m"]))
     router = corpus["router"]
     router_tr, router_va = _split(len(router))
@@ -1281,6 +1496,24 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
             opt.zero_grad(); loss.backward(); opt.step()
             ep_loss += loss.item(); n_steps += 1
 
+        # 5.5) TEXT head - "type the text you see" codes (per-char CE)
+        if text_tr:
+            for s in range(math.ceil(len(text_tr) / batch)):
+                b = text_tr[s * batch:(s + 1) * batch]
+                x = _jitter(_move(corpus["text_x"][b], device), flip=False)
+                feat = model.features(x)
+                logits = model.text_logits(feat).view(
+                    len(b), model.text_head.text_len, model.text_head.n_chars)
+                tgt = torch.tensor(
+                    [[TEXT_ALPHABET.index(ch) for ch in corpus["text_m"][i]["text"]]
+                     for i in b], device=device)
+                loss = F.cross_entropy(
+                    logits.reshape(len(b) * model.text_head.text_len,
+                                   model.text_head.n_chars),
+                    tgt.reshape(-1))
+                opt.zero_grad(); loss.backward(); opt.step()
+                ep_loss += loss.item(); n_steps += 1
+
         # 6) PATTERN reasoner — set-transformer over cells + candidates
         pat_batch = max(4, batch // 4)
         for s in range(math.ceil(len(pat_tr) / pat_batch)):
@@ -1347,6 +1580,7 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
     metrics = eval_brain(model, corpus, device=device,
                          tile_va=tile_va, point_va_single=point_va_single,
                          drag_va=drag_va, bbox_va=bbox_va, pat_va=pat_va,
+                         count_va=count_va, text_va=text_va,
                          router_va=router_va, verbose=verbose)
     _save_brain(model, metrics, corpus, models_dir)
     return model, metrics
@@ -1368,6 +1602,7 @@ def _save_brain(model, metrics, corpus, models_dir):
             "d_concept": model.d_concept,
             "pattern_d": model.pattern_d,
             "pattern_layers": model.pattern_layers,
+            "text_len": model.text_len,
         },
         "tile_size": corpus["tile_size"], "scene_size": corpus["scene_size"],
         "metrics": metrics,
@@ -1386,8 +1621,8 @@ def _save_brain(model, metrics, corpus, models_dir):
 
 @torch.no_grad()
 def eval_brain(model, corpus, device="cpu", tile_va=None, point_va_single=None,
-               drag_va=None, bbox_va=None, pat_va=None, router_va=None,
-               verbose=True):
+               drag_va=None, bbox_va=None, pat_va=None, count_va=None,
+               text_va=None, router_va=None, verbose=True):
     log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
     model.eval()
     tile_size = corpus["tile_size"]
@@ -1458,6 +1693,42 @@ def eval_brain(model, corpus, device="cpu", tile_va=None, point_va_single=None,
             good += int(d <= 0.10 and sd <= 0.25)
         metrics["bbox_acc"] = good / len(bbox_va)
         log("  bbox acc:       %.3f" % metrics["bbox_acc"])
+
+    # count exact accuracy (self-gated peak counter, same as inference)
+    if count_va:
+        answered = exact = 0
+        for i in count_va:
+            m = corpus["count_m"][i]
+            x = _to_float(_move(corpus["count_x"][i:i + 1], device))
+            hm = model.heatmaps(model.features(x))          # (1, C+1, H, W)
+            presence = F.softmax(hm, dim=1)[:, :-1]         # drop background
+            n = _count_peaks(presence[0, m["target_id"]])
+            if n is None:
+                continue                                    # self-gated
+            answered += 1
+            exact += int(n == m["count"])
+        metrics["count_exact"] = exact / max(1, answered)
+        metrics["count_answer_rate"] = answered / len(count_va)
+        log("  count exact:   %.3f (answers %.0f%% of rounds)" % (
+            metrics["count_exact"], 100 * metrics["count_answer_rate"]))
+
+    # text codes: exact 5-char match + per-character accuracy
+    if text_va:
+        exact = chars_ok = chars_n = 0
+        for i in text_va:
+            m = corpus["text_m"][i]
+            x = _to_float(_move(corpus["text_x"][i:i + 1], device))
+            logits = model.text_logits(model.features(x)).view(
+                1, model.text_head.text_len, model.text_head.n_chars)
+            pred = logits.argmax(dim=2)[0].tolist()
+            got = "".join(TEXT_ALPHABET[p] for p in pred)
+            exact += int(got == m["text"])
+            chars_ok += sum(a == b for a, b in zip(got, m["text"]))
+            chars_n += len(m["text"])
+        metrics["text_exact"] = exact / len(text_va)
+        metrics["text_char_acc"] = chars_ok / max(1, chars_n)
+        log("  text exact:    %.3f  per-char %.3f" % (
+            metrics["text_exact"], metrics["text_char_acc"]))
 
     # pattern candidate accuracy (the learned reasoner)
     if pat_va:
@@ -1552,12 +1823,14 @@ class BrainSolver:
             d_concept = int(arch.get("d_concept", 256))
             pattern_d = int(arch.get("pattern_d", 256))
             pattern_layers = int(arch.get("pattern_layers", 3))
+            text_len = int(arch.get("text_len", 5))
             n = len(self.classes)
             # Rebuild with the EXACT architecture recorded at train time, so
             # the state_dict always fits — no shape mismatches at load.
             self.model = Brain(n, width=self.width, prompt_dim=prompt_dim,
                                prompt_layers=prompt_layers, d_concept=d_concept,
                                pattern_d=pattern_d, pattern_layers=pattern_layers,
+                               text_len=text_len,
                                n_families=len(self.families))
             self.model.load_state_dict(torch.load(pt, map_location=self.device))
             self.model.to(self.device).eval()
@@ -1720,6 +1993,17 @@ class BrainSolver:
         cx, cy = float(c[0]), float(c[1])
         return {"x": cx - w / 2, "y": cy - h / 2, "w": w, "h": h}
 
+    # ── Text codes ("Type the text you see") ──────────────────────────────
+    @torch.no_grad()
+    def read_text(self, image):
+        """Read a text-entry code image -> the decoded string."""
+        if not self.available:
+            return None
+        logits = self.model.text_logits(self._feat(image, self.size)).view(
+            1, self.model.text_head.text_len, self.model.text_head.n_chars)
+        pred = logits.argmax(dim=2)[0].tolist()
+        return "".join(TEXT_ALPHABET[p] for p in pred)
+
     # ── Pattern reasoner ──────────────────────────────────────────────────
     @torch.no_grad()
     def solve_pattern(self, image, cell_boxes, cand_boxes, prompt=""):
@@ -1800,6 +2084,10 @@ class BrainSolver:
                         if bb else None)
             if family == hct.COUNT:
                 return self._solve_count(image, prompt)
+            if family == hct.TEXT_ENTRY:
+                code = self.read_text(image)
+                return ({"family": TEXT_ENTRY, "answer": code,
+                         "confidence": 0.9} if code else None)
             if family == PATTERN:
                 return self._solve_pattern(image, cell_boxes, cand_boxes, prompt)
             if family in (hct.DRAG_DROP, TOWER):
@@ -1885,6 +2173,8 @@ def main(argv=None):
     t.add_argument("--n_bbox", type=int, default=7000)
     t.add_argument("--n_pipe", type=int, default=3000)
     t.add_argument("--n_tower", type=int, default=3000)
+    t.add_argument("--n_shape", type=int, default=3000)
+    t.add_argument("--n_text", type=int, default=4000)
     # architecture knobs (the knowledge capacity). Defaults are sized so the
     # saved checkpoint is ~150 MB (under the 200 MB cap), the bulk of it in the
     # language brain + class ontology rather than a padded conv backbone.
@@ -1913,11 +2203,13 @@ def main(argv=None):
                                        n_count=a.n_count, n_drag=a.n_drag,
                                        n_grid=a.n_grid, n_pattern=a.n_pattern,
                                        n_bbox=a.n_bbox, n_pipe=a.n_pipe,
-                                       n_tower=a.n_tower))
+                                       n_tower=a.n_tower, n_shape=a.n_shape,
+                                       n_text=a.n_text))
     elif a.cmd == "eval":
         corpus = build_brain_corpus(per_class=60, n_point=400, n_count=200,
                                     n_drag=400, n_grid=150, n_pattern=80,
-                                    n_bbox=300, seed=a.seed)
+                                    n_bbox=300, n_pipe=150, n_tower=150,
+                                    n_shape=150, n_text=300, seed=a.seed)
         solver = BrainSolver()
         if not solver.available:
             print("no models/brain.pt — run `python brain.py train` first")
@@ -1940,7 +2232,8 @@ def main(argv=None):
                     pattern_d=64, pattern_layers=2,
                     corpus_kwargs=dict(per_class=20, n_point=200, n_count=80,
                                        n_drag=200, n_grid=60, n_pattern=40,
-                                       n_bbox=120, n_pipe=40, n_tower=40))
+                                       n_bbox=120, n_pipe=40, n_tower=40,
+                                       n_shape=40, n_text=60))
 
 
 def _in_notebook():
