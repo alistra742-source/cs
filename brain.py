@@ -1495,9 +1495,9 @@ class BrainSolver:
     def locate_drag(self, image):
         if not self.available:
             return None
-        hm = self.model.drag_maps(self._feat(image, self.size)).squeeze(0)
-        pf = soft_argmax2d(hm[0])[0]
-        pt = soft_argmax2d(hm[1])[0]
+        hm = self.model.drag_maps(self._feat(image, self.size))  # (1, 2, H, W)
+        pf = soft_argmax2d(hm[:, 0])[0]
+        pt = soft_argmax2d(hm[:, 1])[0]
         return {"from": (float(pf[0]), float(pf[1])),
                 "to": (float(pt[0]), float(pt[1]))}
 
