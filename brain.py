@@ -594,8 +594,164 @@ def make_bbox_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     return img, meta
 
 
-def build_brain_corpus(per_class=600, n_point=14000, n_count=5000,
-                       n_drag=9000, n_grid=3000, n_pattern=1500, n_bbox=7000,
+def make_pipe_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
+    """"Drag the pipe to where it fits" — a pipe run (horizontal or vertical)
+    with a missing section (the slot), plus a loose pipe segment carrying a
+    Move badge. Same piece->slot from/to supervision as the drag rounds, on
+    plumbing imagery, so the drag head learns pipes explicitly."""
+    from make_challenges import _scene_bg
+    from PIL import ImageDraw, ImageFont
+    S = size
+    img = _scene_bg(S, rng)
+    d = ImageDraw.Draw(img)
+    metals = [(146, 150, 156), (170, 174, 180), (122, 126, 134),
+              (158, 150, 138), (132, 140, 148)]
+    col = metals[rng.randrange(len(metals))]
+    dark = tuple(int(v * 0.62) for v in col)
+    light = tuple(min(255, int(v * 1.25)) for v in col)
+
+    pd = S * rng.uniform(0.09, 0.13)        # pipe diameter
+    seg = S * rng.uniform(0.17, 0.25)       # gap length == piece length
+    horiz = rng.random() < 0.5
+
+    def draw_pipe(x0, y0, x1, y1):
+        d.rectangle([x0, y0, x1, y1], fill=col, outline=dark, width=2)
+        if y1 - y0 > 0:                       # cylinder highlight
+            hy = y0 + (y1 - y0) * 0.28
+            d.line([x0 + 2, hy, x1 - 2, hy], fill=light, width=2)
+
+    def flange(x, y):
+        fw = pd * 0.28
+        d.rectangle([x - fw / 2, y - pd * 0.12, x + fw / 2, y + pd * 1.12],
+                    fill=dark, outline=tuple(int(v * 0.8) for v in dark),
+                    width=1)
+
+    if horiz:
+        ry = S * rng.uniform(0.30, 0.68)     # run centre y
+        gx = S * rng.uniform(0.36, 0.62)     # gap centre x
+        draw_pipe(S * 0.06, ry - pd / 2, gx - seg / 2, ry + pd / 2)
+        draw_pipe(gx + seg / 2, ry - pd / 2, S * 0.94, ry + pd / 2)
+        flange(gx - seg / 2, ry - pd / 2)
+        flange(gx + seg / 2, ry - pd / 2)
+        tx, ty = gx / S, ry / S
+        px = S * rng.uniform(0.18, 0.80)
+        py = S * rng.uniform(0.08, 0.22) if ry > S * 0.45 else S * rng.uniform(0.78, 0.92)
+        draw_pipe(px - seg / 2, py - pd / 2, px + seg / 2, py + pd / 2)
+        ptop = py - pd / 2
+    else:
+        rx = S * rng.uniform(0.30, 0.68)
+        gy = S * rng.uniform(0.36, 0.62)
+        draw_pipe(rx - pd / 2, S * 0.06, rx + pd / 2, gy - seg / 2)
+        draw_pipe(rx - pd / 2, gy + seg / 2, rx + pd / 2, S * 0.94)
+        flange(rx - pd / 2, gy - seg / 2)
+        flange(rx - pd / 2, gy + seg / 2)
+        tx, ty = rx / S, gy / S
+        py = S * rng.uniform(0.18, 0.80)
+        px = S * rng.uniform(0.08, 0.22) if rx > S * 0.45 else S * rng.uniform(0.78, 0.92)
+        draw_pipe(px - pd / 2, py - seg / 2, px + pd / 2, py + seg / 2)
+        ptop = py - seg / 2
+
+    # "Move" badge above the loose piece
+    try:
+        font = ImageFont.load_default(size=max(9, S // 9))
+    except TypeError:
+        font = ImageFont.load_default()
+    tb = d.textbbox((0, 0), "Move", font=font)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    bx = int(px - tw / 2)
+    by = max(2, int(ptop - th - 8))
+    d.rounded_rectangle([bx - 5, by - 3, bx + tw + 5, by + th + 4],
+                        radius=4, fill=(250, 250, 252),
+                        outline=(60, 60, 66))
+    d.text((bx, by), "Move", font=font, fill=(40, 40, 46))
+
+    prompt = rng.choice([
+        "Drag the pipe to where it fits",
+        "Drag the pipe segment to the place where it fits",
+        "Move the pipe to where it fits best",
+    ])
+    meta = {"type": "pipe", "prompt": prompt,
+            "fx": round(px / S, 4), "fy": round(py / S, 4),
+            "tx": round(tx, 4), "ty": round(ty, 4)}
+    return img, meta
+
+
+def make_tower_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
+    """Wooden-block tower round ('Move the correct missing block segment onto
+    the incomplete tower'): three wood stacks, one clearly the shortest (the
+    drop target), plus a loose 1-2 block piece on the right with a Move badge.
+    Label = normalised (fx, fy) piece centre and (tx, ty) where the piece sits
+    on top of the short stack - the from/to the drag head predicts."""
+    from make_challenges import _scene_bg
+    from PIL import ImageDraw, ImageFont
+    S = size
+    img = _scene_bg(S, rng)
+    d = ImageDraw.Draw(img)
+    woods = [(150, 106, 60), (168, 124, 72), (134, 94, 52),
+             (180, 136, 86), (144, 100, 58)]
+
+    bw = S * rng.uniform(0.11, 0.15)         # block width
+    bh = S * rng.uniform(0.075, 0.105)       # block height
+    bottom = S * rng.uniform(0.78, 0.88)
+    short_h = rng.randint(1, 3)
+    short_i = rng.randrange(3)
+    heights = [rng.randint(short_h + 1, short_h + 3) for _ in range(3)]
+    heights[short_i] = short_h
+    xs = [S * rng.uniform(0.08, 0.14), S * rng.uniform(0.28, 0.34),
+          S * rng.uniform(0.48, 0.54)]
+    tops = []
+    for x, h in zip(xs, heights):
+        col = woods[rng.randrange(len(woods))]
+        for k in range(h):
+            y0 = bottom - (k + 1) * bh
+            y1 = bottom - k * bh
+            c = tuple(min(255, v + rng.randint(-10, 10)) for v in col)
+            oc = tuple(int(v * 0.62) for v in c)
+            d.rectangle([x, y0, x + bw, y1], fill=c, outline=oc, width=2)
+            d.line([x + 2, y0 + bh / 2, x + bw - 2, y0 + bh / 2],
+                   fill=tuple(int(v * 0.78) for v in c), width=1)
+        tops.append(bottom - h * bh)
+
+    ph = rng.choice([1, 1, 2])               # piece height in blocks
+    px = S * rng.uniform(0.76, 0.86)
+    ptop = S * rng.uniform(0.28, 0.55)
+    pcol = woods[rng.randrange(len(woods))]
+    for k in range(ph):
+        y0 = ptop + k * bh
+        c = tuple(min(255, v + rng.randint(-10, 10)) for v in pcol)
+        d.rectangle([px, y0, px + bw, y0 + bh], fill=c,
+                    outline=tuple(int(v * 0.62) for v in c), width=2)
+        d.line([px + 2, y0 + bh / 2, px + bw - 2, y0 + bh / 2],
+               fill=tuple(int(v * 0.78) for v in c), width=1)
+    try:
+        font = ImageFont.load_default(size=max(9, S // 9))
+    except TypeError:
+        font = ImageFont.load_default()
+    tb = d.textbbox((0, 0), "Move", font=font)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    bx = int(px + bw / 2 - tw / 2)
+    by = max(2, int(ptop - th - 8))
+    d.rounded_rectangle([bx - 5, by - 3, bx + tw + 5, by + th + 4],
+                        radius=4, fill=(250, 250, 252),
+                        outline=(60, 60, 66))
+    d.text((bx, by), "Move", font=font, fill=(40, 40, 46))
+
+    fx, fy = (px + bw / 2) / S, (ptop + ph * bh / 2) / S
+    tx, ty = (xs[short_i] + bw / 2) / S, (tops[short_i] - ph * bh / 2) / S
+    prompt = rng.choice([
+        "Move the correct missing block segment onto the incomplete tower",
+        "Move the missing block segment onto the incomplete tower",
+        "Put the missing block segment onto the incomplete tower",
+    ])
+    meta = {"type": "tower", "prompt": prompt,
+            "fx": round(fx, 4), "fy": round(fy, 4),
+            "tx": round(tx, 4), "ty": round(ty, 4)}
+    return img, meta
+
+
+def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
+                       n_drag=9000, n_grid=6000, n_pattern=4000, n_bbox=7000,
+                       n_pipe=3000, n_tower=3000,
                        tile_size=DEFAULT_TILE_SIZE, scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
     """Build the full multi-task corpus in memory.
@@ -671,6 +827,27 @@ def build_brain_corpus(per_class=600, n_point=14000, n_count=5000,
     # ── drag rounds (drag head) ────────────────────────────────────────────
     drag_x, drag_m = _load_scenes(make_drag_round, n_drag, "drag")
 
+    # ── pipe + tower rounds: same piece->slot from/to supervision, different
+    # imagery ("drag the pipe to where it fits" / wood towers). They join the
+    # drag training pool so the drag head learns all three looks. ───────────
+    for kind, fn, n in (("pipe", make_pipe_round, n_pipe),
+                        ("tower", make_tower_round, n_tower)):
+        if n <= 0:
+            continue
+        log("  %s: generating %d..." % (kind, n))
+        kx = torch.empty((n, 3, scene_size, scene_size), dtype=torch.uint8)
+        km = []
+        for k in range(n):
+            rng = random.Random("%s|%d|%d" % (kind, seed, k))
+            img, meta = fn(rng, scene_size)
+            kx[k] = _img_to_u8(img, scene_size)
+            km.append(meta)
+            if n >= 2000 and (k + 1) % 1000 == 0:
+                log("    %s: %d/%d" % (kind, k + 1, n))
+        log("    %s: done (%d)" % (kind, n))
+        drag_x = torch.cat([drag_x, kx])
+        drag_m = drag_m + km
+
     # ── bbox rounds (bbox head) ────────────────────────────────────────────
     log("  bbox: generating %d..." % n_bbox)
     bbox_x = torch.empty((n_bbox, 3, scene_size, scene_size), dtype=torch.uint8)
@@ -696,32 +873,61 @@ def build_brain_corpus(per_class=600, n_point=14000, n_count=5000,
             log("    pattern: %d/%d" % (k + 1, n_pattern))
     log("    pattern: done (%d)" % n_pattern)
 
-    # ── router training pairs (prompt -> family) from every round + extras ─
+    # ── router training pairs (prompt -> family) ──────────────────────────
+    # Round-derived pairs (one per round) plus a BALANCED synthetic set: the
+    # round prompts skew heavily toward point/drag, which is why the router
+    # sat at ~81%. The synthetic set covers all 9 families with many wordings
+    # and every class name, so the router sees each family often.
     router = []
     for m in point_m:
         router.append((m.get("prompt", ""), AREA_POINT))
     for m in count_m:
         router.append((m.get("prompt", ""), COUNT))
     for m in drag_m:
-        router.append((m.get("prompt", ""), DRAG_DROP))
+        fam = TOWER if m.get("type") == "tower" else DRAG_DROP
+        router.append((m.get("prompt", ""), fam))
     for m in pat_m:
         router.append((m.get("prompt", ""), PATTERN))
     for m in bbox_m:
         router.append((m.get("prompt", ""), AREA_BBOX))
-    # hand pairs for families with no offline image supervision
-    for p in ["Please click each image containing a bus",
-              "Select all tiles with a cat", "Pick the images showing a tree"]:
-        router.append((p, BINARY))
-    for p in ["Draw a box around the cat's head", "Box the largest object"]:
+    _BIN_T = ("Please click each image containing a {n}",
+              "Select all tiles with a {n}",
+              "Pick every image that shows a {n}")
+    _CNT_T = ("How many {n}s are in this image?",
+              "Count the {n}s in the image",
+              "What number of {n}s do you see?")
+    _PT_T = ("Please click on the {n}", "Click the {n}",
+             "Please click on the {n} in the image")
+    for name in CLASSES:
+        for t in _BIN_T:
+            router.append((t.format(n=name), BINARY))
+        for t in _CNT_T:
+            router.append((t.format(n=name), COUNT))
+        for t in _PT_T:
+            router.append((t.format(n=name), AREA_POINT))
+    for p in ["Draw a box around the cat's head", "Box the largest object",
+              "Draw a rectangle around the bird",
+              "Please draw a box around the dog",
+              "Draw a box around the object"]:
         router.append((p, AREA_BBOX))
+    for p in ["Drag the element to the place where it fits best",
+              "Move the shape into its matching hole",
+              "Drag the piece to where it belongs",
+              "Drag the pipe to where it fits"]:
+        router.append((p, DRAG_DROP))
+    for p in ["Put one of the animals into the empty spot to complete the "
+              "pattern", "Complete the pattern by dragging the right tile",
+              "Which tile completes the pattern?"]:
+        router.append((p, PATTERN))
+    for p in ["Move the correct missing block segment onto the incomplete "
+              "tower", "Move the missing block onto the incomplete tower",
+              "Put the missing block segment on the tower"]:
+        router.append((p, TOWER))
     for p in ["Select the most accurate description",
-              "Which of these is correct?"]:
+              "Which of these is correct?", "Choose the right answer"]:
         router.append((p, MULTIPLE_CHOICE))
     for p in ["Type the text you see", "Enter the code below"]:
         router.append((p, TEXT_ENTRY))
-    for p in ["Move the correct missing block segment onto the incomplete tower",
-              "Stack the blocks to the same height"]:
-        router.append((p, TOWER))
 
     log("  router prompt pairs: %d" % len(router))
     log("  corpus built in %.0fs (%.0f MB uint8)" % (
@@ -977,13 +1183,15 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
         t0 = time.time()
         log("  epoch %d/%d  training on %s ..." % (ep + 1, epochs, device))
 
-        # 1) TILE head — single tiles + grid tiles
+        # 1) TILE head — single tiles + grid tiles. The backbone is trained
+        # here too (NO no_grad): this is the main class-recognition signal,
+        # and freezing it was why tile accuracy plateaued at ~60% — the tile
+        # FC was classifying with features shaped only by the location tasks.
         n_tile_steps = math.ceil(len(tile_tr) / batch)
         for s in range(n_tile_steps):
             b = tile_tr[s * batch:(s + 1) * batch]
             x = _jitter(_move(corpus["tile_x"][b], device))
-            with torch.no_grad():
-                feat = model.features(x)
+            feat = model.features(x)
             logits = model.tile_logits(feat)
             loss = F.cross_entropy(logits, _move(corpus["tile_y"][b], device),
                                    label_smoothing=0.05)
@@ -1668,13 +1876,15 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default=None)
-    t.add_argument("--per_class", type=int, default=600)
+    t.add_argument("--per_class", type=int, default=1200)
     t.add_argument("--n_point", type=int, default=14000)
-    t.add_argument("--n_count", type=int, default=5000)
+    t.add_argument("--n_count", type=int, default=8000)
     t.add_argument("--n_drag", type=int, default=9000)
-    t.add_argument("--n_grid", type=int, default=3000)
-    t.add_argument("--n_pattern", type=int, default=1500)
+    t.add_argument("--n_grid", type=int, default=6000)
+    t.add_argument("--n_pattern", type=int, default=4000)
     t.add_argument("--n_bbox", type=int, default=7000)
+    t.add_argument("--n_pipe", type=int, default=3000)
+    t.add_argument("--n_tower", type=int, default=3000)
     # architecture knobs (the knowledge capacity). Defaults are sized so the
     # saved checkpoint is ~150 MB (under the 200 MB cap), the bulk of it in the
     # language brain + class ontology rather than a padded conv backbone.
@@ -1702,7 +1912,8 @@ def main(argv=None):
                     corpus_kwargs=dict(per_class=a.per_class, n_point=a.n_point,
                                        n_count=a.n_count, n_drag=a.n_drag,
                                        n_grid=a.n_grid, n_pattern=a.n_pattern,
-                                       n_bbox=a.n_bbox))
+                                       n_bbox=a.n_bbox, n_pipe=a.n_pipe,
+                                       n_tower=a.n_tower))
     elif a.cmd == "eval":
         corpus = build_brain_corpus(per_class=60, n_point=400, n_count=200,
                                     n_drag=400, n_grid=150, n_pattern=80,
@@ -1722,13 +1933,14 @@ def main(argv=None):
                    router_va=[i for i in range(len(corpus["router"])) if i % 20 == 0])
     elif a.cmd == "smoke":
         # tiny architecture + tiny corpus + 1 epoch: a fast end-to-end proof
-        # that every head's forward/backward runs with no shape errors.
+        # that every head's forward/backward runs with no shape errors
+        # (including the pipe + tower drag families).
         train_brain(epochs=1, width=24, batch=16, seed=0, device="cpu",
                     prompt_dim=64, prompt_layers=2, d_concept=64,
                     pattern_d=64, pattern_layers=2,
                     corpus_kwargs=dict(per_class=20, n_point=200, n_count=80,
                                        n_drag=200, n_grid=60, n_pattern=40,
-                                       n_bbox=120))
+                                       n_bbox=120, n_pipe=40, n_tower=40))
 
 
 def _in_notebook():
