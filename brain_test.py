@@ -58,6 +58,8 @@ class BrainTestEngine(TrainerEngine):
         super().__init__()
         self._solver = None
         self._solver_tried = False
+        self._solver_lock = threading.Lock()
+        self._brain_state = "not-loaded"   # not-loaded/loading/loaded/failed
         self._tile_boxes: List[Dict[str, float]] = []
         self.rounds: List[Dict[str, Any]] = []
         self.answered_count = 0
@@ -65,24 +67,93 @@ class BrainTestEngine(TrainerEngine):
 
     # ── solver (lazy: torch/brain import only when first needed) ─────────
     def _get_solver(self):
+        with self._solver_lock:
+            return self._get_solver_locked()
+
+    def _get_solver_locked(self):
         if self._solver is None and not self._solver_tried:
             self._solver_tried = True
+            self._brain_state = "loading"
             try:
                 import brain as _brain
                 self._solver = _brain.BrainSolver()
                 if not self._solver.available:
                     self._solver = None
+                    self._brain_state = "failed"
                     self._add_log("models/brain.pt not loadable - train the "
                                   "Brain first (`python brain.py train`).")
                 else:
+                    self._brain_state = "loaded"
                     self._add_log("Brain loaded (%.0f MB) - live solving ON."
                                   % (sum(p.numel() for p in
                                          self._solver.model.parameters())
                                      * 4 / 1e6))
             except Exception as exc:
                 self._solver = None
+                self._brain_state = "failed"
                 self._add_log("Brain import failed: %s" % exc)
         return self._solver
+
+    def _preload_solver(self):
+        """Load torch + the 149MB brain OFF the event loop, at launch time,
+        so the first challenge analysis never stalls the browser flow."""
+        threading.Thread(target=self._get_solver, daemon=True).start()
+
+    def begin_launch(self) -> dict:
+        queued = super().begin_launch()
+        if queued.get("ok"):
+            self._preload_solver()
+        return queued
+
+    # ── diagnostics: see exactly why form/checkbox steps fail ────────────
+    async def _do_real_cycle(self) -> str:
+        try:
+            self._add_log("Cycle start: %s" % (self._page.url or "?"))
+        except Exception:
+            pass
+        return await super()._do_real_cycle()
+
+    async def _fill_demo_field(self, page, value: str) -> bool:
+        ok = await super()._fill_demo_field(page, value)
+        if ok:
+            self._add_log("Demo form filled with sample text (%d chars)."
+                          % len(value))
+            await asyncio.sleep(1.2)     # let the camera capture the fill
+            return True
+        try:
+            info = await page.evaluate(
+                "() => JSON.stringify(Array.from("
+                "document.querySelectorAll('input, textarea')).slice(0, 12)"
+                ".map(e => ({tag: e.tagName, type: e.type || '', "
+                "name: e.name || '', id: e.id || '', "
+                "vis: !!(e.offsetWidth || e.offsetHeight)})))")
+            self._add_log("DEMO FORM FIELD NOT FOUND. Inputs on the page: %s"
+                          % info)
+        except Exception as exc:
+            self._add_log("DEMO FORM FIELD NOT FOUND (probe failed: %s)" % exc)
+        return False
+
+    async def _wait_for_checkbox(self, page, timeout: float = 60.0):
+        # longer than the trainer's 35s: the widget can be slow behind proxies
+        return await super()._wait_for_checkbox(page, timeout=timeout)
+
+    async def _click_real_checkbox(self, page) -> bool:
+        try:
+            frames_info = await page.evaluate(
+                "() => JSON.stringify(Array.from("
+                "document.querySelectorAll('iframe')).slice(0, 10)"
+                ".map(f => ({src: (f.src || '').slice(0, 90), "
+                "w: f.offsetWidth, h: f.offsetHeight})))")
+            self._add_log("Page iframes: %s" % frames_info)
+        except Exception:
+            pass
+        ok = await super()._click_real_checkbox(page)
+        if not ok:
+            self._add_log(
+                "CHECKBOX NOT CLICKED. If no hcaptcha iframe appears in the "
+                "list above, the hCaptcha script did not load (check network/"
+                "proxy) or the widget is still rendering - retrying the cycle.")
+        return ok
 
     # ── capture: also grab exact tile boxes from the live DOM ────────────
     async def _capture_challenge(self, iframe, frame):
@@ -301,7 +372,8 @@ class BrainTestEngine(TrainerEngine):
         st["cycles_count"] = st.pop("pass_count", 0)
         st.update({
             "mode": "brain-test",
-            "brain_loaded": self._get_solver() is not None,
+            "brain_state": self._brain_state,
+            "brain_loaded": self._brain_state == "loaded",
             "answered_count": self.answered_count,
             "deferred_count": self.deferred_count,
             "rounds": [dict(r) for r in self.rounds[-25:]],
