@@ -1920,6 +1920,10 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 <div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:10px 0 6px">ROUND LOG</div>
 <div id="testRounds" style="font-size:12px;max-height:320px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px"></div>
+<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:12px 0 6px">ACTIVITY LOG</div>
+<div id="testLogs" style="font-size:11px;max-height:200px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px;font-family:'JetBrains Mono',monospace;color:#9ca3af"></div>
+<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:12px 0 6px">OPERATOR ACTIVITY (live camera input)</div>
+<div id="testPointer" style="font-size:11px;max-height:140px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px;font-family:'JetBrains Mono',monospace;color:#9ca3af"></div>
 </div>
 
 <div id="tabdata" class="hide">
@@ -1980,7 +1984,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens','trainer','data'];
+  var ids=['main','tokens','trainer','data','test'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -1990,6 +1994,9 @@ function showTab(name){
   });
   if(name==='trainer' || name==='data'){
     refreshTrainer();
+  }
+  if(name==='test'){
+    testPoll();
   }
 }
 window.showTab=showTab;
@@ -2029,6 +2036,14 @@ function testPoll(){
         '<div style="opacity:.85">→ '+testEsc(r.answer)+' <span style="opacity:.6">(conf '+r.confidence+')</span></div></div>';
     }).join('');
     el('testRounds').innerHTML=rows||'<div style="opacity:.5">No rounds yet — press Start.</div>';
+    var logs=s.logs||[];
+    el('testLogs').innerHTML=logs.slice().reverse().map(function(l){
+      return '<div>'+testEsc(l)+'</div>';
+    }).join('')||'<div style="opacity:.5">No activity yet.</div>';
+    var ptr=s.pointer_log||[];
+    el('testPointer').innerHTML=ptr.slice().reverse().map(function(p){
+      return '<div>'+testEsc((p.t||'')+' '+p.kind+' ('+p.x+','+p.y+')'+(p.selector?' '+p.selector:''))+'</div>';
+    }).join('')||'<div style="opacity:.5">No operator input (click/drag on the live camera to see it here).</div>';
   }).catch(function(){});
 }
 setInterval(function(){
