@@ -44,6 +44,7 @@ from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
 import live_ui
 import trainer
+import brain_test
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -1045,6 +1046,32 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
         state["launching"] = False
 
 
+async def _start_brain_test_runner(speed: float = 2.0) -> dict:
+    """Attach the BRAIN TEST engine to B1's browser on the app asyncio loop.
+
+    Live hCaptcha demo rounds are analyzed by models/brain.pt (BrainSolver)
+    and reported in the Test tab. No clicking, no training, no collection.
+    """
+    if trainer.trainer_engine.is_busy() and not trainer.trainer_engine.is_preparing():
+        return {"ok": False,
+                "message": "The Live Demo trainer is running - stop it first"}
+    if brain_test.brain_engine.is_busy() and not brain_test.brain_engine.is_preparing():
+        return {"ok": False, "message": "Brain test already running or stopping"}
+    cfg = load_config()
+    browser = await _start_real_demo_browser("B1", cfg)
+    if browser.get("error"):
+        return {"ok": False, "message": browser["error"], "browser": browser}
+    state = _workers.get("B1") or _init_worker("B1")
+    bot = state.get("bot")
+    result = brain_test.brain_engine.start_external(
+        getattr(bot, "_page", None), speed=speed, one_shot=False,
+    )
+    if result.get("ok"):
+        state["status"] = "demo"
+        state["step"] = "brain test · official hCaptcha demo"
+    return {**result, "browser": browser}
+
+
 async def _start_real_demo_runner(speed: float, one_shot: bool = False) -> dict:
     """Attach the trainer to B1's browser on the app asyncio loop."""
     if (trainer.trainer_engine.is_busy()
@@ -1510,6 +1537,41 @@ def handle_trainer_questions():
     st = trainer.trainer_engine.get_state()
     return jsonify(st.get('questions', []))
 
+@app.route('/test/status')
+def handle_test_status():
+    return jsonify(brain_test.brain_engine.get_state())
+
+
+@app.route('/test/start', methods=['POST'])
+def handle_test_start():
+    queued = brain_test.brain_engine.begin_launch()
+    if not queued.get("ok"):
+        return jsonify(queued), 409
+    if not _loop:
+        brain_test.brain_engine.launch_failed("Event loop is unavailable.")
+        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
+
+    async def launch_runner():
+        result = await _start_brain_test_runner()
+        if not result.get("ok"):
+            brain_test.brain_engine.launch_failed(
+                result.get("message", "Could not start the brain test."))
+        return result
+
+    try:
+        asyncio.run_coroutine_threadsafe(launch_runner(), _loop)
+    except Exception as exc:
+        brain_test.brain_engine.launch_failed(
+            f"Could not queue browser setup: {exc}")
+        return jsonify({"ok": False, "message": "could not queue browser setup"}), 503
+    return jsonify(queued), 202
+
+
+@app.route('/test/stop', methods=['POST'])
+def handle_test_stop():
+    return jsonify(brain_test.brain_engine.stop())
+
+
 @app.route('/trainer/speed', methods=['POST'])
 def handle_trainer_speed():
     data = request.get_json(silent=True) or {}
@@ -1717,6 +1779,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
 <button data-tab="trainer" onclick="showTab('trainer')">Live Demo</button>
+<button data-tab="test" onclick="showTab('test')">Test</button>
 <button data-tab="data" onclick="showTab('data')">Data</button>
 </nav>
 
@@ -1832,6 +1895,33 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 
 <!-- Captured image challenges and their prompts are kept separate from controls. -->
+<div id="tabtest" class="hide">
+<div class="row mb">
+  <button class="primary" onclick="testStart()">Start Brain Test</button>
+  <button class="danger" onclick="testStop()">Stop</button>
+  <span id="testState" style="font-size:12px;opacity:.75">idle</span>
+</div>
+<div class="row mb" style="gap:14px;flex-wrap:wrap;font-size:12px">
+  <span>Brain: <b id="testBrain">?</b></span>
+  <span>Answered: <b id="testAnswered">0</b></span>
+  <span>Deferred: <b id="testDeferred">0</b></span>
+  <span>Cycles: <b id="testCycles">0</b></span>
+</div>
+<div class="row mb" style="gap:12px;flex-wrap:wrap">
+  <div style="flex:1;min-width:320px">
+    <div style="font-size:11px;letter-spacing:1px;opacity:.6;margin-bottom:6px">LIVE CAMERA</div>
+    <img id="testCam" src="/latest" style="width:100%;border:1px solid #26262b;border-radius:10px;background:#0d0d0f" alt="live camera">
+  </div>
+  <div style="flex:1;min-width:320px">
+    <div style="font-size:11px;letter-spacing:1px;opacity:.6;margin-bottom:6px">BRAIN'S ANSWER (overlay)</div>
+    <img id="testOverlay" style="width:100%;border:1px solid #26262b;border-radius:10px;background:#0d0d0f" alt="brain answer overlay">
+    <div id="testLatest" style="font-size:12px;margin-top:8px;white-space:pre-wrap"></div>
+  </div>
+</div>
+<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:10px 0 6px">ROUND LOG</div>
+<div id="testRounds" style="font-size:12px;max-height:320px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px"></div>
+</div>
+
 <div id="tabdata" class="hide">
   <div class="card" style="margin-bottom:12px">
     <div class="flex" style="justify-content:space-between;margin-bottom:10px">
@@ -1903,6 +1993,48 @@ function showTab(name){
   }
 }
 window.showTab=showTab;
+
+/* ── Test tab: live brain solving ─────────────────────────────────────── */
+function testStart(){
+  fetch('/test/start',{method:'POST'}).then(r=>r.json()).then(function(j){
+    if(!j.ok){alert(j.message||'could not start');}
+  });
+}
+function testStop(){
+  fetch('/test/stop',{method:'POST'}).then(r=>r.json());
+}
+function testEsc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function testPoll(){
+  fetch('/test/status').then(r=>r.json()).then(function(s){
+    var el=function(id){return document.getElementById(id);};
+    el('testState').textContent=(s.running?(s.stage||'running'):(s.preparing?'starting':'idle'))+(s.status_text?' · '+s.status_text:'');
+    el('testBrain').textContent=s.brain_loaded?'LOADED':'NOT LOADED (train first)';
+    el('testAnswered').textContent=s.answered_count||0;
+    el('testDeferred').textContent=s.deferred_count||0;
+    el('testCycles').textContent=s.cycles_count||0;
+    var cam=el('testCam'); if(cam && s.running){cam.src='/latest?'+Date.now();}
+    var rounds=s.rounds||[];
+    if(rounds.length){
+      var last=rounds[rounds.length-1];
+      var ov=el('testOverlay');
+      if(last.overlay_url && ov.getAttribute('src')!==last.overlay_url){ov.src=last.overlay_url;}
+      el('testLatest').textContent='#'+last.id+' ['+last.family+']\n'+last.question+'\n→ '+last.answer+'  (conf '+last.confidence+')';
+    }
+    var rows=rounds.slice().reverse().map(function(r){
+      var col=r.deferred?'#fbbf24':'#34d399';
+      return '<div style="padding:4px 0;border-bottom:1px solid #1a1a1e">'+
+        '<span style="color:'+col+'">'+(r.deferred?'DEFER':'ANSWER')+'</span> '+
+        '<b>#'+r.id+'</b> ['+testEsc(r.family)+'] '+testEsc(r.question)+
+        '<div style="opacity:.85">→ '+testEsc(r.answer)+' <span style="opacity:.6">(conf '+r.confidence+')</span></div></div>';
+    }).join('');
+    el('testRounds').innerHTML=rows||'<div style="opacity:.5">No rounds yet — press Start.</div>';
+  }).catch(function(){});
+}
+setInterval(function(){
+  if(document.getElementById('tabtest') && !document.getElementById('tabtest').classList.contains('hide')){testPoll();}
+},2000);
+window.testStart=testStart;window.testStop=testStop;
 
 function startBot(){
   api('/start').then(function(r){return r.json()}).then(function(d){
