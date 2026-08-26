@@ -61,6 +61,7 @@ class BrainTestEngine(TrainerEngine):
         self._solver_tried = False
         self._solver_lock = threading.Lock()
         self._brain_state = "not-loaded"   # not-loaded/loading/loaded/failed
+        self._brain_error = ""
         self._tile_boxes: List[Dict[str, float]] = []
         self.rounds: List[Dict[str, Any]] = []
         self.answered_count = 0
@@ -71,67 +72,94 @@ class BrainTestEngine(TrainerEngine):
         with self._solver_lock:
             return self._get_solver_locked()
 
+    _PART_PATTERNS = (("brain_part_%02d", 0), ("brain.pt.part-%02d", 0),
+                      ("brain.pt.part-%02d", 1))
+
+    def _write_brain(self, parts, js_path, ref="") -> None:
+        import subprocess
+        root = os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(os.path.dirname(js_path), exist_ok=True)
+        with open(js_path[:-len("brain.json")] + "brain.pt", "wb") as f:
+            for chunk in parts:
+                f.write(chunk)
+        j = subprocess.run(["git", "show", "%s:brain.json" % ref] if ref
+                           else ["git", "show", "HEAD:brain.json"],
+                           cwd=root, capture_output=True, timeout=30)
+        try:
+            d = json.loads(j.stdout) if j.returncode == 0 and \
+                j.stdout[:1] == b"{" else {}
+        except Exception:
+            d = {}
+        try:
+            d.setdefault("classes", __import__("make_dataset").CLASSES)
+        except Exception:
+            d.setdefault("classes", [])
+        d.setdefault("families", ["image_label_binary", "area_select_point",
+                                  "area_select_bbox", "image_drag_drop",
+                                  "multiple_choice", "text_entry", "counting",
+                                  "pattern", "tower"])
+        d.setdefault("scene_size", 96)
+        d.setdefault("tile_size", 64)
+        d.setdefault("arch", {}).setdefault("width", 48)
+        d["arch"].setdefault("prompt_dim", 512)
+        d["arch"].setdefault("prompt_layers", 8)
+        d["arch"].setdefault("d_concept", 320)
+        d["arch"].setdefault("pattern_d", 320)
+        d["arch"].setdefault("pattern_layers", 4)
+        d["arch"]["text_len"] = 5
+        with open(js_path, "w") as f:
+            json.dump(d, f, indent=2)
+
     def _ensure_brain_file(self) -> bool:
         """models/brain.pt is a ~149MB artifact that is NOT committed - it
-        lives in git as split parts. If the file is missing on this machine,
-        reassemble it automatically from whatever ref has the parts."""
-        import subprocess
+        lives as split parts (in git and/or as loose files). Reassemble it
+        automatically from whichever source has a complete set."""
+        import glob
         root = os.path.dirname(os.path.abspath(__file__))
         pt = os.path.join(root, "models", "brain.pt")
         js = os.path.join(root, "models", "brain.json")
         if os.path.exists(pt) and os.path.exists(js):
             return True
-        namings = ("brain_part_%02d", "brain.pt.part-%02d")
-        refs = ["HEAD", "origin/arena/01a033e0-cs",
-                "arena/01a033e0-cs", "origin/main", "main"]
-        for ref in refs:
-            for naming in namings:
-                try:
-                    parts = []
-                    for i in range(12):
-                        p = subprocess.run(
-                            ["git", "show", "%s:%s" % (ref, naming % i)],
-                            cwd=root, capture_output=True, timeout=120)
-                        if p.returncode != 0 or len(p.stdout) < 1000:
-                            break
-                        parts.append(p.stdout)
-                    if len(parts) < 2:
-                        continue
-                    os.makedirs(os.path.dirname(pt), exist_ok=True)
-                    with open(pt, "wb") as f:
-                        for chunk in parts:
-                            f.write(chunk)
-                    j = subprocess.run(["git", "show", "%s:brain.json" % ref],
-                                       cwd=root, capture_output=True, timeout=30)
+        # 1) loose part files sitting in the repo folder
+        for pattern, offset in self._PART_PATTERNS:
+            parts, i = [], 0
+            while i < 12:
+                path = os.path.join(root, pattern % (i + offset))
+                if not os.path.isfile(path) or os.path.getsize(path) < 1000:
+                    break
+                with open(path, "rb") as f:
+                    parts.append(f.read())
+                i += 1
+            if len(parts) >= 2:
+                self._write_brain(parts, js)
+                self._add_log("Reassembled models/brain.pt from %d loose "
+                              "part files (%s)." % (len(parts), pattern))
+                return True
+        # 2) part files stored in git (any ref, both naming schemes)
+        import subprocess
+        for ref in ("HEAD", "origin/arena/01a033e0-cs",
+                    "arena/01a033e0-cs", "origin/main", "main"):
+            for pattern, offset in self._PART_PATTERNS:
+                parts, i = [], 0
+                while i < 12:
                     try:
-                        d = json.loads(j.stdout) if j.returncode == 0 and                             j.stdout[:1] == b"{" else {}
+                        p = subprocess.run(
+                            ["git", "show", "%s:%s" % (ref, pattern % (i + offset))],
+                            cwd=root, capture_output=True, timeout=120)
                     except Exception:
-                        d = {}
-                    d.setdefault("classes", __import__("make_dataset").CLASSES)
-                    d.setdefault("families", ["image_label_binary",
-                                              "area_select_point",
-                                              "area_select_bbox",
-                                              "image_drag_drop",
-                                              "multiple_choice", "text_entry",
-                                              "counting", "pattern", "tower"])
-                    d.setdefault("scene_size", 96)
-                    d.setdefault("tile_size", 64)
-                    d.setdefault("arch", {}).setdefault("width", 48)
-                    d["arch"].setdefault("prompt_dim", 512)
-                    d["arch"].setdefault("prompt_layers", 8)
-                    d["arch"].setdefault("d_concept", 320)
-                    d["arch"].setdefault("pattern_d", 320)
-                    d["arch"].setdefault("pattern_layers", 4)
-                    d["arch"]["text_len"] = 5
-                    with open(js, "w") as f:
-                        json.dump(d, f, indent=2)
+                        break
+                    if p.returncode != 0 or len(p.stdout) < 1000:
+                        break
+                    parts.append(p.stdout)
+                    i += 1
+                if len(parts) >= 2:
+                    self._write_brain(parts, js, ref=ref)
                     self._add_log("Reassembled models/brain.pt from %d git "
                                   "parts (ref %s)." % (len(parts), ref))
                     return True
-                except Exception:
-                    continue
-        self._add_log("models/brain.pt missing and no git parts found - "
-                      "train the Brain or commit the parts.")
+        self._brain_error = ("no brain parts found (checked loose files and "
+                             "git refs HEAD/arena/main)")
+        self._add_log("models/brain.pt missing and no parts found anywhere.")
         return False
 
     def _get_solver_locked(self):
@@ -185,8 +213,8 @@ class BrainTestEngine(TrainerEngine):
                 await asyncio.sleep(0.5)
         except Exception:
             pass
-        await asyncio.sleep(2.0)          # settle: let the widget script run
-        self._add_log("Page rendered (readyState complete).")
+        await asyncio.sleep(3.0)          # fixed 3s settle, then act
+        self._add_log("Page rendered - waiting 3s, then filling the form.")
         return True
 
     async def _wait_widget_iframe(self, page, timeout: float = 25.0) -> bool:
@@ -213,6 +241,7 @@ class BrainTestEngine(TrainerEngine):
         return await super()._do_real_cycle()
 
     async def _fill_demo_field(self, page, value: str) -> bool:
+        await asyncio.sleep(3.0)          # wait 3s, THEN fill (as requested)
         for attempt in range(3):
             ok = await super()._fill_demo_field(page, value)
             if ok:
@@ -242,6 +271,7 @@ class BrainTestEngine(TrainerEngine):
 
     async def _click_real_checkbox(self, page) -> bool:
         if await self._wait_widget_iframe(page):
+            await asyncio.sleep(3.0)      # widget is up: wait 3s, then click
             self._add_log("hCaptcha widget iframe detected - clicking.")
         else:
             self._add_log("No hcaptcha iframe after 25s - trying the click "
@@ -481,6 +511,7 @@ class BrainTestEngine(TrainerEngine):
         st.update({
             "mode": "brain-test",
             "brain_state": self._brain_state,
+            "brain_error": self._brain_error,
             "brain_loaded": self._brain_state == "loaded",
             "answered_count": self.answered_count,
             "deferred_count": self.deferred_count,

@@ -2018,7 +2018,7 @@ function testPoll(){
     el('testState').textContent=(s.running?(s.stage||'running'):(s.preparing?'starting':'idle'))+(s.status_text?' · '+s.status_text:'');
     el('testBrain').textContent=(s.brain_state==='loaded'?'LOADED':
       s.brain_state==='loading'?'LOADING…':
-      s.brain_state==='failed'?'FAILED (models/brain.pt missing?)':
+      s.brain_state==='failed'?('FAILED: '+(s.brain_error||'brain.pt missing')):
       'NOT LOADED');
     el('testAnswered').textContent=s.answered_count||0;
     el('testDeferred').textContent=s.deferred_count||0;
