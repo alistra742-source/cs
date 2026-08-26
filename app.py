@@ -1904,6 +1904,7 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <div class="row mb" style="gap:14px;flex-wrap:wrap;font-size:12px">
   <span>Brain: <b id="testBrain">?</b></span>
   <span>Answered: <b id="testAnswered">0</b></span>
+  <span>Executed (clicked): <b id="testExecuted">0</b></span>
   <span>Deferred: <b id="testDeferred">0</b></span>
   <span>Cycles: <b id="testCycles">0</b></span>
 </div>
@@ -2021,6 +2022,7 @@ function testPoll(){
       s.brain_state==='failed'?('FAILED: '+(s.brain_error||'brain.pt missing')):
       'NOT LOADED');
     el('testAnswered').textContent=s.answered_count||0;
+    el('testExecuted').textContent=s.executed_count||0;
     el('testDeferred').textContent=s.deferred_count||0;
     el('testCycles').textContent=s.cycles_count||0;
     var cam=el('testCam'); if(cam && s.running){cam.src='/latest?'+Date.now();}

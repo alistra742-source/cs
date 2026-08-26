@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-brain_test.py — the TEST tab engine: live hCaptcha, solved by the Brain.
+brain_test.py — the TEST tab: live hCaptcha, solved by the Brain.
 
-Drives the official hCaptcha demo (accounts.hcaptcha.com/demo) in the shared
-LIVE browser — checkbox, challenge, camera, the works — but instead of a
-human answering, the BRAIN (models/brain.pt, brain.py BrainSolver) analyzes
-every challenge round and reports exactly what it would answer:
+Runs the EXACT trainer flow (navigate the official hCaptcha demo, fill the
+demo field, click the real checkbox, capture the challenge) — and when a
+challenge round appears, the BRAIN (models/brain.pt, brain.py BrainSolver)
+solves it for real:
 
-  - the routed challenge family (from the real prompt text)
-  - the Brain's answer (tile indices + labels / click point / drag from-to /
-    box / count / text code) and its confidence
-  - an overlay image showing WHERE the Brain would click
-  - an honest "deferred (not confident)" when it would fall back to vision
+  - routes the family from the live prompt
+  - computes the answer (tiles / point / drag / box / count / text)
+  - EXECUTES it on the live challenge (clicks the tiles, clicks the point,
+    performs the drag) and submits
+  - reports the answer + confidence in the Test tab, with an overlay image
 
-It never trains and never collects samples: read-only analysis of live
-rounds. Built as a TrainerEngine subclass so the whole battle-tested browser
-flow (launch, checkbox, challenge capture, reload) is reused verbatim.
+models/brain.pt is reassembled automatically when missing: from loose part
+files, from git (any ref), or downloaded from GitHub raw (works on any
+machine with internet). No training, no sample collection.
 """
 
 from __future__ import annotations
@@ -34,9 +34,10 @@ from trainer import TrainerEngine
 
 import hcaptcha_types as hct
 
-# Tile-node boxes as fractions of the challenge-iframe viewport. Returned by
-# evaluating this inside the live challenge frame; the iframe screenshot maps
-# 1:1 onto that viewport, so the fractions crop tiles exactly.
+# Commit on arena/01a033e0-cs that carries the split brain parts — used as
+# the GitHub raw fallback when neither loose files nor git have them.
+_BRAIN_SHA = "5886f0e3c86ffc8cabbde701412f938bcecb9f5a"
+
 _TILE_BOXES_JS = r"""() => {
     const nodes = document.querySelectorAll(
         'div.task-image, [class*="task-image" i]');
@@ -53,7 +54,10 @@ _TILE_BOXES_JS = r"""() => {
 
 
 class BrainTestEngine(TrainerEngine):
-    """Live hCaptcha demo rounds answered by the Brain (analysis only)."""
+    """Live hCaptcha demo rounds solved by the Brain (analysis + clicks)."""
+
+    _PART_PATTERNS = (("brain_part_%02d", 0), ("brain.pt.part-%02d", 0),
+                      ("brain.pt.part-%02d", 1))
 
     def __init__(self):
         super().__init__()
@@ -63,33 +67,32 @@ class BrainTestEngine(TrainerEngine):
         self._brain_state = "not-loaded"   # not-loaded/loading/loaded/failed
         self._brain_error = ""
         self._tile_boxes: List[Dict[str, float]] = []
+        self._challenge_iframe = None
+        self._challenge_frame = None
+        self._last_res: Optional[Dict[str, Any]] = None
         self.rounds: List[Dict[str, Any]] = []
         self.answered_count = 0
         self.deferred_count = 0
+        self.executed_count = 0
 
-    # ── solver (lazy: torch/brain import only when first needed) ─────────
-    def _get_solver(self):
-        with self._solver_lock:
-            return self._get_solver_locked()
-
-    _PART_PATTERNS = (("brain_part_%02d", 0), ("brain.pt.part-%02d", 0),
-                      ("brain.pt.part-%02d", 1))
-
+    # ── brain file: reassemble from loose files / git / GitHub raw ───────
     def _write_brain(self, parts, js_path, ref="") -> None:
-        import subprocess
         root = os.path.dirname(os.path.abspath(__file__))
+        pt_path = os.path.join(os.path.dirname(js_path), "brain.pt")
         os.makedirs(os.path.dirname(js_path), exist_ok=True)
-        with open(js_path[:-len("brain.json")] + "brain.pt", "wb") as f:
+        with open(pt_path, "wb") as f:
             for chunk in parts:
                 f.write(chunk)
-        j = subprocess.run(["git", "show", "%s:brain.json" % ref] if ref
-                           else ["git", "show", "HEAD:brain.json"],
-                           cwd=root, capture_output=True, timeout=30)
-        try:
-            d = json.loads(j.stdout) if j.returncode == 0 and \
-                j.stdout[:1] == b"{" else {}
-        except Exception:
-            d = {}
+        d = {}
+        if ref:
+            import subprocess
+            j = subprocess.run(["git", "show", "%s:brain.json" % ref],
+                               cwd=root, capture_output=True, timeout=30)
+            try:
+                if j.returncode == 0 and j.stdout[:1] == b"{":
+                    d = json.loads(j.stdout)
+            except Exception:
+                d = {}
         try:
             d.setdefault("classes", __import__("make_dataset").CLASSES)
         except Exception:
@@ -111,16 +114,14 @@ class BrainTestEngine(TrainerEngine):
             json.dump(d, f, indent=2)
 
     def _ensure_brain_file(self) -> bool:
-        """models/brain.pt is a ~149MB artifact that is NOT committed - it
-        lives as split parts (in git and/or as loose files). Reassemble it
-        automatically from whichever source has a complete set."""
-        import glob
+        """models/brain.pt is a ~149MB artifact, not committed. Reassemble it
+        from (1) loose part files, (2) any git ref, (3) GitHub raw download."""
         root = os.path.dirname(os.path.abspath(__file__))
         pt = os.path.join(root, "models", "brain.pt")
         js = os.path.join(root, "models", "brain.json")
         if os.path.exists(pt) and os.path.exists(js):
             return True
-        # 1) loose part files sitting in the repo folder
+        # 1) loose part files in the repo folder
         for pattern, offset in self._PART_PATTERNS:
             parts, i = [], 0
             while i < 12:
@@ -132,10 +133,10 @@ class BrainTestEngine(TrainerEngine):
                 i += 1
             if len(parts) >= 2:
                 self._write_brain(parts, js)
-                self._add_log("Reassembled models/brain.pt from %d loose "
-                              "part files (%s)." % (len(parts), pattern))
+                self._add_log("Reassembled brain.pt from %d loose parts."
+                              % len(parts))
                 return True
-        # 2) part files stored in git (any ref, both naming schemes)
+        # 2) part files stored in git (any ref)
         import subprocess
         for ref in ("HEAD", "origin/arena/01a033e0-cs",
                     "arena/01a033e0-cs", "origin/main", "main"):
@@ -144,7 +145,8 @@ class BrainTestEngine(TrainerEngine):
                 while i < 12:
                     try:
                         p = subprocess.run(
-                            ["git", "show", "%s:%s" % (ref, pattern % (i + offset))],
+                            ["git", "show",
+                             "%s:%s" % (ref, pattern % (i + offset))],
                             cwd=root, capture_output=True, timeout=120)
                     except Exception:
                         break
@@ -154,13 +156,37 @@ class BrainTestEngine(TrainerEngine):
                     i += 1
                 if len(parts) >= 2:
                     self._write_brain(parts, js, ref=ref)
-                    self._add_log("Reassembled models/brain.pt from %d git "
-                                  "parts (ref %s)." % (len(parts), ref))
+                    self._add_log("Reassembled brain.pt from %d git parts "
+                                  "(%s)." % (len(parts), ref))
                     return True
-        self._brain_error = ("no brain parts found (checked loose files and "
-                             "git refs HEAD/arena/main)")
-        self._add_log("models/brain.pt missing and no parts found anywhere.")
+        # 3) download the parts from GitHub raw (any machine with internet)
+        try:
+            import requests
+            parts = []
+            for i in range(12):
+                url = ("https://raw.githubusercontent.com/alistra742-source/"
+                       "cs/%s/brain_part_%02d" % (_BRAIN_SHA, i))
+                r = requests.get(url, timeout=120)
+                if r.status_code != 200 or len(r.content) < 1000:
+                    break
+                parts.append(r.content)
+            if len(parts) >= 2:
+                self._write_brain(parts, js)
+                self._add_log("Downloaded brain.pt as %d parts from GitHub."
+                              % len(parts))
+                return True
+            self._brain_error = ("downloaded only %d parts from GitHub"
+                                 % len(parts))
+        except Exception as exc:
+            self._brain_error = "GitHub download failed: %s" % exc
+        self._add_log("Could not obtain brain parts anywhere: %s"
+                      % self._brain_error)
         return False
+
+    # ── solver (lazy, preloaded at launch on a background thread) ────────
+    def _get_solver(self):
+        with self._solver_lock:
+            return self._get_solver_locked()
 
     def _get_solver_locked(self):
         if self._solver is None and not self._solver_tried:
@@ -173,8 +199,9 @@ class BrainTestEngine(TrainerEngine):
                 if not self._solver.available:
                     self._solver = None
                     self._brain_state = "failed"
-                    self._add_log("models/brain.pt not loadable - train the "
-                                  "Brain first (`python brain.py train`).")
+                    self._brain_error = self._brain_error or \
+                        "models/brain.pt not loadable"
+                    self._add_log("Brain not loadable: %s" % self._brain_error)
                 else:
                     self._brain_state = "loaded"
                     self._add_log("Brain loaded (%.0f MB) - live solving ON."
@@ -184,12 +211,11 @@ class BrainTestEngine(TrainerEngine):
             except Exception as exc:
                 self._solver = None
                 self._brain_state = "failed"
+                self._brain_error = str(exc)
                 self._add_log("Brain import failed: %s" % exc)
         return self._solver
 
     def _preload_solver(self):
-        """Load torch + the 149MB brain OFF the event loop, at launch time,
-        so the first challenge analysis never stalls the browser flow."""
         threading.Thread(target=self._get_solver, daemon=True).start()
 
     def begin_launch(self) -> dict:
@@ -198,103 +224,10 @@ class BrainTestEngine(TrainerEngine):
             self._preload_solver()
         return queued
 
-    # ── render waiting: domcontentloaded fires long before the hCaptcha
-    # widget paints. Wait for the full render so fill/click are not
-    # attempted against a half-painted page. ─────────────────────────────
-    async def _wait_for_content(self, page, timeout: float = 30.0) -> bool:
-        ok = await super()._wait_for_content(page, timeout=timeout)
-        if not ok:
-            return ok
-        try:
-            deadline = time.monotonic() + 20.0
-            while time.monotonic() < deadline:
-                if await page.evaluate("document.readyState") == "complete":
-                    break
-                await asyncio.sleep(0.5)
-        except Exception:
-            pass
-        await asyncio.sleep(3.0)          # fixed 3s settle, then act
-        self._add_log("Page rendered - waiting 3s, then filling the form.")
-        return True
-
-    async def _wait_widget_iframe(self, page, timeout: float = 25.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not self._stopped():
-            try:
-                found = await page.evaluate(
-                    "() => Array.from(document.querySelectorAll('iframe'))"
-                    ".some(f => (f.src || '').toLowerCase()"
-                    ".includes('hcaptcha'))")
-                if found:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        return False
-
-    # ── diagnostics: see exactly why form/checkbox steps fail ────────────
-    async def _do_real_cycle(self) -> str:
-        try:
-            self._add_log("Cycle start: %s" % (self._page.url or "?"))
-        except Exception:
-            pass
-        return await super()._do_real_cycle()
-
-    async def _fill_demo_field(self, page, value: str) -> bool:
-        await asyncio.sleep(3.0)          # wait 3s, THEN fill (as requested)
-        for attempt in range(3):
-            ok = await super()._fill_demo_field(page, value)
-            if ok:
-                self._add_log("Demo form filled with sample text (%d chars)."
-                              % len(value))
-                await asyncio.sleep(1.2)  # let the camera capture the fill
-                return True
-            self._add_log("Form field not ready yet (attempt %d/3) - "
-                          "waiting for render…" % (attempt + 1))
-            await asyncio.sleep(2.5)
-        try:
-            info = await page.evaluate(
-                "() => JSON.stringify(Array.from("
-                "document.querySelectorAll('input, textarea')).slice(0, 12)"
-                ".map(e => ({tag: e.tagName, type: e.type || '', "
-                "name: e.name || '', id: e.id || '', "
-                "vis: !!(e.offsetWidth || e.offsetHeight)})))")
-            self._add_log("DEMO FORM FIELD NOT FOUND. Inputs on the page: %s"
-                          % info)
-        except Exception as exc:
-            self._add_log("DEMO FORM FIELD NOT FOUND (probe failed: %s)" % exc)
-        return False
-
-    async def _wait_for_checkbox(self, page, timeout: float = 60.0):
-        # longer than the trainer's 35s: the widget can be slow behind proxies
-        return await super()._wait_for_checkbox(page, timeout=timeout)
-
-    async def _click_real_checkbox(self, page) -> bool:
-        if await self._wait_widget_iframe(page):
-            await asyncio.sleep(3.0)      # widget is up: wait 3s, then click
-            self._add_log("hCaptcha widget iframe detected - clicking.")
-        else:
-            self._add_log("No hcaptcha iframe after 25s - trying the click "
-                          "anyway (it may render late).")
-        try:
-            frames_info = await page.evaluate(
-                "() => JSON.stringify(Array.from("
-                "document.querySelectorAll('iframe')).slice(0, 10)"
-                ".map(f => ({src: (f.src || '').slice(0, 90), "
-                "w: f.offsetWidth, h: f.offsetHeight})))")
-            self._add_log("Page iframes: %s" % frames_info)
-        except Exception:
-            pass
-        ok = await super()._click_real_checkbox(page)
-        if not ok:
-            self._add_log(
-                "CHECKBOX NOT CLICKED. If no hcaptcha iframe appears in the "
-                "list above, the hCaptcha script did not load (check network/"
-                "proxy) or the widget is still rendering - retrying the cycle.")
-        return ok
-
-    # ── capture: also grab exact tile boxes from the live DOM ────────────
+    # ── capture: tile boxes + keep the live frame for executing answers ──
     async def _capture_challenge(self, iframe, frame):
+        self._challenge_iframe = iframe
+        self._challenge_frame = frame
         image, question, full_text = await super()._capture_challenge(
             iframe, frame)
         self._tile_boxes = []
@@ -303,11 +236,13 @@ class BrainTestEngine(TrainerEngine):
             boxes = json.loads(raw) if raw else []
             if isinstance(boxes, list) and boxes:
                 self._tile_boxes = boxes
+                self._add_log("Found %d tile nodes in the live challenge."
+                              % len(boxes))
         except Exception:
             pass
         return image, question, full_text
 
-    # ── THE BRAIN ANSWERS HERE ────────────────────────────────────────────
+    # ── the Brain solves: analyze, report, then EXECUTE the answer ────────
     async def _record_challenge(self, image: str, question: str,
                                 full_text: str) -> None:
         try:
@@ -316,14 +251,101 @@ class BrainTestEngine(TrainerEngine):
             self._add_log("Brain analysis error: %s" % exc)
             self._record_round(question, "error",
                                "analysis failed: %s" % exc, 0.0, None)
+            return
+        res = self._last_res
+        if res is None:
+            self._add_log("Not confident enough to click - deferring "
+                          "(no wrong clicks).")
+            return
+        ok = await self._execute_answer(res)
+        if ok:
+            with self._lock:
+                self.executed_count += 1
 
+    # ── execute: actually click / drag the Brain's answer on the page ─────
+    async def _execute_answer(self, res) -> bool:
+        iframe, frame, page = (self._challenge_iframe, self._challenge_frame,
+                               self._page)
+        if iframe is None or frame is None or page is None:
+            return False
+        fam = res.get("family")
+        a = res.get("answer")
+        try:
+            if (fam == hct.BINARY or res.get("family") == hct.BINARY) \
+                    and isinstance(a, list):
+                locs = frame.locator('div.task-image, [class*="task-image" i]')
+                n = await locs.count()
+                self._add_log("Clicking the Brain's tiles %s (%d tile nodes "
+                              "available)…" % (a, n))
+                for idx in a:
+                    if 0 < idx <= n:
+                        await locs.nth(idx - 1).click(timeout=5000)
+                        await asyncio.sleep(0.4)
+                await self._click_submit(frame)
+                return True
+            if isinstance(a, dict) and "from" in a:
+                box = await iframe.bounding_box()
+                if not box:
+                    return False
+                fx = box["x"] + a["from"][0] * box["width"]
+                fy = box["y"] + a["from"][1] * box["height"]
+                tx = box["x"] + a["to"][0] * box["width"]
+                ty = box["y"] + a["to"][1] * box["height"]
+                self._add_log("Dragging the Brain's answer (%.0f,%.0f) -> "
+                              "(%.0f,%.0f)…" % (fx, fy, tx, ty))
+                await page.mouse.move(fx, fy)
+                await asyncio.sleep(0.15)
+                await page.mouse.down()
+                for t in range(1, 13):
+                    await page.mouse.move(fx + (tx - fx) * t / 12.0,
+                                          fy + (ty - fy) * t / 12.0)
+                    await asyncio.sleep(0.035)
+                await asyncio.sleep(0.12)
+                await page.mouse.up()
+                await asyncio.sleep(0.5)
+                await self._click_submit(frame)
+                return True
+            if isinstance(a, tuple) and len(a) == 2:
+                box = await iframe.bounding_box()
+                if not box:
+                    return False
+                px = box["x"] + a[0] * box["width"]
+                py = box["y"] + a[1] * box["height"]
+                self._add_log("Clicking the Brain's point (%.0f,%.0f)…"
+                              % (px, py))
+                await page.mouse.click(px, py)
+                await asyncio.sleep(0.4)
+                await self._click_submit(frame)
+                return True
+            self._add_log("Answer type has no click path yet (%s) - reported "
+                          "only." % fam)
+            return False
+        except Exception as exc:
+            self._add_log("Executing the answer failed: %s" % exc)
+            return False
+
+    async def _click_submit(self, frame) -> None:
+        for sel in ('.button-submit', '[class*="submit" i]',
+                    'button[type="submit"]'):
+            try:
+                btn = frame.locator(sel)
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=5000)
+                    self._add_log("Submitted the round.")
+                    return
+            except Exception:
+                continue
+
+    # ── analysis (pure function of the screenshot + prompt) ──────────────
     def _analyze(self, image_b64: str, question: str) -> None:
         from PIL import Image, ImageDraw
         solver = self._get_solver()
+        self._last_res = None
         if solver is None:
             self._record_round(question, "unavailable",
-                               "Brain not loaded (models/brain.pt missing)",
-                               0.0, None)
+                               "Brain not loaded: %s" % (self._brain_error
+                                                         or "missing"), 0.0,
+                              None)
             return
 
         im = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
@@ -383,12 +405,11 @@ class BrainTestEngine(TrainerEngine):
                 self.latest_screenshot = ov_b64
             if overlay_url:
                 self.latest_challenge_image = overlay_url
+        self._last_res = res
         self._record_round(question, fam, answer_text, conf, overlay_url,
                            learned=learned)
 
     def _extract_tiles(self, im):
-        """Crop the 3x3 tile grid: exact DOM boxes when available, else a
-        geometric split of the challenge area below the prompt bar."""
         W, H = im.size
         boxes_px = []
         if self._tile_boxes:
@@ -410,10 +431,8 @@ class BrainTestEngine(TrainerEngine):
             x0, y0 = max(0, x0), max(0, y0)
             x1, y1 = min(W, x1), min(H, y1)
             if x1 - x0 < 8 or y1 - y0 < 8:
-                tiles.append(None)
                 continue
             tiles.append(im.crop((x0, y0, x1, y1)))
-        tiles = [t for t in tiles if t is not None]
         return tiles, boxes_px
 
     def _format_answer(self, fam, res, reason):
@@ -491,22 +510,18 @@ class BrainTestEngine(TrainerEngine):
             self._add_log("Brain %s #%d [%s]: %s"
                           % (tag, len(self.rounds), fam, answer_text))
 
-    # ── cycle control: show the answer, then move to the next challenge ──
+    # ── after executing the answer, give hCaptcha time to react, then
+    #    cycle to the next challenge automatically ─────────────────────────
     async def _wait_for_human_completion(self, page):
-        """The Brain has already answered (reported in the Test tab). Give the
-        operator a window to complete the round manually via the LIVE camera
-        if they want; otherwise cycle to the next challenge automatically."""
         try:
             return await asyncio.wait_for(
-                super()._wait_for_human_completion(page), timeout=18.0)
+                super()._wait_for_human_completion(page), timeout=30.0)
         except asyncio.TimeoutError:
             self._add_log("Cycling to the next challenge…")
             return "success"
 
     def get_state(self) -> dict:
         st = super().get_state()
-        # pass_count here counts challenge CYCLES, not solved passes - the
-        # Brain only reports answers, it does not click them.
         st["cycles_count"] = st.pop("pass_count", 0)
         st.update({
             "mode": "brain-test",
@@ -515,6 +530,7 @@ class BrainTestEngine(TrainerEngine):
             "brain_loaded": self._brain_state == "loaded",
             "answered_count": self.answered_count,
             "deferred_count": self.deferred_count,
+            "executed_count": self.executed_count,
             "rounds": [dict(r) for r in self.rounds[-25:]],
         })
         return st
