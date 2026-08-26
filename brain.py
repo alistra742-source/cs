@@ -121,6 +121,19 @@ except Exception:  # pragma: no cover
     nn = None
     F = None
 
+# Decorator that works with AND without torch: the @_no_grad
+# decorators below are evaluated at import time, and with torch absent
+# (torch = None) they would raise "'NoneType' object has no attribute
+# 'no_grad'" and make the whole module unimportable - exactly the failure
+# seen on app hosts that do not install torch. With torch missing this is
+# a no-op and BrainSolver degrades to available=False (the app's vision
+# fallback path).
+if _TORCH:
+    _no_grad = torch.no_grad()
+else:  # pragma: no cover
+    def _no_grad(fn):
+        return fn
+
 
 def _bootstrap_siblings():
     """Make brain.py self-sufficient when run outside the repo.
@@ -1718,7 +1731,7 @@ def _save_brain(model, metrics, corpus, models_dir):
 #  Evaluation: held-out, per-family self-test (mirrors test_solver.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@torch.no_grad()
+@_no_grad
 def eval_brain(model, corpus, device="cpu", tile_va=None, point_va_single=None,
                drag_va=None, bbox_va=None, pat_va=None, count_va=None,
                text_va=None, router_va=None, verbose=True):
@@ -1965,7 +1978,7 @@ class BrainSolver:
             return self.model.features(self._prep_tile(im, size))
 
     # ── TileClassifier drop-in ────────────────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def probabilities(self, images):
         """List of {label: prob} dicts, one per image."""
         if not self.available:
@@ -1986,7 +1999,7 @@ class BrainSolver:
         return out
 
     # ── PointLocator drop-in ──────────────────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def _scores(self, image):
         """(presence_map (C,H,W), location (C,2)) in one forward pass."""
         if not self.available:
@@ -2084,7 +2097,7 @@ class BrainSolver:
         return (best["x"], best["y"], best["label"])
 
     # ── DragLocator drop-in ───────────────────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def locate_drag(self, image):
         if not self.available:
             return None
@@ -2095,7 +2108,7 @@ class BrainSolver:
                 "to": (float(pt[0]), float(pt[1]))}
 
     # ── BBox ──────────────────────────────────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def bbox(self, image):
         if not self.available:
             return None
@@ -2106,7 +2119,7 @@ class BrainSolver:
         return {"x": cx - w / 2, "y": cy - h / 2, "w": w, "h": h}
 
     # ── Text codes ("Type the text you see") ──────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def read_text(self, image):
         """Read a text-entry code image -> the decoded string."""
         if not self.available or not self.text_ok:
@@ -2117,7 +2130,7 @@ class BrainSolver:
         return "".join(TEXT_ALPHABET[p] for p in pred)
 
     # ── Pattern reasoner ──────────────────────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def solve_pattern(self, image, cell_boxes, cand_boxes, prompt=""):
         if not self.available:
             return None
@@ -2139,7 +2152,7 @@ class BrainSolver:
                 "box": cand_boxes[idx]}
 
     # ── Learned router (prompt -> family) ─────────────────────────────────
-    @torch.no_grad()
+    @_no_grad
     def router_predict(self, prompt, image=None):
         if not self.available:
             return None

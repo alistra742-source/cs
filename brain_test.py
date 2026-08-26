@@ -195,6 +195,12 @@ class BrainTestEngine(TrainerEngine):
             try:
                 self._ensure_brain_file()
                 import brain as _brain
+                if not _brain._TORCH:
+                    self._brain_state = "failed"
+                    self._brain_error = ("torch is not installed on this "
+                                         "machine - run: pip install torch")
+                    self._add_log("Brain needs torch: pip install torch")
+                    return None
                 self._solver = _brain.BrainSolver()
                 if not self._solver.available:
                     self._solver = None
