@@ -24,6 +24,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -70,11 +71,75 @@ class BrainTestEngine(TrainerEngine):
         with self._solver_lock:
             return self._get_solver_locked()
 
+    def _ensure_brain_file(self) -> bool:
+        """models/brain.pt is a ~149MB artifact that is NOT committed - it
+        lives in git as split parts. If the file is missing on this machine,
+        reassemble it automatically from whatever ref has the parts."""
+        import subprocess
+        root = os.path.dirname(os.path.abspath(__file__))
+        pt = os.path.join(root, "models", "brain.pt")
+        js = os.path.join(root, "models", "brain.json")
+        if os.path.exists(pt) and os.path.exists(js):
+            return True
+        namings = ("brain_part_%02d", "brain.pt.part-%02d")
+        refs = ["HEAD", "origin/arena/01a033e0-cs",
+                "arena/01a033e0-cs", "origin/main", "main"]
+        for ref in refs:
+            for naming in namings:
+                try:
+                    parts = []
+                    for i in range(12):
+                        p = subprocess.run(
+                            ["git", "show", "%s:%s" % (ref, naming % i)],
+                            cwd=root, capture_output=True, timeout=120)
+                        if p.returncode != 0 or len(p.stdout) < 1000:
+                            break
+                        parts.append(p.stdout)
+                    if len(parts) < 2:
+                        continue
+                    os.makedirs(os.path.dirname(pt), exist_ok=True)
+                    with open(pt, "wb") as f:
+                        for chunk in parts:
+                            f.write(chunk)
+                    j = subprocess.run(["git", "show", "%s:brain.json" % ref],
+                                       cwd=root, capture_output=True, timeout=30)
+                    try:
+                        d = json.loads(j.stdout) if j.returncode == 0 and                             j.stdout[:1] == b"{" else {}
+                    except Exception:
+                        d = {}
+                    d.setdefault("classes", __import__("make_dataset").CLASSES)
+                    d.setdefault("families", ["image_label_binary",
+                                              "area_select_point",
+                                              "area_select_bbox",
+                                              "image_drag_drop",
+                                              "multiple_choice", "text_entry",
+                                              "counting", "pattern", "tower"])
+                    d.setdefault("scene_size", 96)
+                    d.setdefault("tile_size", 64)
+                    d.setdefault("arch", {}).setdefault("width", 48)
+                    d["arch"].setdefault("prompt_dim", 512)
+                    d["arch"].setdefault("prompt_layers", 8)
+                    d["arch"].setdefault("d_concept", 320)
+                    d["arch"].setdefault("pattern_d", 320)
+                    d["arch"].setdefault("pattern_layers", 4)
+                    d["arch"]["text_len"] = 5
+                    with open(js, "w") as f:
+                        json.dump(d, f, indent=2)
+                    self._add_log("Reassembled models/brain.pt from %d git "
+                                  "parts (ref %s)." % (len(parts), ref))
+                    return True
+                except Exception:
+                    continue
+        self._add_log("models/brain.pt missing and no git parts found - "
+                      "train the Brain or commit the parts.")
+        return False
+
     def _get_solver_locked(self):
         if self._solver is None and not self._solver_tried:
             self._solver_tried = True
             self._brain_state = "loading"
             try:
+                self._ensure_brain_file()
                 import brain as _brain
                 self._solver = _brain.BrainSolver()
                 if not self._solver.available:
@@ -105,6 +170,40 @@ class BrainTestEngine(TrainerEngine):
             self._preload_solver()
         return queued
 
+    # ── render waiting: domcontentloaded fires long before the hCaptcha
+    # widget paints. Wait for the full render so fill/click are not
+    # attempted against a half-painted page. ─────────────────────────────
+    async def _wait_for_content(self, page, timeout: float = 30.0) -> bool:
+        ok = await super()._wait_for_content(page, timeout=timeout)
+        if not ok:
+            return ok
+        try:
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                if await page.evaluate("document.readyState") == "complete":
+                    break
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)          # settle: let the widget script run
+        self._add_log("Page rendered (readyState complete).")
+        return True
+
+    async def _wait_widget_iframe(self, page, timeout: float = 25.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stopped():
+            try:
+                found = await page.evaluate(
+                    "() => Array.from(document.querySelectorAll('iframe'))"
+                    ".some(f => (f.src || '').toLowerCase()"
+                    ".includes('hcaptcha'))")
+                if found:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
     # ── diagnostics: see exactly why form/checkbox steps fail ────────────
     async def _do_real_cycle(self) -> str:
         try:
@@ -114,12 +213,16 @@ class BrainTestEngine(TrainerEngine):
         return await super()._do_real_cycle()
 
     async def _fill_demo_field(self, page, value: str) -> bool:
-        ok = await super()._fill_demo_field(page, value)
-        if ok:
-            self._add_log("Demo form filled with sample text (%d chars)."
-                          % len(value))
-            await asyncio.sleep(1.2)     # let the camera capture the fill
-            return True
+        for attempt in range(3):
+            ok = await super()._fill_demo_field(page, value)
+            if ok:
+                self._add_log("Demo form filled with sample text (%d chars)."
+                              % len(value))
+                await asyncio.sleep(1.2)  # let the camera capture the fill
+                return True
+            self._add_log("Form field not ready yet (attempt %d/3) - "
+                          "waiting for render…" % (attempt + 1))
+            await asyncio.sleep(2.5)
         try:
             info = await page.evaluate(
                 "() => JSON.stringify(Array.from("
@@ -138,6 +241,11 @@ class BrainTestEngine(TrainerEngine):
         return await super()._wait_for_checkbox(page, timeout=timeout)
 
     async def _click_real_checkbox(self, page) -> bool:
+        if await self._wait_widget_iframe(page):
+            self._add_log("hCaptcha widget iframe detected - clicking.")
+        else:
+            self._add_log("No hcaptcha iframe after 25s - trying the click "
+                          "anyway (it may render late).")
         try:
             frames_info = await page.evaluate(
                 "() => JSON.stringify(Array.from("
