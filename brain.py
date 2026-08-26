@@ -606,6 +606,45 @@ def _to_float(x):
     return (x.float() / 255.0 - 0.5) / 0.5
 
 
+def _degrade_pil(im, rng):
+    """Apply REALISTIC degradations - the kind real screenshots carry: JPEG
+    compression (q35-85), gaussian blur, sensor noise, brightness/contrast/
+    colour shift, low-res resampling.
+
+    Two uses: (a) a fraction of TRAINING rounds is degraded so the Brain
+    learns robustness, and (b) the STRESS test degrades every held-out round,
+    so the reported accuracy is the honest real-world-ish number instead of
+    the flattering clean-synthetic one (the repo docs themselves warn that
+    synthetic train+test matches perfectly and overstates live results)."""
+    import io as _io
+    from PIL import Image as _Im, ImageEnhance, ImageFilter
+    resample = getattr(_Im, "Resampling", _Im).BILINEAR
+    im = im.convert("RGB")
+    if rng.random() < 0.8:
+        im = ImageEnhance.Brightness(im).enhance(rng.uniform(0.70, 1.30))
+        im = ImageEnhance.Contrast(im).enhance(rng.uniform(0.75, 1.25))
+        im = ImageEnhance.Color(im).enhance(rng.uniform(0.70, 1.30))
+    if rng.random() < 0.6:
+        im = im.filter(ImageFilter.GaussianBlur(rng.uniform(0.4, 1.4)))
+    if rng.random() < 0.6:
+        arr = np.asarray(im).astype(np.int16)
+        rs = np.random.RandomState(rng.randrange(1 << 30))
+        arr = np.clip(arr + (rs.randn(*arr.shape)
+                             * rng.uniform(4, 14)).astype(np.int16), 0, 255)
+        im = _Im.fromarray(arr.astype(np.uint8))
+    if rng.random() < 0.8:
+        buf = _io.BytesIO()
+        im.save(buf, "JPEG", quality=rng.randint(35, 85))
+        buf.seek(0)
+        im = _Im.open(buf).convert("RGB")
+    if rng.random() < 0.4:
+        w, h = im.size
+        f = rng.uniform(0.55, 0.80)
+        im = im.resize((max(8, int(w * f)), max(8, int(h * f))),
+                       resample).resize((w, h), resample)
+    return im
+
+
 def _count_peaks(chan, min_peak=0.08, min_sep=0.16, weak_gate=0.20,
                  max_n=9, margin=0.04):
     """Count instances from one class's presence channel (H, W).
@@ -949,6 +988,7 @@ def make_text_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
 def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                        n_drag=9000, n_grid=6000, n_pattern=6000, n_bbox=7000,
                        n_pipe=3000, n_tower=3000, n_shape=3000, n_text=4000,
+                       degrade_frac=0.35,
                        tile_size=DEFAULT_TILE_SIZE, scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
     """Build the full multi-task corpus in memory.
@@ -973,7 +1013,10 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     for cid, name in enumerate(CLASSES):
         for k in range(per_class):
             rng = random.Random("tile|%s|%d|%d" % (name, seed, k))
-            tx[i] = _img_to_u8(md.render(name, tile_size, rng), tile_size)
+            im = md.render(name, tile_size, rng)
+            if degrade_frac > 0 and rng.random() < degrade_frac:
+                im = _degrade_pil(im, rng)
+            tx[i] = _img_to_u8(im, tile_size)
             ty[i] = cid
             i += 1
         if (cid + 1) % 5 == 0 or cid == N_CLASSES - 1:
@@ -986,6 +1029,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     for k in range(n_grid):
         rng = random.Random("grid|%d|%d" % (seed, k))
         img, meta = make_grid_round(rng, scene_size)
+        if degrade_frac > 0 and rng.random() < degrade_frac:
+            img = _degrade_pil(img, rng)
         names = meta["tiles"]
         boxes = meta["tile_boxes"]
         W, H = img.size
@@ -1011,6 +1056,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         for k in range(n):
             rng = random.Random("%s|%d|%d" % (kind, seed, k))
             img, meta = fn(rng, scene_size)
+            if degrade_frac > 0 and rng.random() < degrade_frac:
+                img = _degrade_pil(img, rng)
             xs[k] = _img_to_u8(img, scene_size)
             metas.append(meta)
             if n >= 4000 and (k + 1) % 2000 == 0:
@@ -1039,6 +1086,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         for k in range(n):
             rng = random.Random("%s|%d|%d" % (kind, seed, k))
             img, meta = fn(rng, scene_size)
+            if degrade_frac > 0 and rng.random() < degrade_frac:
+                img = _degrade_pil(img, rng)
             kx[k] = _img_to_u8(img, scene_size)
             km.append(meta)
             if n >= 2000 and (k + 1) % 1000 == 0:
@@ -1056,6 +1105,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         for k in range(n_text):
             rng = random.Random("text|%d|%d" % (seed, k))
             img, meta = make_text_round(rng, scene_size)
+            if degrade_frac > 0 and rng.random() < degrade_frac:
+                img = _degrade_pil(img, rng)
             text_x[k] = _img_to_u8(img, scene_size)
             text_m.append(meta)
             if n_text >= 2000 and (k + 1) % 1000 == 0:
@@ -1073,6 +1124,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     for k in range(n_bbox):
         rng = random.Random("bbox|%d|%d" % (seed, k))
         img, meta = make_bbox_round(rng, scene_size)
+        if degrade_frac > 0 and rng.random() < degrade_frac:
+            img = _degrade_pil(img, rng)
         bbox_x[k] = _img_to_u8(img, scene_size)
         bbox_m.append(meta)
         if n_bbox >= 4000 and (k + 1) % 2000 == 0:
@@ -1085,6 +1138,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     for k in range(n_pattern):
         rng = random.Random("pattern|%d|%d" % (seed, k))
         img, meta = make_pattern_round(rng, scene_size)
+        if degrade_frac > 0 and rng.random() < degrade_frac:
+            img = _degrade_pil(img, rng)
         pat_imgs.append(img)
         pat_m.append(meta)
         if n_pattern >= 400 and (k + 1) % 200 == 0:
@@ -1591,8 +1646,43 @@ def train_brain(epochs=12, width=48, batch=64, lr=1e-3, seed=0,
                          drag_va=drag_va, bbox_va=bbox_va, pat_va=pat_va,
                          count_va=count_va, text_va=text_va,
                          router_va=router_va, verbose=verbose)
+    log("== STRESS eval: fresh rounds, EVERY image degraded (the honest numbers) ==")
+    sm = stress_test(model, device=device, verbose=verbose)
+    for k, v in sm.items():
+        metrics["stress_" + k] = v
     _save_brain(model, metrics, corpus, models_dir)
     return model, metrics
+
+
+def stress_test(model, device="cpu", n_rounds=12, n_grids=8, seed=999,
+                verbose=True):
+    """The HONEST accuracy number.
+
+    Fresh held-out rounds (a seed namespace disjoint from any training run)
+    with EVERY image degraded: JPEG compression, gaussian blur, sensor noise,
+    colour/brightness shift and low-res resampling - the artefacts real
+    screenshots carry. The clean-synthetic eval flatters because test matches
+    training perfectly (the repo docs say so themselves); this is the number
+    to trust. After training with degrade_frac>0 these numbers climb toward
+    the clean ones."""
+    corpus = build_brain_corpus(
+        per_class=20, n_point=n_rounds, n_count=max(4, n_rounds // 2),
+        n_drag=n_rounds, n_grid=n_grids, n_pattern=max(4, n_rounds // 3),
+        n_bbox=n_rounds, n_pipe=max(4, n_rounds // 2),
+        n_tower=max(4, n_rounds // 2), n_shape=max(4, n_rounds // 2),
+        n_text=n_rounds, degrade_frac=1.0, seed=seed, verbose=verbose)
+    va_tile = list(range(len(corpus["tile_y"])))
+    va_point = [i for i in range(len(corpus["point_m"]))
+                if corpus["point_m"][i].get("type") != "count"]
+    return eval_brain(model, corpus, device=device, tile_va=va_tile,
+                      point_va_single=va_point,
+                      drag_va=list(range(len(corpus["drag_m"]))),
+                      bbox_va=list(range(len(corpus["bbox_m"]))),
+                      pat_va=list(range(len(corpus["pat_m"]))),
+                      count_va=list(range(len(corpus["count_m"]))),
+                      text_va=list(range(len(corpus["text_m"]))),
+                      router_va=list(range(len(corpus["router"]))),
+                      verbose=verbose)
 
 
 def _save_brain(model, metrics, corpus, models_dir):
@@ -2209,6 +2299,8 @@ def main(argv=None):
     e = sub.add_parser("eval", help="load models/brain.pt + held-out self-test")
     e.add_argument("--device", default=None)
     e.add_argument("--seed", type=int, default=999)   # disjoint from training
+    e.add_argument("--stress", action="store_true",
+                   help="degraded rounds only - the honest accuracy")
 
     s = sub.add_parser("smoke", help="tiny corpus, 1 epoch, CPU sanity check")
 
@@ -2228,6 +2320,14 @@ def main(argv=None):
                                        n_tower=a.n_tower, n_shape=a.n_shape,
                                        n_text=a.n_text))
     elif a.cmd == "eval":
+        if a.stress:
+            solver = BrainSolver()
+            if not solver.available:
+                print("no models/brain.pt - run `python brain.py train` first")
+                return
+            print("== STRESS eval: fresh rounds, EVERY image degraded ==")
+            stress_test(solver.model, device=solver.device, seed=a.seed)
+            return
         corpus = build_brain_corpus(per_class=60, n_point=400, n_count=200,
                                     n_drag=400, n_grid=150, n_pattern=80,
                                     n_bbox=300, n_pipe=150, n_tower=150,
