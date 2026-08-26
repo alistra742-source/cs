@@ -38,6 +38,11 @@ import hcaptcha_types as hct
 # the GitHub raw fallback when neither loose files nor git have them.
 _BRAIN_SHA = "5886f0e3c86ffc8cabbde701412f938bcecb9f5a"
 
+# The live page the Test tab drives (override with BRAIN_TEST_URL).
+TARGET_URL = os.environ.get(
+    "BRAIN_TEST_URL",
+    "https://help.royalmail.com/resource/1736330734000/RMG_HCaptcha_Next")
+
 _TILE_BOXES_JS = r"""() => {
     const nodes = document.querySelectorAll(
         'div.task-image, [class*="task-image" i]');
@@ -230,12 +235,10 @@ class BrainTestEngine(TrainerEngine):
             self._preload_solver()
         return queued
 
-    # ── OWN simple cycle: open -> wait -> fill -> click -> solve ─────
-    # Direct, heavily-logged flow with generous waits. The widget iframe is
-    # located WITHOUT frame resolution (just the visible iframe element +
-    # bounding box), which is far more robust than the trainer's frame
-    # walking - and the checkbox is clicked at the iframe's left-center,
-    # exactly where hCaptcha draws it.
+    # ── OWN cycle for the target page: checkbox -> 15s challenge wait
+    # -> (no challenge) Next -> 5s -> checkbox again -> loop. When a
+    # challenge DOES appear, the Brain solves it (analyze -> click -> submit)
+    # and the loop continues. Heavily logged at every step.
     async def _find_widget_iframe_simple(self, page):
         try:
             locs = await page.locator("iframe").all()
@@ -262,60 +265,11 @@ class BrainTestEngine(TrainerEngine):
                 return loc
         return None
 
-    async def _do_real_cycle(self) -> str:
-        page = self._page
-        if page is None:
-            return "stopped"
-        with self._lock:
-            self.total_cycles += 1
-
-        # 1) open the demo and let it FULLY render
-        self._set_state("navigating", "Opening the hCaptcha demo...")
-        try:
-            await page.goto(trainer.TARGET_DEMO_URL,
-                            wait_until="domcontentloaded", timeout=60000)
-        except Exception as exc:
-            self._add_log("Could not open the demo page: %s" % exc)
-            self._set_state("error", "Could not open the demo page.")
-            return "error"
-        self._add_log("Demo page opened. Waiting 6s for full render...")
-        await asyncio.sleep(6.0)
-
-        # 2) fill the demo form field - 3 attempts while it renders
-        self._set_state("filling_form", "Filling the demo form field...")
-        try:
-            sample = trainer.generate_form_words()["field"]
-        except Exception:
-            sample = "hello world"
-        filled = False
-        for attempt in range(3):
-            try:
-                loc = page.locator(
-                    'input[type="text"], input:not([type]), textarea').first
-                if await loc.count() > 0:
-                    await loc.fill(sample, timeout=8000)
-                    filled = True
-                    self._add_log("Form field filled (attempt %d): %r"
-                                  % (attempt + 1, sample))
-                    break
-                self._add_log("No text field yet (attempt %d/3)..."
-                              % (attempt + 1))
-            except Exception as exc:
-                self._add_log("Form fill attempt %d failed: %s"
-                              % (attempt + 1, exc))
-            await asyncio.sleep(3.0)
-        if not filled:
-            self._add_log("Form never became fillable - continuing to the "
-                          "checkbox anyway.")
-        await asyncio.sleep(1.5)
-
-        # 3) wait (patiently, up to 60s) for the hCaptcha widget iframe and
-        #    click its left-center, where the checkbox is drawn
-        self._set_state("clicking_checkbox",
-                        "Waiting for the hCaptcha checkbox...")
-        clicked = False
+    async def _click_checkbox_patient(self, page, timeout=60.0) -> bool:
+        """Find the hCaptcha widget iframe and click its left-center (where
+        the checkbox is drawn). Waits patiently, logging progress."""
         waited = 0.0
-        while waited < 60.0 and not self._stopped():
+        while waited < timeout and not self._stopped():
             loc = await self._find_widget_iframe_simple(page)
             if loc is not None:
                 try:
@@ -328,10 +282,9 @@ class BrainTestEngine(TrainerEngine):
                         await page.mouse.move(cx, cy)
                         await asyncio.sleep(0.25)
                         await page.mouse.click(cx, cy)
-                        clicked = True
-                        self._add_log("CLICKED the checkbox at (%.0f, %.0f) "
-                                      "after %.0fs." % (cx, cy, waited))
-                        break
+                        self._add_log("CLICKED the checkbox at (%.0f, %.0f)."
+                                      % (cx, cy))
+                        return True
                 except Exception as exc:
                     self._add_log("Checkbox click failed (%s) - retrying..."
                                   % exc)
@@ -340,43 +293,89 @@ class BrainTestEngine(TrainerEngine):
                               "(%.0fs)..." % waited)
             await asyncio.sleep(2.5)
             waited += 2.5
-        if not clicked:
-            self._add_log("The hCaptcha widget iframe never appeared within "
-                          "60s - reloading the page for a fresh attempt.")
-            return "error"
+        return False
 
-        # 4) wait for the challenge (or an instant pass)
-        self._set_state("waiting_for_challenge",
-                        "Waiting for the challenge...")
-        deadline = time.monotonic() + 45.0
-        iframe = frame = None
+    async def _click_next(self, page) -> bool:
+        """Click the page's Next button."""
+        for sel in ('button:has-text("Next")',
+                    'input[type="submit"][value*="Next" i]',
+                    'a:has-text("Next")',
+                    '[role="button"]:has-text("Next")',
+                    'button:has-text("next")',
+                    '[class*="next" i] button'):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.click(timeout=8000)
+                    self._add_log("CLICKED the Next button (%s)." % sel)
+                    return True
+            except Exception:
+                continue
+        self._add_log("No Next button found on the page.")
+        return False
+
+    async def _wait_challenge(self, page, timeout=15.0):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self._stopped():
-            if await self._checkbox_is_checked(page):
-                self._add_log("Instant pass (no challenge) - refreshing.")
-                await self._reload_demo(page)
-                return "success"
             iframe, frame = await self._find_frame(
                 page, trainer.CHALLENGE_IFRAME_SELECTOR)
             if iframe is not None and frame is not None:
-                self._add_log("Challenge iframe is up.")
-                break
-            await asyncio.sleep(0.6)
-        if iframe is None or frame is None:
-            self._add_log("No challenge appeared within 45s.")
-            return "timeout"
+                return iframe, frame
+            await asyncio.sleep(0.5)
+        return None, None
 
-        # 5) capture + the Brain solves (analyzes, reports, clicks, submits)
-        self._set_state("solving", "The Brain is solving the challenge...")
-        image, question, full_text = await self._capture_challenge(iframe,
-                                                                   frame)
-        await self._record_challenge(image, question, full_text)
+    async def _do_real_cycle(self) -> str:
+        page = self._page
+        if page is None:
+            return "stopped"
+        with self._lock:
+            self.total_cycles += 1
 
-        # 6) let hCaptcha react, then move on to the next round
-        await asyncio.sleep(5.0)
-        result = await self._wait_for_human_completion(page)
-        if result == "success":
-            await self._reload_demo(page)
-        return result
+        # 1) open the target page and let it render
+        self._set_state("navigating", "Opening the page...")
+        try:
+            await page.goto(TARGET_URL,
+                            wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            self._add_log("Could not open the page: %s" % exc)
+            self._set_state("error", "Could not open the page.")
+            return "error"
+        self._add_log("Page opened. Waiting 6s for render...")
+        await asyncio.sleep(6.0)
+
+        # 2) the loop: checkbox -> 15s challenge -> Next -> 5s -> checkbox...
+        for step in range(12):
+            if self._stopped():
+                return "stopped"
+            self._set_state("clicking_checkbox",
+                            "Clicking the hCaptcha checkbox...")
+            if not await self._click_checkbox_patient(page, timeout=60.0):
+                self._add_log("Checkbox never appeared - reloading the page.")
+                return "error"
+
+            self._set_state("waiting_for_challenge",
+                            "Waiting up to 15s for the challenge...")
+            iframe, frame = await self._wait_challenge(page, timeout=15.0)
+            if iframe is not None and frame is not None:
+                # a challenge appeared: the Brain solves it
+                self._set_state("solving",
+                                "The Brain is solving the challenge...")
+                image, question, full_text = await self._capture_challenge(
+                    iframe, frame)
+                await self._record_challenge(image, question, full_text)
+                await asyncio.sleep(5.0)
+                await self._wait_for_human_completion(page)
+                continue        # back to the checkbox (loop)
+
+            # no challenge within 15s -> click Next, wait 5s, checkbox again
+            self._add_log("No challenge in 15s - clicking Next...")
+            if not await self._click_next(page):
+                self._add_log("Next not found - reloading the page.")
+                await self._reload_demo(page)
+                return "error"
+            self._add_log("Waiting 5s, then clicking the checkbox again...")
+            await asyncio.sleep(5.0)
+        return "success"
 
     # ── capture: tile boxes + keep the live frame for executing answers ──
     async def _capture_challenge(self, iframe, frame):
@@ -677,6 +676,7 @@ class BrainTestEngine(TrainerEngine):
     def get_state(self) -> dict:
         st = super().get_state()
         st["cycles_count"] = st.pop("pass_count", 0)
+        st["target_url"] = TARGET_URL
         st.update({
             "mode": "brain-test",
             "brain_state": self._brain_state,
