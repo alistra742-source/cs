@@ -1063,6 +1063,18 @@ async def _start_brain_test_runner(speed: float = 2.0) -> dict:
         return {"ok": False, "message": browser["error"], "browser": browser}
     state = _workers.get("B1") or _init_worker("B1")
     bot = state.get("bot")
+    # The shared-browser helper parks the page on the hCaptcha DEMO; navigate
+    # straight to the brain-test target so the camera opens on Royal Mail.
+    if bot is not None:
+        try:
+            nav = await live_control.live_navigate(bot,
+                                                   brain_test.TARGET_URL)
+            if nav.get("screenshot"):
+                state["last_shot_b64"] = nav["screenshot"]
+            _log("[B1] [BrainTest] Navigated to %s" % brain_test.TARGET_URL)
+        except Exception as exc:
+            _log("[B1] [BrainTest] Initial navigation failed (%s); the "
+                 "cycle will retry." % exc)
     result = brain_test.brain_engine.start_external(
         getattr(bot, "_page", None), speed=speed, one_shot=False,
     )

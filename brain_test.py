@@ -331,15 +331,16 @@ class BrainTestEngine(TrainerEngine):
         with self._lock:
             self.total_cycles += 1
 
-        # 1) open the target page and let it render
+        # 1) open the target page and let it render. A goto timeout is NOT
+        #    fatal: the page is often usable anyway, so continue to the
+        #    checkbox instead of bouncing back to the previous page forever.
         self._set_state("navigating", "Opening the page...")
         try:
             await page.goto(TARGET_URL,
                             wait_until="domcontentloaded", timeout=60000)
         except Exception as exc:
-            self._add_log("Could not open the page: %s" % exc)
-            self._set_state("error", "Could not open the page.")
-            return "error"
+            self._add_log("Page load was slow (%s) - continuing on whatever "
+                          "is rendered..." % exc)
         self._add_log("Page opened. Waiting 6s for render...")
         await asyncio.sleep(6.0)
 
