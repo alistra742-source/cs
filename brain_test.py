@@ -231,9 +231,37 @@ class BrainTestEngine(TrainerEngine):
         return queued
 
     # ── OWN simple cycle: open -> wait -> fill -> click -> solve ─────
-    # The trainer's tangled cycle kept failing on some hosts; this is a
-    # direct, heavily-logged flow with generous waits. Every step is visible
-    # in the Activity Log.
+    # Direct, heavily-logged flow with generous waits. The widget iframe is
+    # located WITHOUT frame resolution (just the visible iframe element +
+    # bounding box), which is far more robust than the trainer's frame
+    # walking - and the checkbox is clicked at the iframe's left-center,
+    # exactly where hCaptcha draws it.
+    async def _find_widget_iframe_simple(self, page):
+        try:
+            locs = await page.locator("iframe").all()
+        except Exception:
+            return None
+        for loc in locs:
+            try:
+                src = (await loc.get_attribute("src") or "").lower()
+                title = (await loc.get_attribute("title") or "").lower()
+            except Exception:
+                continue
+            is_hcaptcha = ("hcaptcha" in src or "hcaptcha" in title
+                           or "checkbox" in title)
+            if not is_hcaptcha:
+                continue
+            if "challenge" in src or "challenge" in title:
+                continue
+            try:
+                box = await loc.bounding_box()
+            except Exception:
+                box = None
+            if box and float(box.get("width") or 0) > 20 \
+                    and float(box.get("height") or 0) > 20:
+                return loc
+        return None
+
     async def _do_real_cycle(self) -> str:
         page = self._page
         if page is None:
@@ -242,72 +270,84 @@ class BrainTestEngine(TrainerEngine):
             self.total_cycles += 1
 
         # 1) open the demo and let it FULLY render
-        self._set_state("navigating", "Opening the hCaptcha demo…")
+        self._set_state("navigating", "Opening the hCaptcha demo...")
         try:
             await page.goto(trainer.TARGET_DEMO_URL,
-                            wait_until="load", timeout=60000)
-        except Exception:
-            try:
-                await page.goto(trainer.TARGET_DEMO_URL,
-                                wait_until="domcontentloaded", timeout=60000)
-            except Exception as exc:
-                self._add_log("Could not open the demo page: %s" % exc)
-                self._set_state("error", "Could not open the demo page.")
-                return "error"
-        self._add_log("Demo page opened. Waiting 5s for full render…")
-        await asyncio.sleep(5.0)
+                            wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            self._add_log("Could not open the demo page: %s" % exc)
+            self._set_state("error", "Could not open the demo page.")
+            return "error"
+        self._add_log("Demo page opened. Waiting 6s for full render...")
+        await asyncio.sleep(6.0)
 
-        # 2) fill the demo form field (any visible text input / textarea)
-        self._set_state("filling_form", "Filling the demo form field…")
+        # 2) fill the demo form field - 3 attempts while it renders
+        self._set_state("filling_form", "Filling the demo form field...")
         try:
             sample = trainer.generate_form_words()["field"]
         except Exception:
             sample = "hello world"
-        try:
-            loc = page.locator(
-                'input[type="text"], input:not([type]), textarea').first
-            if await loc.count() > 0:
-                await loc.fill(sample, timeout=8000)
-                self._add_log("Form field filled: %r" % sample)
-            else:
-                self._add_log("No text field on the page - continuing.")
-        except Exception as exc:
-            self._add_log("Form fill failed: %s" % exc)
-        await asyncio.sleep(2.0)
+        filled = False
+        for attempt in range(3):
+            try:
+                loc = page.locator(
+                    'input[type="text"], input:not([type]), textarea').first
+                if await loc.count() > 0:
+                    await loc.fill(sample, timeout=8000)
+                    filled = True
+                    self._add_log("Form field filled (attempt %d): %r"
+                                  % (attempt + 1, sample))
+                    break
+                self._add_log("No text field yet (attempt %d/3)..."
+                              % (attempt + 1))
+            except Exception as exc:
+                self._add_log("Form fill attempt %d failed: %s"
+                              % (attempt + 1, exc))
+            await asyncio.sleep(3.0)
+        if not filled:
+            self._add_log("Form never became fillable - continuing to the "
+                          "checkbox anyway.")
+        await asyncio.sleep(1.5)
 
-        # 3) click the hCaptcha checkbox (widget iframe, left-center)
-        self._set_state("clicking_checkbox", "Clicking the hCaptcha checkbox…")
+        # 3) wait (patiently, up to 60s) for the hCaptcha widget iframe and
+        #    click its left-center, where the checkbox is drawn
+        self._set_state("clicking_checkbox",
+                        "Waiting for the hCaptcha checkbox...")
         clicked = False
-        for attempt in range(8):
-            iframe, frame = await self._find_widget(page)
-            if iframe is not None:
+        waited = 0.0
+        while waited < 60.0 and not self._stopped():
+            loc = await self._find_widget_iframe_simple(page)
+            if loc is not None:
                 try:
-                    box = await iframe.bounding_box()
+                    box = await loc.bounding_box()
                     if box and float(box.get("width") or 0) > 20:
                         cx = box["x"] + min(38.0, box["width"] * 0.2)
                         cy = box["y"] + box["height"] / 2.0
                         await page.mouse.move(cx - 80, cy - 50)
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.3)
                         await page.mouse.move(cx, cy)
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.25)
                         await page.mouse.click(cx, cy)
                         clicked = True
-                        self._add_log("CLICKED the checkbox at (%.0f, %.0f)."
-                                      % (cx, cy))
+                        self._add_log("CLICKED the checkbox at (%.0f, %.0f) "
+                                      "after %.0fs." % (cx, cy, waited))
                         break
                 except Exception as exc:
-                    self._add_log("Checkbox click failed (%s) - retrying…"
+                    self._add_log("Checkbox click failed (%s) - retrying..."
                                   % exc)
-            if attempt == 0:
-                self._add_log("Waiting for the hCaptcha widget iframe…")
+            if int(waited) % 10 == 0 and waited > 0:
+                self._add_log("Still waiting for the hCaptcha checkbox "
+                              "(%.0fs)..." % waited)
             await asyncio.sleep(2.5)
+            waited += 2.5
         if not clicked:
-            self._add_log("The hCaptcha widget never appeared on the page.")
-            self._set_state("error", "hCaptcha widget did not appear.")
+            self._add_log("The hCaptcha widget iframe never appeared within "
+                          "60s - reloading the page for a fresh attempt.")
             return "error"
 
         # 4) wait for the challenge (or an instant pass)
-        self._set_state("waiting_for_challenge", "Waiting for the challenge…")
+        self._set_state("waiting_for_challenge",
+                        "Waiting for the challenge...")
         deadline = time.monotonic() + 45.0
         iframe = frame = None
         while time.monotonic() < deadline and not self._stopped():
@@ -326,7 +366,7 @@ class BrainTestEngine(TrainerEngine):
             return "timeout"
 
         # 5) capture + the Brain solves (analyzes, reports, clicks, submits)
-        self._set_state("solving", "The Brain is solving the challenge…")
+        self._set_state("solving", "The Brain is solving the challenge...")
         image, question, full_text = await self._capture_challenge(iframe,
                                                                    frame)
         await self._record_challenge(image, question, full_text)
