@@ -421,19 +421,28 @@ if _TORCH:
             return ctr, wh
 
     class TextHead(nn.Module):
-        """text_entry ("Type the text you see"): pooled features -> one
-        36-way (A-Z0-9) classification per character position. Fixed 5-char
-        codes - the shape hCaptcha's text rounds use."""
+        """text_entry ("Type the text you see"): column-strip pooling -> one
+        36-way (A-Z0-9) classification per character position.
+
+        Position-aware by construction: the feature map is pooled into
+        text_len vertical STRIPS (one per character column) and each strip is
+        classified separately. A global average pool would destroy the
+        horizontal position of each character and make per-position
+        prediction impossible (that was the v1 bug - the head could not
+        learn)."""
 
         def __init__(self, c_in, text_len=5, n_chars=36):
             super().__init__()
             self.text_len = text_len
             self.n_chars = n_chars
-            self.fc = nn.Linear(c_in, text_len * n_chars)
+            self.fc = nn.Linear(c_in, n_chars)
 
         def forward(self, feat):
-            pooled = F.adaptive_avg_pool2d(feat, 1).flatten(1)
-            return self.fc(pooled)
+            # (B, C, H, W) -> (B, C, 1, L) -> (B, L, C) -> (B, L*n_chars)
+            strips = F.adaptive_avg_pool2d(feat, (1, self.text_len))
+            strips = strips.squeeze(2).permute(0, 2, 1)      # (B, L, C)
+            out = self.fc(strips)                            # (B, L, 36)
+            return out.flatten(1)
 
     class RouterHead(nn.Module):
         """Learned (prompt + image) -> family classifier.
@@ -1794,6 +1803,7 @@ class BrainSolver:
     def __init__(self, models_dir=MODELS_DIR, device=None,
                  min_conf=float(os.environ.get("SOLVER_CNN_MIN_CONF", "0.62"))):
         self.available = False
+        self.text_ok = True     # False when an old-format brain has no v2 text head
         self.model = None
         self.classes = list(CLASSES)
         self.families = list(FAMILIES)
@@ -1835,9 +1845,21 @@ class BrainSolver:
             self.model.load_state_dict(torch.load(pt, map_location=self.device))
             self.model.to(self.device).eval()
             self.available = True
-        except Exception:  # pragma: no cover
-            self.model = None
-            self.available = False
+        except Exception:  # old-format brain (v1 TextHead) - retry without it
+            try:
+                state = torch.load(pt, map_location=self.device)
+                filt = {k: v for k, v in state.items()
+                        if not k.startswith("text_head.")}
+                missing = set(self.model.state_dict().keys()) - set(filt.keys())
+                self.model.load_state_dict(filt, strict=False)
+                if missing and not all(k.startswith("text_head.") for k in missing):
+                    raise RuntimeError("unexpected missing keys: %s" % missing)
+                self.model.to(self.device).eval()
+                self.available = True
+                self.text_ok = False     # v1 text head -> not loadable
+            except Exception:  # pragma: no cover
+                self.model = None
+                self.available = False
 
     # ── low-level image prep ──────────────────────────────────────────────
     def _prep_tile(self, im, size=None):
@@ -1997,7 +2019,7 @@ class BrainSolver:
     @torch.no_grad()
     def read_text(self, image):
         """Read a text-entry code image -> the decoded string."""
-        if not self.available:
+        if not self.available or not self.text_ok:
             return None
         logits = self.model.text_logits(self._feat(image, self.size)).view(
             1, self.model.text_head.text_len, self.model.text_head.n_chars)
@@ -2087,7 +2109,7 @@ class BrainSolver:
             if family == hct.TEXT_ENTRY:
                 code = self.read_text(image)
                 return ({"family": TEXT_ENTRY, "answer": code,
-                         "confidence": 0.9} if code else None)
+                         "confidence": 0.9} if code else None)  # None if v1 brain
             if family == PATTERN:
                 return self._solve_pattern(image, cell_boxes, cand_boxes, prompt)
             if family in (hct.DRAG_DROP, TOWER):
