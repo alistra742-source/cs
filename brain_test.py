@@ -274,45 +274,181 @@ class BrainTestEngine(TrainerEngine):
                 best = best or loc
         return best
 
+    async def _widget_error_text(self, frame) -> str:
+        """hCaptcha's own error banner inside the widget frame ("Rate
+        limited or network error. Please retry.", "Your access to this
+        site was blocked", ...) — when present the checkbox node is INERT
+        or never rendered, so no click will ever register. Returns "" when
+        the widget is healthy. This is what answers "is it loading or is
+        something blocking it"."""
+        try:
+            text = await frame.evaluate(
+                "() => (document.body ? document.body.innerText : '')")
+        except Exception:
+            return ""
+        low = (text or "").lower()
+        for kw in ("rate limited or network error", "rate limited",
+                   "network error", "please retry", "please try again",
+                   "automated queries", "access to this site was blocked",
+                   "connection error", "could not load", "unable to load",
+                   "something went wrong"):
+            if kw in low:
+                return (text or "").strip()[:160]
+        return ""
+
+    async def _checkbox_node_ready(self, frame) -> bool:
+        """True once the #checkbox node actually exists INSIDE the widget
+        frame. The old flow clicked the iframe element the moment it
+        appeared — before the frame's document had rendered the checkbox —
+        which is exactly the 'frame_locator click failed: element not
+        found' in the Activity Log."""
+        try:
+            controls = frame.locator(", ".join(trainer.CHECKBOX_SELECTOR))
+            return await controls.count() > 0
+        except Exception:
+            pass
+        try:
+            return bool(await frame.evaluate(
+                "() => !!document.querySelector("
+                "'#checkbox, [role=\\\"checkbox\\\"], .checkbox, "
+                "input[type=\\\"checkbox\\\"], [aria-checked]')"))
+        except Exception:
+            return False
+
+    async def _scroll_widget_into_view(self, iframe) -> None:
+        """Make sure the widget iframe is inside the viewport — page-space
+        mouse clicks land nowhere when the iframe is below the fold."""
+        try:
+            await iframe.scroll_into_view_if_needed(timeout=4000)
+            return
+        except Exception:
+            pass
+        try:
+            await iframe.evaluate(
+                "(el) => el.scrollIntoView({block: 'center', inline: 'nearest'})")
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
     async def _click_checkbox_patient(self, page, timeout=60.0) -> bool:
-        """Click the hCaptcha checkbox with the PROVEN strategies (the
-        trainer's own doc: a lone locator click inside a cross-origin widget
-        iframe almost never registers on this engine):
+        """Click the hCaptcha checkbox and ONLY report success when hCaptcha
+        itself confirms it (aria-checked=true, a challenge iframe spawned,
+        or a response token appeared). The old flow clicked blind: the
+        frame_locator click ran before the widget frame had rendered
+        #checkbox (so it failed with 'element not found') and the
+        page-space mouse click was logged as "CLICKED the checkbox at page
+        (x, y)." even when nothing happened — which is why the loop saw
+        "No challenge in 15s" forever.
 
-        1. page.frame_locator(iframe[src=...]).locator(#checkbox).click()
-           - works purely by iframe src, no frame resolution needed
-        2. a real page-space mouse click on the checkbox area (iframe left
-           side, vertically centred - where the 30x30 #checkbox lives)
-        3. JS el.click() through the frame_locator
-
-        When nothing is found for 10s, the page's iframe inventory is dumped
-        to the Activity Log so a mismatch is visible immediately."""
-        waited = 0.0
-        dumped = False
-        while waited < timeout and not self._stopped():
-            loc = await self._find_widget_iframe_simple(page)
-            if loc is not None:
-                try:
-                    src = await loc.get_attribute("src") or ""
-                except Exception:
-                    src = ""
-                # strategy 1: frame_locator click (by iframe src)
-                if src:
+        New flow:
+        1. WAIT for the widget frame AND its #checkbox node to actually
+           exist (up to ``timeout``) instead of clicking the iframe
+           element the moment it appears.
+        2. When the widget shows an error banner instead of the checkbox
+           (rate limited / network error / blocked IP), surface the exact
+           text and give up so the caller refreshes the page.
+        3. Click ladder with CONFIRMATION after every strategy:
+           frame_locator click, page-space mouse click on the real
+           checkbox rect, keyboard activation, JS el.click() — each one
+           only counts when _confirm_checkbox passes.
+        """
+        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        last_log = 0.0
+        dumped_inventory = False
+        dumped_dom = False
+        while time.monotonic() < deadline and not self._stopped():
+            iframe, frame = await self._find_widget(page)
+            if iframe is None or frame is None:
+                elapsed = time.monotonic() - started
+                if elapsed >= 10.0 and not dumped_inventory:
+                    dumped_inventory = True
                     try:
-                        fl = page.frame_locator('iframe[src="%s"]' % src)
-                        cb = fl.locator(", ".join(trainer.CHECKBOX_SELECTOR))
-                        await cb.first.click(timeout=5000)
-                        self._add_log("CLICKED #checkbox via frame_locator.")
-                        return True
+                        info = await page.evaluate(
+                            "() => JSON.stringify(Array.from("
+                            "document.querySelectorAll('iframe'))"
+                            ".map(f => ({src: (f.src||'').slice(0, 80), "
+                            "title: f.title || '', w: f.offsetWidth, "
+                            "h: f.offsetHeight})))")
+                        self._add_log("IFRAME INVENTORY: %s" % info)
+                    except Exception:
+                        pass
+                if elapsed - last_log >= 6.0:
+                    last_log = elapsed
+                    self._add_log("Still waiting for the hCaptcha checkbox "
+                                  "widget (%.0fs)..." % elapsed)
+                await asyncio.sleep(0.5)
+                continue
+
+            # ── widget iframe exists — wait for the checkbox NODE ──
+            if not await self._checkbox_node_ready(frame):
+                err = await self._widget_error_text(frame)
+                if err:
+                    self._add_log(
+                        "hCaptcha widget is NOT showing the checkbox — it "
+                        "shows an error banner instead: %r. The widget "
+                        "isn't loading / is being blocked; refreshing the "
+                        "page for a fresh attempt." % err)
+                    return False
+                elapsed = time.monotonic() - started
+                if elapsed - last_log >= 6.0:
+                    last_log = elapsed
+                    self._add_log("Widget frame is up, but the checkbox "
+                                  "node is not rendered yet (%.0fs)..."
+                                  % elapsed)
+                await asyncio.sleep(0.5)
+                continue
+
+            # ── the checkbox exists: scroll it into view and click ──
+            await self._scroll_widget_into_view(iframe)
+            full_src = ""
+            try:
+                full_src = await iframe.get_attribute("src") or ""
+            except Exception:
+                full_src = ""
+            page_point = await self._widget_page_point(page, iframe, frame)
+            if page_point:
+                self._add_log(
+                    "Checkbox target at page (%.0f, %.0f)." % page_point)
+
+            for attempt in range(1, 5):
+                if attempt > 1:
+                    await asyncio.sleep(0.4)
+                    iframe2, frame2 = await self._find_widget(page)
+                    if iframe2 is not None:
+                        iframe = iframe2
+                    if frame2 is not None:
+                        frame = frame2
+                        try:
+                            full_src = await iframe.get_attribute("src") \
+                                or full_src
+                        except Exception:
+                            pass
+                        page_point = (await self._widget_page_point(
+                            page, iframe, frame)) or page_point
+
+                # strategy 1: frame_locator click (by iframe src)
+                if full_src and "hcaptcha" in full_src.lower():
+                    try:
+                        fl = page.frame_locator('iframe[src="%s"]' % full_src)
+                        fl_cb = fl.locator(", ".join(trainer.CHECKBOX_SELECTOR))
+                        for ci in range(min(4, await fl_cb.count())):
+                            try:
+                                await fl_cb.nth(ci).click(timeout=3000)
+                                if await self._confirm_checkbox(
+                                        page, frame,
+                                        "frame click #%d (attempt %d)"
+                                        % (ci, attempt)):
+                                    return True
+                            except Exception:
+                                continue
                     except Exception as exc:
-                        self._add_log("frame_locator click failed: %s"
-                                      % exc)
-                # strategy 2: page-space mouse click on the checkbox area
-                try:
-                    box = await loc.bounding_box()
-                    if box and float(box.get("width") or 0) > 20:
-                        cx = box["x"] + min(31.0, box["width"] * 0.15)
-                        cy = box["y"] + box["height"] / 2.0
+                        self._add_log("frame_locator click failed: %s" % exc)
+
+                # strategy 2: page-space mouse click on the checkbox rect
+                if page_point:
+                    try:
+                        cx, cy = page_point
                         try:
                             await page.mouse.move(cx - 80, cy - 50, steps=3)
                         except Exception:
@@ -324,41 +460,68 @@ class BrainTestEngine(TrainerEngine):
                             pass
                         await asyncio.sleep(0.25)
                         await page.mouse.click(cx, cy)
-                        self._add_log("CLICKED the checkbox at page (%.0f, "
-                                      "%.0f)." % (cx, cy))
-                        return True
-                except Exception as exc:
-                    self._add_log("mouse click failed: %s" % exc)
-                # strategy 3: JS el.click() through the frame_locator
-                if src:
-                    try:
-                        fl = page.frame_locator('iframe[src="%s"]' % src)
-                        await fl.locator(
-                            ", ".join(trainer.CHECKBOX_SELECTOR)
-                        ).first.evaluate("el => el.click()")
-                        self._add_log("JS-clicked #checkbox via "
-                                      "frame_locator.")
-                        return True
+                        self._add_log("Mouse click at page (%.0f, %.0f) — "
+                                      "verifying..." % (cx, cy))
+                        if await self._confirm_checkbox(
+                                page, frame,
+                                "mouse click (attempt %d)" % attempt):
+                            self._add_log("CLICKED the checkbox at page "
+                                          "(%.0f, %.0f)." % (cx, cy))
+                            return True
                     except Exception as exc:
-                        self._add_log("frame_locator js click failed: %s"
-                                      % exc)
-            if waited >= 10.0 and not dumped:
-                dumped = True
+                        self._add_log("mouse click failed: %s" % exc)
+
+                # strategy 3: keyboard activation (role=checkbox activates
+                # via Enter/Space; no coordinates involved)
                 try:
-                    info = await page.evaluate(
-                        "() => JSON.stringify(Array.from("
-                        "document.querySelectorAll('iframe'))"
-                        ".map(f => ({src: (f.src||'').slice(0, 80), "
-                        "title: f.title || '', w: f.offsetWidth, "
-                        "h: f.offsetHeight})))")
-                    self._add_log("IFRAME INVENTORY: %s" % info)
+                    await frame.evaluate("""() => {
+                        const el = document.querySelector(
+                            '[role="checkbox"], #checkbox, .checkbox, [aria-checked], .button-submit');
+                        if (el) el.focus();
+                    }""")
+                    await asyncio.sleep(0.1)
+                    await page.keyboard.press("Enter")
+                    if await self._confirm_checkbox(
+                            page, frame,
+                            "keyboard Enter (attempt %d)" % attempt):
+                        return True
+                    await page.keyboard.press("Space")
+                    if await self._confirm_checkbox(
+                            page, frame,
+                            "keyboard Space (attempt %d)" % attempt):
+                        return True
                 except Exception:
                     pass
-            if int(waited) % 10 == 0 and waited > 0:
-                self._add_log("Still waiting for the hCaptcha checkbox "
-                              "(%.0fs)..." % waited)
-            await asyncio.sleep(2.5)
-            waited += 2.5
+
+                # strategy 4: JS el.click() inside the widget frame
+                try:
+                    js_clicked = await frame.evaluate("""() => {
+                        const el = document.querySelector(
+                            '[role="checkbox"], #checkbox, .checkbox, input[type="checkbox"], [aria-checked], .button-submit');
+                        if (!el) return false;
+                        el.click();
+                        return true;
+                    }""")
+                    if js_clicked and await self._confirm_checkbox(
+                            page, frame,
+                            "JS click (attempt %d)" % attempt):
+                        return True
+                except Exception as exc:
+                    self._add_log("JS checkbox click failed: %s" % exc)
+
+            # all strategies ran without hCaptcha confirming — dump the
+            # widget DOM once so a silent mismatch is visible, then keep
+            # waiting (the widget may still be mid-render) until timeout.
+            if not dumped_dom:
+                dumped_dom = True
+                try:
+                    html = await frame.evaluate(
+                        "() => (document.body ? document.body.outerHTML : '').slice(0, 1200)")
+                    self._add_log("Widget frame DOM (no click confirmed): "
+                                  "%s" % html)
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
         return False
 
     async def _click_next(self, page) -> bool:
@@ -418,8 +581,9 @@ class BrainTestEngine(TrainerEngine):
             self._set_state("clicking_checkbox",
                             "Clicking the hCaptcha checkbox...")
             if not await self._click_checkbox_patient(page, timeout=60.0):
-                self._add_log("Checkbox never appeared - refreshing the "
-                              "page for a fresh attempt.")
+                self._add_log("Checkbox click not confirmed (widget "
+                              "missing, blocked, or click never registered) "
+                              "- refreshing the page for a fresh attempt.")
                 await self._refresh_page(page)
                 continue
 
