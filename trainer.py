@@ -2,10 +2,11 @@
 
 This module deliberately does *not* manufacture challenges, issue tokens, or
 solve CAPTCHA challenges.  It drives the official hCaptcha demo in a real
-Chrome tab, fills its optional sample field, clicks the real checkbox, and
-then pauses when hCaptcha asks for a human.  The actual challenge iframe is
-captured and its visible prompt is copied into the dashboard so an operator
-can inspect it and complete the check manually.
+Chrome tab and clicks the real checkbox - nothing else (the demo's optional
+sample field is left untouched) - then pauses when hCaptcha asks for a
+human.  The actual challenge iframe is captured and its visible prompt is
+copied into the dashboard so an operator can inspect it and complete the
+check manually.
 """
 
 from __future__ import annotations
@@ -1161,12 +1162,10 @@ class TrainerEngine:
         if self._stopped():
             return "stopped"
 
-        form_data = generate_form_words()
+        # Checkbox-only flow: click the hCaptcha checkbox and NOTHING else.
+        # The demo's optional sample field is intentionally left untouched.
         with self._lock:
-            self.current_form = form_data
-        self._set_state("filling_form", "Filling the real demo field with a short sample…")
-        if not await self._fill_demo_field(page, form_data["field"]):
-            self._add_log("Official demo optional field was not found; continuing to hCaptcha.")
+            self.current_form = generate_form_words()
         if self._stopped():
             return "stopped"
 
