@@ -41,7 +41,7 @@ _BRAIN_SHA = "5886f0e3c86ffc8cabbde701412f938bcecb9f5a"
 # The live page the Test tab drives (override with BRAIN_TEST_URL).
 TARGET_URL = os.environ.get(
     "BRAIN_TEST_URL",
-    "https://help.royalmail.com/resource/1736330734000/RMG_HCaptcha_Next")
+    "https://democaptcha.com/demo-form-eng/hcaptcha.html")
 
 _TILE_BOXES_JS = r"""() => {
     const nodes = document.querySelectorAll(
@@ -344,18 +344,21 @@ class BrainTestEngine(TrainerEngine):
         self._add_log("Page opened. Waiting 6s for render...")
         await asyncio.sleep(6.0)
 
-        # 2) the loop: checkbox -> 15s challenge -> Next -> 5s -> checkbox...
-        for step in range(12):
+        # 2) the loop: click the checkbox -> wait for the challenge ->
+        #    (no challenge) refresh the page and try again
+        for step in range(20):
             if self._stopped():
                 return "stopped"
             self._set_state("clicking_checkbox",
                             "Clicking the hCaptcha checkbox...")
             if not await self._click_checkbox_patient(page, timeout=60.0):
-                self._add_log("Checkbox never appeared - reloading the page.")
-                return "error"
+                self._add_log("Checkbox never appeared - refreshing the "
+                              "page for a fresh attempt.")
+                await self._refresh_page(page)
+                continue
 
             self._set_state("waiting_for_challenge",
-                            "Waiting up to 15s for the challenge...")
+                            "Waiting for the challenge...")
             iframe, frame = await self._wait_challenge(page, timeout=15.0)
             if iframe is not None and frame is not None:
                 # a challenge appeared: the Brain solves it
@@ -368,15 +371,22 @@ class BrainTestEngine(TrainerEngine):
                 await self._wait_for_human_completion(page)
                 continue        # back to the checkbox (loop)
 
-            # no challenge within 15s -> click Next, wait 5s, checkbox again
-            self._add_log("No challenge in 15s - clicking Next...")
-            if not await self._click_next(page):
-                self._add_log("Next not found - reloading the page.")
-                await self._reload_demo(page)
-                return "error"
-            self._add_log("Waiting 5s, then clicking the checkbox again...")
-            await asyncio.sleep(5.0)
+            # no challenge within 15s -> refresh the page and retry
+            self._add_log("No challenge in 15s - refreshing the page...")
+            await self._refresh_page(page)
         return "success"
+
+    async def _refresh_page(self, page) -> None:
+        """Refresh the page (fallback: re-navigate) and wait for render."""
+        try:
+            await page.reload(timeout=45000)
+        except Exception:
+            try:
+                await page.goto(TARGET_URL,
+                                wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+        await asyncio.sleep(6.0)
 
     # ── capture: tile boxes + keep the live frame for executing answers ──
     async def _capture_challenge(self, iframe, frame):
