@@ -78,6 +78,10 @@ class BrainTestEngine(TrainerEngine):
         self.rounds: List[Dict[str, Any]] = []
         self.answered_count = 0
         self.deferred_count = 0
+        # Set when the widget shows hCaptcha's own error banner instead of
+        # the checkbox (rate limited / blocked IP / network error). Cleared
+        # after a successful click.
+        self._widget_blocked = ""
         self.executed_count = 0
 
     # ── brain file: reassemble from loose files / git / GitHub raw ───────
@@ -274,28 +278,6 @@ class BrainTestEngine(TrainerEngine):
                 best = best or loc
         return best
 
-    async def _widget_error_text(self, frame) -> str:
-        """hCaptcha's own error banner inside the widget frame ("Rate
-        limited or network error. Please retry.", "Your access to this
-        site was blocked", ...) — when present the checkbox node is INERT
-        or never rendered, so no click will ever register. Returns "" when
-        the widget is healthy. This is what answers "is it loading or is
-        something blocking it"."""
-        try:
-            text = await frame.evaluate(
-                "() => (document.body ? document.body.innerText : '')")
-        except Exception:
-            return ""
-        low = (text or "").lower()
-        for kw in ("rate limited or network error", "rate limited",
-                   "network error", "please retry", "please try again",
-                   "automated queries", "access to this site was blocked",
-                   "connection error", "could not load", "unable to load",
-                   "something went wrong"):
-            if kw in low:
-                return (text or "").strip()[:160]
-        return ""
-
     async def _checkbox_node_ready(self, frame) -> bool:
         """True once the #checkbox node actually exists INSIDE the widget
         frame. The old flow clicked the iframe element the moment it
@@ -384,11 +366,18 @@ class BrainTestEngine(TrainerEngine):
             if not await self._checkbox_node_ready(frame):
                 err = await self._widget_error_text(frame)
                 if err:
+                    with self._lock:
+                        self._widget_blocked = err
                     self._add_log(
                         "hCaptcha widget is NOT showing the checkbox — it "
                         "shows an error banner instead: %r. The widget "
-                        "isn't loading / is being blocked; refreshing the "
-                        "page for a fresh attempt." % err)
+                        "isn't loading / is being blocked (rate limited IP "
+                        "or network error). Waiting a few seconds before a "
+                        "fresh attempt — refreshing immediately would just "
+                        "re-hit the same rate limit." % err)
+                    # hCaptcha's rate limit is per-IP for a window: give it
+                    # a short cool-down instead of an instant refresh loop.
+                    await asyncio.sleep(6.0)
                     return False
                 elapsed = time.monotonic() - started
                 if elapsed - last_log >= 6.0:
@@ -575,18 +564,43 @@ class BrainTestEngine(TrainerEngine):
 
         # 2) the loop: click the checkbox -> wait for the challenge ->
         #    (no challenge) refresh the page and try again
+        blocked_streak = 0
         for step in range(20):
             if self._stopped():
                 return "stopped"
             self._set_state("clicking_checkbox",
                             "Clicking the hCaptcha checkbox...")
             if not await self._click_checkbox_patient(page, timeout=60.0):
+                with self._lock:
+                    blocked_now = bool(self._widget_blocked)
+                    self._widget_blocked = ""
+                if blocked_now:
+                    # The widget itself reports a rate limit / block: hCaptcha
+                    # is refusing this session, so refresh loops only re-hit
+                    # the same wall. Give up after a few attempts instead of
+                    # grinding for 20 minutes with nothing to show.
+                    blocked_streak += 1
+                    if blocked_streak >= 3:
+                        self._set_state(
+                            "blocked",
+                            "hCaptcha is not rendering the checkbox on this "
+                            "session (rate limited / blocked IP). The Test "
+                            "browser rides a residential proxy when the pool "
+                            "has live sessions - refresh the pool or wait "
+                            "for the rate limit to cool down, then Start "
+                            "again.")
+                        self._add_log(
+                            "Giving up after %d blocked attempts: hCaptcha "
+                            "is not rendering the checkbox (rate limited / "
+                            "blocked IP). Restart the test so the browser "
+                            "picks a fresh proxy session." % blocked_streak)
+                        return "blocked"
                 self._add_log("Checkbox click not confirmed (widget "
                               "missing, blocked, or click never registered) "
                               "- refreshing the page for a fresh attempt.")
                 await self._refresh_page(page)
                 continue
-
+            blocked_streak = 0
             self._set_state("waiting_for_challenge",
                             "Waiting for the challenge...")
             iframe, frame = await self._wait_challenge(page, timeout=15.0)

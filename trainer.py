@@ -610,6 +610,30 @@ class TrainerEngine:
             return iframe, frame
         return None, None
 
+    async def _widget_error_text(self, frame) -> str:
+        """hCaptcha's own error banner inside the widget frame ("Rate
+        limited or network error. Please retry.", "Your access to this
+        site was blocked", ...) — when present the checkbox node is INERT
+        or never rendered, so no click will ever register. Returns "" when
+        the widget is healthy. This is what answers "is it loading or is
+        something blocking it"."""
+        if frame is None:
+            return ""
+        try:
+            text = await frame.evaluate(
+                "() => (document.body ? document.body.innerText : '')")
+        except Exception:
+            return ""
+        low = (text or "").lower()
+        for kw in ("rate limited or network error", "rate limited",
+                   "network error", "please retry", "please try again",
+                   "automated queries", "access to this site was blocked",
+                   "connection error", "could not load", "unable to load",
+                   "something went wrong"):
+            if kw in low:
+                return (text or "").strip()[:160]
+        return ""
+
     async def _wait_for_checkbox(self, page, timeout: float = 35.0):
         deadline = time.monotonic() + timeout
         last_log = 0.0
@@ -620,6 +644,22 @@ class TrainerEngine:
                     controls = frame.locator(", ".join(CHECKBOX_SELECTOR))
                     if await controls.count() > 0:
                         return iframe, frame, controls.first
+                except Exception:
+                    pass
+                # Widget iframe is up but the checkbox node is not rendered.
+                # If hCaptcha shows an error banner instead (rate limited /
+                # blocked IP / network error), the box will NEVER appear on
+                # this session - surface it instead of waiting out the
+                # timeout with a misleading "still waiting" log.
+                try:
+                    err = await self._widget_error_text(frame)
+                    if err:
+                        self._add_log(
+                            "hCaptcha widget is NOT showing the checkbox - "
+                            "it shows an error banner instead: %r. The "
+                            "widget isn't loading / is being blocked (rate "
+                            "limited IP or network error)." % err)
+                        return None, None, None
                 except Exception:
                     pass
                 # Frame is up even if the checkbox node is not queryable yet
@@ -1175,7 +1215,7 @@ class TrainerEngine:
                 )
             while not self._stopped():
                 result = await self._do_real_cycle()
-                if self._one_shot or result == "stopped":
+                if self._one_shot or result in ("stopped", "blocked"):
                     break
                 if self._stopped():
                     break
@@ -1195,7 +1235,7 @@ class TrainerEngine:
                 self.preparing = False
                 self._external_page = None
                 self._external_task = None
-                if self.current_stage not in {"error", "timeout"}:
+                if self.current_stage not in {"error", "timeout", "blocked"}:
                     self.current_stage = "idle"
                     self.status_text = (
                         "Real demo cycle complete."
@@ -1228,7 +1268,7 @@ class TrainerEngine:
 
             while not self._stopped():
                 result = await self._do_real_cycle()
-                if self._one_shot or result == "stopped":
+                if self._one_shot or result in ("stopped", "blocked"):
                     break
                 if self._stopped():
                     break
@@ -1266,7 +1306,7 @@ class TrainerEngine:
             self._playwright = None
             with self._lock:
                 self.running = False
-                if self.current_stage not in {"error", "timeout"}:
+                if self.current_stage not in {"error", "timeout", "blocked"}:
                     self.current_stage = "idle"
                     self.status_text = (
                         "Real demo cycle complete."
