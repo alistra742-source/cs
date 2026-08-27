@@ -635,37 +635,84 @@ class TrainerEngine:
                 return (text or "").strip()[:160]
         return ""
 
+    async def _find_widget_iframe_simple(self, page):
+        """Find the hCaptcha CHECKBOX widget iframe element (no frame
+        resolution). The challenge modal is excluded by its URL
+        (frame=challenge / hcaptcha-challenge) - NEVER by its title, because
+        the widget's own title is 'Widget containing checkbox for hCaptcha
+        security challenge', which contains the word 'challenge' (excluding
+        on the title made the checkbox unfindable)."""
+        try:
+            locs = await page.locator("iframe").all()
+        except Exception:
+            return None
+        best = None
+        for loc in locs:
+            try:
+                src = (await loc.get_attribute("src") or "").lower()
+                title = (await loc.get_attribute("title") or "").lower()
+            except Exception:
+                continue
+            if "challenge" in src or "frame=challenge" in src:
+                continue                      # the challenge modal (by URL)
+            is_widget = ("checkbox" in title or "frame=checkbox" in src
+                         or "hcaptcha" in src or "hcaptcha" in title)
+            if not is_widget:
+                continue
+            try:
+                box = await loc.bounding_box()
+            except Exception:
+                box = None
+            if box and float(box.get("width") or 0) > 20 \
+                    and float(box.get("height") or 0) > 20:
+                if "checkbox" in title:
+                    return loc                # the checkbox widget itself
+                best = best or loc
+        return best
+
     async def _wait_for_checkbox(self, page, timeout: float = 35.0):
         deadline = time.monotonic() + timeout
         last_log = 0.0
         while time.monotonic() < deadline and not self._stopped():
             iframe, frame = await self._find_widget(page)
-            if iframe is not None and frame is not None:
-                try:
-                    controls = frame.locator(", ".join(CHECKBOX_SELECTOR))
-                    if await controls.count() > 0:
-                        return iframe, frame, controls.first
-                except Exception:
-                    pass
-                # Widget iframe is up but the checkbox node is not rendered.
-                # If hCaptcha shows an error banner instead (rate limited /
-                # blocked IP / network error), the box will NEVER appear on
-                # this session - surface it instead of waiting out the
-                # timeout with a misleading "still waiting" log.
-                try:
-                    err = await self._widget_error_text(frame)
-                    if err:
-                        self._add_log(
-                            "hCaptcha widget is NOT showing the checkbox - "
-                            "it shows an error banner instead: %r. The "
-                            "widget isn't loading / is being blocked (rate "
-                            "limited IP or network error)." % err)
-                        return None, None, None
-                except Exception:
-                    pass
-                # Frame is up even if the checkbox node is not queryable yet
-                # (0x0 painted widget). Still return it so we can click the
-                # iframe's left-center, where hCaptcha draws the box.
+            if iframe is None and frame is None:
+                # Frame attachment fails for cross-origin widget iframes on
+                # this engine (content_frame() is None) even when the widget
+                # is fully rendered in the page. Fall back to a frame-less
+                # DOM finder: we can still click the box with a page-space
+                # mouse event on the iframe's left-center.
+                simple = await self._find_widget_iframe_simple(page)
+                if simple is not None:
+                    iframe = simple
+            if iframe is not None:
+                if frame is not None:
+                    try:
+                        controls = frame.locator(", ".join(CHECKBOX_SELECTOR))
+                        if await controls.count() > 0:
+                            return iframe, frame, controls.first
+                    except Exception:
+                        pass
+                    # Widget iframe is up but the checkbox node is not
+                    # rendered. If hCaptcha shows an error banner instead
+                    # (rate limited / blocked IP / network error), the box
+                    # will NEVER appear on this session - surface it instead
+                    # of waiting out the timeout with a misleading "still
+                    # waiting" log.
+                    try:
+                        err = await self._widget_error_text(frame)
+                        if err:
+                            self._add_log(
+                                "hCaptcha widget is NOT showing the checkbox - "
+                                "it shows an error banner instead: %r. The "
+                                "widget isn't loading / is being blocked (rate "
+                                "limited IP or network error)." % err)
+                            return None, None, None
+                    except Exception:
+                        pass
+                # Widget iframe is up (frame attached or not): return it so
+                # the caller can click the checkbox - by locator when the
+                # frame is attached, or by page-space coordinates on the
+                # iframe's left-center (where hCaptcha paints the box).
                 return iframe, frame, None
             now = time.monotonic()
             if now - last_log >= 6.0:
@@ -745,10 +792,17 @@ class TrainerEngine:
                     return True
             except Exception:
                 pass
+        # A REAL challenge must be VISIBLE to count as confirmation - the
+        # demo page pre-mounts a hidden challenge iframe in the DOM, so mere
+        # existence (the old check) could confirm a click that never landed.
         try:
             chall = page.locator(CHALLENGE_IFRAME_SELECTOR)
-            if await chall.count() > 0:
-                return True
+            for ci in range(min(3, await chall.count())):
+                try:
+                    if await chall.nth(ci).is_visible():
+                        return True
+                except Exception:
+                    continue
         except Exception:
             pass
         try:

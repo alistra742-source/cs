@@ -245,41 +245,6 @@ class BrainTestEngine(TrainerEngine):
     # -> (no challenge) Next -> 5s -> checkbox again -> loop. When a
     # challenge DOES appear, the Brain solves it (analyze -> click -> submit)
     # and the loop continues. Heavily logged at every step.
-    async def _find_widget_iframe_simple(self, page):
-        """Find the hCaptcha CHECKBOX widget iframe element (no frame
-        resolution). The challenge modal is excluded by its URL
-        (frame=challenge / hcaptcha-challenge) - NEVER by its title, because
-        the widget's own title is 'Widget containing checkbox for hCaptcha
-        security challenge', which contains the word 'challenge' (excluding
-        on the title made the checkbox unfindable)."""
-        try:
-            locs = await page.locator("iframe").all()
-        except Exception:
-            return None
-        best = None
-        for loc in locs:
-            try:
-                src = (await loc.get_attribute("src") or "").lower()
-                title = (await loc.get_attribute("title") or "").lower()
-            except Exception:
-                continue
-            if "challenge" in src or "frame=challenge" in src:
-                continue                      # the challenge modal (by URL)
-            is_widget = ("checkbox" in title or "frame=checkbox" in src
-                         or "hcaptcha" in src or "hcaptcha" in title)
-            if not is_widget:
-                continue
-            try:
-                box = await loc.bounding_box()
-            except Exception:
-                box = None
-            if box and float(box.get("width") or 0) > 20 \
-                    and float(box.get("height") or 0) > 20:
-                if "checkbox" in title:
-                    return loc                # the checkbox widget itself
-                best = best or loc
-        return best
-
     async def _checkbox_node_ready(self, frame) -> bool:
         """True once the #checkbox node actually exists INSIDE the widget
         frame. The old flow clicked the iframe element the moment it
@@ -341,9 +306,20 @@ class BrainTestEngine(TrainerEngine):
         last_log = 0.0
         dumped_inventory = False
         dumped_dom = False
+        logged_frameless = False
         while time.monotonic() < deadline and not self._stopped():
             iframe, frame = await self._find_widget(page)
-            if iframe is None or frame is None:
+            if iframe is None and frame is None:
+                # The engine can't attach to cross-origin widget iframes
+                # (content_frame() is None) even when the widget is fully
+                # rendered in the page. Fall back to a frame-less DOM
+                # finder - we can still click the box with a page-space
+                # mouse event and confirm at the page level (a VISIBLE
+                # challenge iframe or a response token).
+                simple = await self._find_widget_iframe_simple(page)
+                if simple is not None:
+                    iframe = simple
+            if iframe is None:
                 elapsed = time.monotonic() - started
                 if elapsed >= 10.0 and not dumped_inventory:
                     dumped_inventory = True
@@ -364,8 +340,15 @@ class BrainTestEngine(TrainerEngine):
                 await asyncio.sleep(0.5)
                 continue
 
+            if frame is None and not logged_frameless:
+                logged_frameless = True
+                self._add_log(
+                    "Widget iframe is rendered but the engine can't attach "
+                    "to it (cross-origin isolation) - clicking the checkbox "
+                    "by page-space coordinates on the iframe.")
+
             # ── widget iframe exists — wait for the checkbox NODE ──
-            if not await self._checkbox_node_ready(frame):
+            if frame is not None and not await self._checkbox_node_ready(frame):
                 err = await self._widget_error_text(frame)
                 if err:
                     with self._lock:
@@ -406,6 +389,8 @@ class BrainTestEngine(TrainerEngine):
                 if attempt > 1:
                     await asyncio.sleep(0.4)
                     iframe2, frame2 = await self._find_widget(page)
+                    if iframe2 is None and frame2 is None:
+                        iframe2 = await self._find_widget_iframe_simple(page)
                     if iframe2 is not None:
                         iframe = iframe2
                     if frame2 is not None:
@@ -541,6 +526,22 @@ class BrainTestEngine(TrainerEngine):
                 page, trainer.CHALLENGE_IFRAME_SELECTOR)
             if iframe is not None and frame is not None:
                 return iframe, frame
+            # Frame-less fallback: the challenge iframe element may be
+            # rendered but unattachable (cross-origin isolation). A VISIBLE
+            # challenge iframe means the checkbox click registered and the
+            # challenge is open - return the element so the caller can
+            # screenshot it and let the Brain try to solve it.
+            if iframe is None:
+                try:
+                    chall = page.locator(trainer.CHALLENGE_IFRAME_SELECTOR)
+                    for ci in range(min(3, await chall.count())):
+                        try:
+                            if await chall.nth(ci).is_visible():
+                                return await chall.nth(ci), None
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
             await asyncio.sleep(0.5)
         return None, None
 
