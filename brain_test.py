@@ -585,15 +585,14 @@ class BrainTestEngine(TrainerEngine):
                             "blocked",
                             "hCaptcha is not rendering the checkbox on this "
                             "session (rate limited / blocked IP). The Test "
-                            "browser rides a residential proxy when the pool "
-                            "has live sessions - refresh the pool or wait "
-                            "for the rate limit to cool down, then Start "
-                            "again.")
+                            "browser connects directly - wait for the rate "
+                            "limit to cool down, then Start again.")
                         self._add_log(
                             "Giving up after %d blocked attempts: hCaptcha "
                             "is not rendering the checkbox (rate limited / "
-                            "blocked IP). Restart the test so the browser "
-                            "picks a fresh proxy session." % blocked_streak)
+                            "blocked IP on the direct connection). Wait a "
+                            "bit for the rate limit to cool down, then "
+                            "Start the test again." % blocked_streak)
                         return "blocked"
                 self._add_log("Checkbox click not confirmed (widget "
                               "missing, blocked, or click never registered) "

@@ -992,52 +992,14 @@ async def _close_live_browser(wid: str) -> bool:
     return True
 
 
-async def _pick_demo_proxy(wid: str, bot) -> Optional[dict]:
-    """A proven-live residential session for the QA browser, or None.
-
-    hCaptcha refuses to render its checkbox widget for datacenter IPs — the
-    widget iframe comes up with "Rate limited or network error. Please
-    retry." / "Your access to this site was blocked" instead of the
-    checkbox.  The pool's sticky residential sessions (same gate the Discord
-    worker uses: a real TLS probe through the proxy) make the widget render.
-    Dead sessions are blacklisted as they are found.  None -> direct
-    fallback (no sessions configured, or every probe failed).
-    """
-    if not (_proxies_available and proxy_pool is not None):
-        return None
-    for _ in range(2):
-        try:
-            proxy = await _next_proxy(force=PROXY_FORCE)
-        except Exception:
-            proxy = None
-        if proxy is None:
-            return None
-        if bot is not None and (bot.proxy or {}).get("key") == proxy.get("key"):
-            return proxy  # already the session the browser is on
-        try:
-            live = await asyncio.wait_for(proxy_pool.probe(proxy), timeout=5.0)
-        except Exception:
-            live = False
-        if live:
-            return proxy
-        _log(f"[{wid}] [Demo] Probe failed - dead session, blacklisting "
-             f"{proxy.get('key','?')[:44]}", level="info")
-        try:
-            proxy_pool.release(proxy, ok=False)
-        except Exception:
-            pass
-    return None
-
-
 async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
     """Prepare B1's shared LIVE browser for the official hCaptcha demo.
 
-    The QA browser rides a proven-live residential session from the pool
-    when one is available: hCaptcha blocks/rate-limits the checkbox widget
-    for datacenter IPs ("Rate limited or network error. Please retry.",
-    "Your access to this site was blocked"), so a direct egress only ever
-    shows an empty widget.  Direct is the last-resort fallback; TOR is
-    never used for the demo.
+    The QA browser intentionally uses a DIRECT connection.  It does not
+    rotate proxies, use TOR, or borrow the Discord signup worker's
+    transport: the Test/Live-Demo flow must work without depending on the
+    proxy pool (dead sessions or an exhausted vaultproxies quota would
+    otherwise break the test with a chrome-error page).
     """
     state = _workers.get(wid) or _init_worker(wid)
     _workers[wid] = state
@@ -1049,7 +1011,6 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
     state["launching"] = True
     try:
         bot = state.get("bot")
-        demo_proxy = await _pick_demo_proxy(wid, bot)
         if bot is None:
             bot = DiscordAutomation(
                 headless=bool(cfg.get("headless", True)),
@@ -1062,25 +1023,13 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
         except Exception:
             alive = False
         if not alive:
-            if demo_proxy:
-                bot.proxy = demo_proxy
-                bot._direct = False
-            else:
-                bot.proxy = None
-                bot._direct = True
-            transport = ("residential proxy " + str(demo_proxy.get("key", "?"))[:40]
-                         if demo_proxy else "direct")
-            _log(f"[{wid}] [Demo] Launching real Chrome via {transport} "
-                 f"for {trainer.TARGET_DEMO_URL}")
+            bot.proxy = None
+            bot._direct = True
+            _log(f"[{wid}] [Demo] Launching direct real Chrome for {trainer.TARGET_DEMO_URL}")
             await asyncio.wait_for(bot.initialize(), timeout=90)
-        elif demo_proxy and (bot.proxy or {}).get("key") != demo_proxy.get("key"):
-            # A parked signup browser is on another session (or TOR/direct).
-            # Rebuild it on the proven-live session so the widget renders.
-            if not await bot.switch_proxy(demo_proxy):
-                return {"error": "could not switch the shared browser to a live proxy session"}
-        elif not demo_proxy and (not getattr(bot, "_direct", False) or bot.proxy):
-            # No pool sessions left - a parked browser may have a proxy or
-            # TOR attached.  Rebuild it direct before the public demo.
+        elif not getattr(bot, "_direct", False) or bot.proxy:
+            # A parked signup browser may have a proxy or TOR attached.
+            # Rebuild it direct before using it for the public demo.
             if not await bot.switch_direct():
                 return {"error": "could not switch the shared browser to direct mode"}
         st = await live_control.live_navigate(bot, trainer.TARGET_DEMO_URL)
@@ -1088,7 +1037,7 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
             return st
         state["status"] = "demo"
         state["step"] = "official hCaptcha demo"
-        state["proxy"] = demo_proxy.get("key", "direct") if demo_proxy else "direct"
+        state["proxy"] = "direct"
         if st.get("screenshot"):
             state["last_shot_b64"] = st["screenshot"]
         return st
