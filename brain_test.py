@@ -39,9 +39,11 @@ import hcaptcha_types as hct
 _BRAIN_SHA = "5886f0e3c86ffc8cabbde701412f938bcecb9f5a"
 
 # The live page the Test tab drives (override with BRAIN_TEST_URL).
+# The official hCaptcha demo — same page the Live Demo (trainer) tab uses,
+# so the sitekey is always valid and the widget renders the real checkbox.
 TARGET_URL = os.environ.get(
     "BRAIN_TEST_URL",
-    "https://democaptcha.com/demo-form-eng/hcaptcha.html")
+    "https://accounts.hcaptcha.com/demo")
 
 _TILE_BOXES_JS = r"""() => {
     const nodes = document.querySelectorAll(
