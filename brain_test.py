@@ -240,21 +240,28 @@ class BrainTestEngine(TrainerEngine):
     # challenge DOES appear, the Brain solves it (analyze -> click -> submit)
     # and the loop continues. Heavily logged at every step.
     async def _find_widget_iframe_simple(self, page):
+        """Find the hCaptcha CHECKBOX widget iframe element (no frame
+        resolution). The challenge modal is excluded by its URL
+        (frame=challenge / hcaptcha-challenge) - NEVER by its title, because
+        the widget's own title is 'Widget containing checkbox for hCaptcha
+        security challenge', which contains the word 'challenge' (excluding
+        on the title made the checkbox unfindable)."""
         try:
             locs = await page.locator("iframe").all()
         except Exception:
             return None
+        best = None
         for loc in locs:
             try:
                 src = (await loc.get_attribute("src") or "").lower()
                 title = (await loc.get_attribute("title") or "").lower()
             except Exception:
                 continue
-            is_hcaptcha = ("hcaptcha" in src or "hcaptcha" in title
-                           or "checkbox" in title)
-            if not is_hcaptcha:
-                continue
-            if "challenge" in src or "challenge" in title:
+            if "challenge" in src or "frame=challenge" in src:
+                continue                      # the challenge modal (by URL)
+            is_widget = ("checkbox" in title or "frame=checkbox" in src
+                         or "hcaptcha" in src or "hcaptcha" in title)
+            if not is_widget:
                 continue
             try:
                 box = await loc.bounding_box()
@@ -262,8 +269,10 @@ class BrainTestEngine(TrainerEngine):
                 box = None
             if box and float(box.get("width") or 0) > 20 \
                     and float(box.get("height") or 0) > 20:
-                return loc
-        return None
+                if "checkbox" in title:
+                    return loc                # the checkbox widget itself
+                best = best or loc
+        return best
 
     async def _click_checkbox_patient(self, page, timeout=60.0) -> bool:
         """Find the hCaptcha widget iframe and click its left-center (where
@@ -272,6 +281,21 @@ class BrainTestEngine(TrainerEngine):
         while waited < timeout and not self._stopped():
             loc = await self._find_widget_iframe_simple(page)
             if loc is not None:
+                # strategy 1: click #checkbox INSIDE the widget frame
+                try:
+                    frame = await self._resolve_hcaptcha_frame(
+                        page, loc, want_checkbox=True)
+                    if frame is not None:
+                        cb = frame.locator('#checkbox, [role="checkbox"]')
+                        if await cb.count() > 0:
+                            await cb.first.click(timeout=5000)
+                            self._add_log("CLICKED #checkbox inside the "
+                                          "widget frame.")
+                            return True
+                except Exception:
+                    pass
+                # strategy 2: page-coordinate click on the iframe's checkbox
+                # area (left side, vertically centred)
                 try:
                     box = await loc.bounding_box()
                     if box and float(box.get("width") or 0) > 20:
