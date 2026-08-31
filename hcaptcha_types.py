@@ -622,6 +622,65 @@ SYNONYMS = {
     "nut": "bolt",
 }
 
+# ── merge the 1000-class longtail vocabulary (make_longtail) ──────────────
+# Identity wins over the old synonyms for real class names ("watch" is a
+# class now, so it no longer folds into "clock"); aliases and colour
+# compounds ("red car" -> red_car) are added on top.
+try:
+    import make_longtail as _mlt
+except Exception:  # pragma: no cover - make_longtail ships in the repo
+    _mlt = None
+if _mlt is not None:
+    for _n in list(_mlt.LONGTAIL_NAMES) + list(_mlt.COMPOUND_NAMES):
+        SYNONYMS[_n] = _n
+    for _n, _als in _mlt.build_synonyms().items():
+        for _a in _als:
+            _k = re.sub(r"[^a-z]+", "_", _a.lower()).strip("_")
+            SYNONYMS.setdefault(_k, _n)
+    # colour-word aliases for compounds: "navy car" -> blue_car, ...
+    _COLOUR_ALIASES = {
+        "navy": "blue", "maroon": "red", "teal": "green", "khaki": "brown",
+        "ivory": "white", "cream": "white", "charcoal": "black",
+        "gold": "yellow", "silver": "white",
+    }
+    for _alias, _col in _COLOUR_ALIASES.items():
+        for _base in _mlt.CORE_BASES:
+            SYNONYMS.setdefault("%s_%s" % (_alias, _base),
+                                "%s_%s" % (_col, _base))
+    # ranks: every longtail class carries a coarse size rank; compounds
+    # inherit the base object's size.
+    for _n, _sz in _mlt.LONGTAIL_SIZE.items():
+        SIZE_RANK.setdefault(_n, _sz)
+    for _n, _b in _mlt.COMPOUND_BASE.items():
+        SIZE_RANK.setdefault(_n, SIZE_RANK.get(_b, 10))
+    # category / attribute sets
+    ANIMALS |= {n for n, c, s, r in _mlt.LONGTAIL if c == "animal"}
+    ANIMALS |= {n for n, b, c, rgb in _mlt.COMPOUNDS if b in ANIMALS}
+    EDIBLE |= {n for n, c, s, r in _mlt.LONGTAIL if c == "food"}
+    EDIBLE |= {n for n, b, c, rgb in _mlt.COMPOUNDS if b in EDIBLE}
+    _land_vehicles = {n for n in _mlt.LONGTAIL_NAMES
+                      if _mlt.LONGTAIL_CATEGORY.get(n) == "vehicle"
+                      and _mlt.longtail_ground_kind(n) == "road"}
+    _water_vehicles = {n for n in _mlt.LONGTAIL_NAMES
+                       if _mlt.LONGTAIL_CATEGORY.get(n) == "vehicle"
+                       and _mlt.longtail_ground_kind(n) == "water"}
+    _air_vehicles = {n for n in _mlt.LONGTAIL_NAMES
+                     if _mlt.LONGTAIL_CATEGORY.get(n) == "vehicle"
+                     and _mlt.longtail_ground_kind(n) == "sky"}
+    WHEELED |= _land_vehicles
+    WHEELED |= {n for n, b, c, rgb in _mlt.COMPOUNDS if b in WHEELED}
+    MOTORISED |= (_land_vehicles | _water_vehicles | _air_vehicles)
+    MOTORISED |= {n for n, b, c, rgb in _mlt.COMPOUNDS if b in MOTORISED}
+    METAL |= (_land_vehicles | _water_vehicles | _air_vehicles)
+    METAL |= {n for n, c, s, r in _mlt.LONGTAIL if c in ("tool", "street")}
+    METAL |= {n for n, b, c, rgb in _mlt.COMPOUNDS
+              if b in METAL or b in _land_vehicles}
+    PLANTS |= {n for n, c, s, r in _mlt.LONGTAIL if c in ("plant", "nature")}
+    PLANTS |= {n for n, b, c, rgb in _mlt.COMPOUNDS if b in PLANTS}
+    del _n, _als, _a, _k, _alias, _col, _base, _b, _sz, _land_vehicles, \
+        _water_vehicles, _air_vehicles
+del _mlt
+
 
 def canonical(word: str):
     """Map a surface word/phrase to the canonical class name (or None)."""
@@ -764,9 +823,9 @@ _SETDOWN_PHRASE = re.compile(
     r"surfaces? (?:safe |suitable )?(?:for|to)",
     re.I)
 
-# Horizontal furniture / lumber the 60-class CNN can actually emit.
+# Horizontal furniture / lumber the 1000-class CNN can actually emit.
 # house/wall are vertical or whole buildings — not a mug-safe surface.
-FLAT_SURFACES = {"table", "chair", "wood"}
+FLAT_SURFACES = {"table", "chair", "wood", "desk", "nightstand"}
 
 _REF_COMPARE_RULES = (
     (re.compile(r"\b(larger|bigger|greater|heavier|taller|wider)\b", re.I),

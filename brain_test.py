@@ -95,15 +95,27 @@ class BrainTestEngine(TrainerEngine):
             for chunk in parts:
                 f.write(chunk)
         d = {}
-        if ref:
-            import subprocess
-            j = subprocess.run(["git", "show", "%s:brain.json" % ref],
-                               cwd=root, capture_output=True, timeout=30)
+        # the split process writes the exact training sidecar next to the
+        # parts as brain_arch.json (classes/arch/metrics) — prefer it so a
+        # 1.1GB giga split reloads with the EXACT architecture it trained.
+        arch_path = os.path.join(root, "brain_arch.json")
+        if os.path.isfile(arch_path):
             try:
-                if j.returncode == 0 and j.stdout[:1] == b"{":
-                    d = json.loads(j.stdout)
+                with open(arch_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
             except Exception:
                 d = {}
+        if ref:
+            import subprocess
+            for js_name in ("brain.json", "brain_arch.json"):
+                j = subprocess.run(["git", "show", "%s:%s" % (ref, js_name)],
+                                   cwd=root, capture_output=True, timeout=30)
+                try:
+                    if j.returncode == 0 and j.stdout[:1] == b"{":
+                        d = json.loads(j.stdout)
+                        break
+                except Exception:
+                    continue
         try:
             d.setdefault("classes", __import__("make_dataset").CLASSES)
         except Exception:
@@ -135,7 +147,7 @@ class BrainTestEngine(TrainerEngine):
         # 1) loose part files in the repo folder
         for pattern, offset in self._PART_PATTERNS:
             parts, i = [], 0
-            while i < 12:
+            while i < 24:
                 path = os.path.join(root, pattern % (i + offset))
                 if not os.path.isfile(path) or os.path.getsize(path) < 1000:
                     break
@@ -153,7 +165,7 @@ class BrainTestEngine(TrainerEngine):
                     "arena/01a033e0-cs", "origin/main", "main"):
             for pattern, offset in self._PART_PATTERNS:
                 parts, i = [], 0
-                while i < 12:
+                while i < 24:
                     try:
                         p = subprocess.run(
                             ["git", "show",
@@ -174,7 +186,7 @@ class BrainTestEngine(TrainerEngine):
         try:
             import requests
             parts = []
-            for i in range(12):
+            for i in range(24):
                 url = ("https://raw.githubusercontent.com/alistra742-source/"
                        "cs/%s/brain_part_%02d" % (_BRAIN_SHA, i))
                 r = requests.get(url, timeout=120)

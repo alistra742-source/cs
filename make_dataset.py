@@ -550,6 +550,38 @@ for _name in CLASSES:
                           % _name.replace("_", " "))
 del _name
 
+# ── merge the 1000-class longtail vocabulary (make_longtail) ──────────────
+#
+#  454 recipe-painted base classes (animals/food/vehicles/tools/furniture/
+#  electronics/clothing/sports/nature/street/household) + 486 colour
+#  compounds (54 core classes x 9 colours — hCaptcha colour grids).
+#  Order is fixed => stable class ids (ids 60..1099 are new).
+try:
+    import make_longtail as _ml
+except Exception:  # pragma: no cover
+    _ml = None
+if _ml is not None:
+    for _name, _cat, _sz, _rec in _ml.LONGTAIL:
+        PAINTERS[_name] = _ml.recipe_painter(_name)
+        CLASSES.append(_name)
+        GEOMETRY[_name] = _ml.size_geometry(_sz,
+                                            _ml._GEOMETRY_OVERRIDES.get(_name, 1.0))
+        GROUND_KIND[_name] = _ml.longtail_ground_kind(_name)
+    for _name, _base, _col, _rgb in _ml.COMPOUNDS:
+        PAINTERS[_name] = _ml.compound_painter(_name)
+        CLASSES.append(_name)
+        GEOMETRY[_name] = GEOMETRY.get(_base, (0.30, 0.80, 1.0))
+        GROUND_KIND[_name] = GROUND_KIND.get(_base, "road")
+    for _name in CLASSES:
+        if _name not in PROMPTS:
+            PROMPTS[_name] = ("Please click each image containing a %s"
+                              % _name.replace("_", " "))
+    del _name, _base, _col, _rgb
+del _ml
+
+N_CLASSES = len(CLASSES)
+assert N_CLASSES == 1000, N_CLASSES
+
 
 # ── one image ─────────────────────────────────────────────────────────────
 

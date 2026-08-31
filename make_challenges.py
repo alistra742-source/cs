@@ -45,12 +45,13 @@ import make_dataset as md
 import hcaptcha_types as hct
 import realdata
 
-CLASSES = md.CLASSES                       # all 60, stable order
+CLASSES = md.CLASSES                       # all 1000, stable order
 CID = {name: i for i, name in enumerate(CLASSES)}
 
-# Objects that can be point targets / scene members. crosswalk is a
-# full-bleed road texture, not a pointable object.
-POINT_CLASSES = [c for c in CLASSES if c != "crosswalk"]
+# Objects that can be point targets / scene members. crosswalk/wall/wood/
+# canvas are full-bleed textures or flat surfaces, not pointable objects.
+_NON_POINT = {"crosswalk", "wall", "wood", "canvas"}
+POINT_CLASSES = [c for c in CLASSES if c not in _NON_POINT]
 
 # Classes with a numerical rank -> usable in relational ("largest", ...)
 # rounds. Names only (canonical form), from the shared tables.
