@@ -87,7 +87,8 @@ CLI
         --per_class 310 --n_point 18000 --n_count 12000 --n_drag 14000
         --n_grid 9000 --n_pattern 12000 --n_bbox 10000 --n_pipe 7000
         --n_tower 7000 --n_shape 7000 --n_text 6000
-        --hcap_dir /path/to/hcap-dataset --hcap_views 16 --split_parts
+        --hcap_dir /path/to/hcap-dataset --hcap_views 16 \
+        --photos_dir /path/to/real_photos --photo_views 16 --split_parts
     # held-out, per-family self-test + the round-solve rate:
     python brain.py eval          # clean held-out
     python brain.py eval --stress # fresh rounds, EVERY image degraded
@@ -1188,6 +1189,96 @@ def load_hcap_tiles(hcap_dir, tile_size=DEFAULT_TILE_SIZE, views=16,
         % (n_files, len(ys), time.time() - t0))
     return x, y, n_files
 
+def _photo_view(im, tile_size, rng):
+    """One random training view of a REAL PHOTO (full frame, subject usually
+    centred): a centre-biased cover-crop (zoom 0.5-1.0), optional flip and
+    small rotation, then resize to the Brain's tile size. The centre bias is
+    the difference from _hcap_view — a photo's subject is rarely in a random
+    corner, and cropping it out would teach the wrong thing."""
+    w, h = im.size
+    side = min(w, h)
+    z = rng.uniform(0.50, 1.0)
+    cs = max(8, int(side * z))
+    # crop window centre jittered around the image centre (±28%)
+    cx = w / 2 + rng.uniform(-0.28, 0.28) * (w - cs) * 0.5
+    cy = h / 2 + rng.uniform(-0.28, 0.28) * (h - cs) * 0.5
+    x0 = int(min(max(0, cx - cs / 2), max(0, w - cs)))
+    y0 = int(min(max(0, cy - cs / 2), max(0, h - cs)))
+    im = im.crop((x0, y0, x0 + cs, y0 + cs))
+    if rng.random() < 0.5:
+        im = im.transpose(Image.FLIP_LEFT_RIGHT)
+    ang = rng.uniform(-8, 8)
+    if abs(ang) > 0.5:
+        im = im.rotate(ang, resample=Image.BILINEAR, expand=True)
+    return im.resize((tile_size, tile_size), Image.LANCZOS)
+
+
+def load_photo_tiles(photos_dir, tile_size=DEFAULT_TILE_SIZE, views=16,
+                     hard_frac=0.5, seed=21, verbose=True):
+    """Ingest a REAL-PHOTO corpus (fetch_photos.py output): one folder per
+    class name, 640 px JPEGs from Wikimedia Commons.
+
+    Each photo yields `views` random centre-cropped views with a
+    clean/soft/hard degradation roll — the exact same treatment the real
+    hCaptcha tiles get, so the tile head learns photo texture (grain,
+    lighting, backgrounds) instead of only drawings. Returns
+    (x: (N,3,S,S) uint8, y: (N,) long class ids, n_files).
+    """
+    log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
+    if not photos_dir or not os.path.isdir(photos_dir):
+        log("    photos: %r is not a directory - skipping" % photos_dir)
+        return torch.empty((0, 3, tile_size, tile_size), dtype=torch.uint8), \
+            torch.empty((0,), dtype=torch.long), 0
+    dirs = {}
+    for sub in sorted(os.listdir(photos_dir)):
+        p = os.path.join(photos_dir, sub)
+        if not os.path.isdir(p):
+            continue
+        folder = sub.lower().replace("-", "_")
+        cls = HCAP_FOLDER_ALIAS.get(folder) or hct.canonical(folder)
+        if cls not in CID:
+            continue
+        files = sorted(f for f in os.listdir(p)
+                       if f.lower().endswith((".jpg", ".jpeg", ".png")))
+        if files:
+            dirs[sub] = (cls, files)
+    if not dirs:
+        log("    photos: no usable class folders in %s" % photos_dir)
+        return torch.empty((0, 3, tile_size, tile_size), dtype=torch.uint8), \
+            torch.empty((0,), dtype=torch.long), 0
+    n_classes = len(set(c for c, _ in dirs.values()))
+    n_files = sum(len(f) for _, f in dirs.values())
+    log("    photos: %d classes, %d real photos (%d views each)" %
+        (n_classes, n_files, views))
+    xs, ys = [], []
+    t0 = time.time()
+    done = 0
+    for sub, (cls, files) in dirs.items():
+        cid = CID[cls]
+        for fi, fn in enumerate(files):
+            done += 1
+            try:
+                im = Image.open(os.path.join(photos_dir, sub, fn)) \
+                         .convert("RGB")
+            except Exception:
+                continue
+            for v in range(views):
+                rng = random.Random("photo|%d|%s|%d|%d" % (seed, sub, fi, v))
+                view = _photo_view(im, tile_size, rng)
+                view = _degrade(view, rng, _degrade_roll(rng, hard_frac, 0.45))
+                xs.append(_img_to_u8(view, tile_size))
+                ys.append(cid)
+            if done % 200 == 0:
+                log("    photos: %d/%d files (%.0fs)" % (done, n_files,
+                                                         time.time() - t0))
+    x = torch.stack(xs) if xs else torch.empty(
+        (0, 3, tile_size, tile_size), dtype=torch.uint8)
+    y = torch.tensor(ys, dtype=torch.long)
+    log("    photos: %d real files -> %d training views in %.0fs"
+        % (done, len(ys), time.time() - t0))
+    return x, y, done
+
+
 def make_bbox_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     """A single-object 'draw a box around the X' round (no manifest equivalent
     in make_challenges). Renders one object on a scene at a random place/scale
@@ -1746,7 +1837,8 @@ def _corpus_cache_save(corpus, npz, pkl, log):
     np.savez(npz, **a)
     meta = {k: corpus[k] for k in
             ("point_m", "count_m", "drag_m", "bbox_m", "text_m", "pat_m",
-             "grid_m", "router", "tile_size", "scene_size", "hcap_n")}
+             "grid_m", "router", "tile_size", "scene_size", "hcap_n",
+             "photo_n")}
     meta["pat_n"] = len(corpus["pat_imgs"])
     meta["grid_n"] = len(corpus["grid_imgs"])
     with open(pkl, "wb") as f:
@@ -1778,7 +1870,7 @@ def _corpus_cache_load(npz, pkl, log):
         "grid_imgs": imgs("grid", meta["grid_n"]), "grid_m": meta["grid_m"],
         "router": meta["router"],
         "tile_size": meta["tile_size"], "scene_size": meta["scene_size"],
-        "hcap_n": meta["hcap_n"],
+        "hcap_n": meta["hcap_n"], "photo_n": meta.get("photo_n", 0),
     }
 
 
@@ -1787,6 +1879,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                        n_pipe=3000, n_tower=3000, n_shape=3000, n_text=4000,
                        degrade_frac=0.40, hard_frac=0.30, clutter_frac=0.5,
                        router_bank=True, hcap_dir=None, hcap_views=16,
+                       photos_dir=None, photo_views=16,
                        tile_size=DEFAULT_TILE_SIZE,
                        scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
@@ -1820,8 +1913,10 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         n_pipe=n_pipe, n_tower=n_tower, n_shape=n_shape, n_text=n_text,
         hard_frac=hard_frac, degrade_frac=degrade_frac,
         clutter_frac=clutter_frac, router_bank=router_bank,
-        hcap_dir=hcap_dir, hcap_views=hcap_views, tile_size=tile_size,
-        scene_size=scene_size, seed=seed, n_classes=N_CLASSES)
+        hcap_dir=hcap_dir, hcap_views=hcap_views,
+        photos_dir=photos_dir, photo_views=photo_views,
+        tile_size=tile_size, scene_size=scene_size, seed=seed,
+        n_classes=N_CLASSES)
     if os.path.exists(ck_npz) and os.path.exists(ck_pkl):
         log("  corpus cache HIT - loading rendered corpus from disk...")
         try:
@@ -1866,6 +1961,17 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
             ty = torch.cat([ty, hy])
             log("    tiles: + %d real hcap views (total %d)" % (
                 len(hx), len(tx)))
+
+    photo_n = 0
+    if photos_dir:
+        px, py, photo_n = load_photo_tiles(
+            photos_dir, tile_size=tile_size, views=photo_views,
+            hard_frac=hard_frac, seed=seed + 2, verbose=verbose)
+        if len(px):
+            tx = torch.cat([tx, px])
+            ty = torch.cat([ty, py])
+            log("    tiles: + %d real-photo views (total %d)" % (
+                len(px), len(tx)))
 
     # ── grid rounds: feed their 9 tiles through the SAME tile head ─────────
     grid_tiles, grid_labels = [], []
@@ -2032,7 +2138,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         "grid_imgs": grid_imgs, "grid_m": grid_m,
         "router": router,
         "tile_size": tile_size, "scene_size": scene_size,
-        "hcap_n": hcap_n,
+        "hcap_n": hcap_n, "photo_n": photo_n,
     }
     try:
         _corpus_cache_save(corpus, ck_npz, ck_pkl, log)
@@ -2423,10 +2529,11 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
         model.param_mb(), device,
         (" (%d GPU)" % n_gpu) if n_gpu else "",
         " | AMP" if use_amp else ""))
-    log("   corpus: %d tile images (incl. %d real hcap views), %d point, "
-        "%d count, %d drag, %d bbox, %d text, %d pattern, %d grids, "
-        "%d router pairs" % (
+    log("   corpus: %d tile images (incl. %d real hcap + %d real-photo "
+        "views), %d point, %d count, %d drag, %d bbox, %d text, %d pattern, "
+        "%d grids, %d router pairs" % (
             len(corpus["tile_y"]), corpus.get("hcap_n", 0),
+            corpus.get("photo_n", 0),
             len(corpus["point_m"]), len(corpus["count_m"]),
             len(corpus["drag_m"]), len(corpus["bbox_m"]),
             len(corpus["text_m"]), len(corpus["pat_m"]),
@@ -3646,6 +3753,11 @@ def main(argv=None):
                    help="real hCaptcha challenge-image dataset (folder per class, e.g. the GitHub 'hcap' datasets)")
     t.add_argument("--hcap_views", type=int, default=16,
                    help="random training views per real hcap tile")
+    t.add_argument("--photos_dir", default=None,
+                   help="real-photo corpus from fetch_photos.py (folder per "
+                        "class) — ingested like the hcap tiles")
+    t.add_argument("--photo_views", type=int, default=16,
+                   help="random training views per real photo")
     t.add_argument("--no_router_bank", action="store_true",
                    help="use the small v1 prompt set instead of the ~30k bank")
     t.add_argument("--kreg", type=float, default=0.02,
@@ -3693,7 +3805,8 @@ def main(argv=None):
                 hard_frac=a.hard_frac, degrade_frac=a.degrade_frac,
                 clutter_frac=a.clutter_frac,
                 router_bank=not a.no_router_bank,
-                hcap_dir=a.hcap_dir, hcap_views=a.hcap_views))
+                hcap_dir=a.hcap_dir, hcap_views=a.hcap_views,
+                photos_dir=a.photos_dir, photo_views=a.photo_views))
         if a.split_parts:
             pt = os.path.join(MODELS_DIR, "brain.pt")
             n = split_brain_parts(pt, max_mb=a.part_max_mb)

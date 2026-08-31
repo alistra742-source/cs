@@ -47,6 +47,16 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 # !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/working/hcap
 ```
 
+4. **Real photos for the non-vehicle classes** (Wikimedia Commons, ~10-20
+   min, ~300 MB). One folder per class; each photo becomes 16 augmented +
+   degraded training views, exactly like the hCaptcha tiles. The fetch is
+   idempotent — re-running it resumes/skips, so a kill + re-run is safe:
+
+```bash
+# all 1000 classes x 4 photos (test with --limit 20 first if you like)
+!python fetch_photos.py --out /kaggle/working/photos --per_class 4
+```
+
 ## 2. Train the giga brain
 
 ```bash
@@ -60,18 +70,21 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
   --n_shape 7000 --n_text 6000 \
   --hard_frac 0.45 --degrade_frac 0.5 --clutter_frac 0.55 \
   --hcap_dir /kaggle/working/hcap --hcap_views 16 \
+  --photos_dir /kaggle/working/photos --photo_views 16 \
   --amp 1 \
   --split_parts --part_max_mb 96
 ```
 (`--batch 8` is the T4 setting; on a 16 GB card that's what fits the 1.1 GB
-giga model + optimizer states + the 160-char prompt transformer comfortably.)
+giga model + optimizer states + the 160-char prompt transformer comfortably.
+Skip the `--photos_dir` line if you didn't run the fetch in step 4.)
 
 What this is:
 
 - **~310k+ synthetic tiles** (310 × 1000 classes) across day/dusk/night,
   flips, rotation, blur, JPEG, noise, motion blur, dark-mode tint,
-  vignette, plus **~25k–300k real hCaptcha views** from the dataset
-  (16 augmented views per real tile).
+  vignette, plus **~25k–300k real hCaptcha vehicle views** from the dataset
+  (16 augmented views per real tile) and **~64k real-photo views** for the
+  other classes (4 photos x 16 views x 1000 classes, Wikimedia Commons).
 - **100k+ challenge rounds in total**: 9k binary grids + 18k point +
   12k count + 14k drag (pipe/tower/shape mixed) + 9k mixed binary+point
   + 12k pattern + 10k bbox + 7k pipe + 7k tower + 7k shape + 6k text +
