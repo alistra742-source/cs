@@ -107,6 +107,8 @@ import argparse
 import collections
 import io
 import json
+import hashlib
+import pickle
 import math
 import os
 import random
@@ -134,6 +136,10 @@ except Exception:  # pragma: no cover
     torch = None
     nn = None
     F = None
+
+# Reduce CUDA allocator fragmentation (matters on 16 GB T4s where a few
+# hundred MB of reserved-but-unallocated blocks can turn into OOM).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Decorator that works with AND without torch: the @_no_grad
 # decorators below are evaluated at import time, and with torch absent
@@ -1704,6 +1710,78 @@ def build_router_bank(verbose=True):
     log("  router bank: %d (prompt, family) pairs" % len(pairs))
     return pairs
 
+def _corpus_cache_paths(**params):
+    """Deterministic cache file paths for a build_brain_corpus config.
+
+    The rendered tile/scene arrays are the slow part (~50 min for the
+    310k-tile giga corpus); caching them on disk means a Kaggle session
+    restart or a hyperparameter re-run never pays that cost twice.
+    """
+    src = json.dumps({k: (str(v) if v is not None else None)
+                      for k, v in sorted(params.items())}, sort_keys=True)
+    key = hashlib.sha1(src.encode()).hexdigest()[:16]
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "corpus_cache")
+    return (os.path.join(d, "corpus_%s.npz" % key),
+            os.path.join(d, "corpus_%s.meta.pkl" % key), d)
+
+
+def _corpus_cache_save(corpus, npz, pkl, log):
+    # pattern/grid PILs are kept at their ORIGINAL size: hard-degradation
+    # randomly downscales them (bad-capture simulation), so the stack must
+    # store each image as its own npz entry.
+    a = dict(
+        tile_x=np.ascontiguousarray(corpus["tile_x"].numpy()),
+        tile_y=np.ascontiguousarray(corpus["tile_y"].numpy()),
+        point_x=np.ascontiguousarray(corpus["point_x"].numpy()),
+        count_x=np.ascontiguousarray(corpus["count_x"].numpy()),
+        drag_x=np.ascontiguousarray(corpus["drag_x"].numpy()),
+        bbox_x=np.ascontiguousarray(corpus["bbox_x"].numpy()),
+        text_x=np.ascontiguousarray(corpus["text_x"].numpy()),
+    )
+    for prefix, imgs in (("pat", corpus["pat_imgs"]),
+                         ("grid", corpus["grid_imgs"])):
+        for i, im in enumerate(imgs):
+            a["%s_%06d" % (prefix, i)] = np.asarray(im.convert("RGB"))
+    np.savez(npz, **a)
+    meta = {k: corpus[k] for k in
+            ("point_m", "count_m", "drag_m", "bbox_m", "text_m", "pat_m",
+             "grid_m", "router", "tile_size", "scene_size", "hcap_n")}
+    meta["pat_n"] = len(corpus["pat_imgs"])
+    meta["grid_n"] = len(corpus["grid_imgs"])
+    with open(pkl, "wb") as f:
+        pickle.dump(meta, f)
+    log("  corpus cache: saved %.1f GB -> %s" %
+        (os.path.getsize(npz) / 1e9, npz))
+
+
+def _corpus_cache_load(npz, pkl, log):
+    with open(pkl, "rb") as f:
+        meta = pickle.load(f)
+    a = np.load(npz)
+
+    def T(k):
+        return torch.from_numpy(np.ascontiguousarray(a[k]))
+
+    def imgs(prefix, n):
+        return [Image.fromarray(a["%s_%06d" % (prefix, i)])
+                for i in range(n)]
+
+    return {
+        "tile_x": T("tile_x"), "tile_y": T("tile_y"),
+        "point_x": T("point_x"), "point_m": meta["point_m"],
+        "count_x": T("count_x"), "count_m": meta["count_m"],
+        "drag_x": T("drag_x"), "drag_m": meta["drag_m"],
+        "bbox_x": T("bbox_x"), "bbox_m": meta["bbox_m"],
+        "text_x": T("text_x"), "text_m": meta["text_m"],
+        "pat_imgs": imgs("pat", meta["pat_n"]), "pat_m": meta["pat_m"],
+        "grid_imgs": imgs("grid", meta["grid_n"]), "grid_m": meta["grid_m"],
+        "router": meta["router"],
+        "tile_size": meta["tile_size"], "scene_size": meta["scene_size"],
+        "hcap_n": meta["hcap_n"],
+    }
+
+
 def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                        n_drag=9000, n_grid=6000, n_pattern=6000, n_bbox=7000,
                        n_pipe=3000, n_tower=3000, n_shape=3000, n_text=4000,
@@ -1734,6 +1812,31 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                                  make_grid_round)
     log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
     t0 = time.time()
+
+    # ── disk cache: skip the ~50 min of re-rendering when identical ──────
+    ck_npz, ck_pkl, ck_dir = _corpus_cache_paths(
+        per_class=per_class, n_point=n_point, n_count=n_count,
+        n_drag=n_drag, n_grid=n_grid, n_pattern=n_pattern, n_bbox=n_bbox,
+        n_pipe=n_pipe, n_tower=n_tower, n_shape=n_shape, n_text=n_text,
+        hard_frac=hard_frac, degrade_frac=degrade_frac,
+        clutter_frac=clutter_frac, router_bank=router_bank,
+        hcap_dir=hcap_dir, hcap_views=hcap_views, tile_size=tile_size,
+        scene_size=scene_size, seed=seed, n_classes=N_CLASSES)
+    if os.path.exists(ck_npz) and os.path.exists(ck_pkl):
+        log("  corpus cache HIT - loading rendered corpus from disk...")
+        try:
+            corpus = _corpus_cache_load(ck_npz, ck_pkl, log)
+        except Exception as e:
+            log("  corpus cache: read failed (%s) - rebuilding fresh" % e)
+            for p in (ck_npz, ck_pkl):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        else:
+            log("  corpus loaded in %.0fs" % (time.time() - t0))
+            return corpus
+    os.makedirs(ck_dir, exist_ok=True)
 
     # ── tile classification: painted tiles + REAL hCaptcha tiles ──────────
     log("  tiles: %d/class x %d classes  (generating %d images...)" % (
@@ -1918,7 +2021,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         sum(t.element_size() * t.numel() for t in
             [tx, point_x, count_x, drag_x, bbox_x]) / 1e6,
         len(tx)))
-    return {
+    corpus = {
         "tile_x": tx, "tile_y": ty,
         "point_x": point_x, "point_m": point_m,
         "count_x": count_x, "count_m": count_m,
@@ -1931,6 +2034,11 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
         "tile_size": tile_size, "scene_size": scene_size,
         "hcap_n": hcap_n,
     }
+    try:
+        _corpus_cache_save(corpus, ck_npz, ck_pkl, log)
+    except Exception as e:  # full disk etc. — never kill a run over the cache
+        log("  corpus cache: NOT saved (%s)" % e)
+    return corpus
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2296,7 +2404,7 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                        math.ceil(len(bbox_tr) / batch) +
                        (math.ceil(len(text_tr) / batch) if text_tr else 0) +
                        math.ceil(len(pat_tr) / pat_batch) +
-                       sum(math.ceil(len(v) / 256) for v in router_by_fam.values()))
+                       sum(math.ceil(len(v) / 64) for v in router_by_fam.values()))
     total_steps = max(1, steps_per_epoch * total_epochs)
     warmup = max(1, int(0.05 * total_steps))
     step_ctr = [0]
@@ -2593,8 +2701,13 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
             ids = router_by_fam.get(fam)
             if not ids:
                 continue
-            for s in range(math.ceil(len(ids) / 256)):
-                b = ids[s * 256:(s + 1) * 256]
+            # 64 prompts x 160 chars per step: the giga prompt transformer
+            # (1024-d x 13 layers) keeps ~13 GB of backward intermediates for
+            # a 256-chunk, which OOMs a 16 GB T4 on top of the 282 M-param
+            # backbone + Adam states. 64-chunks cost ~3 GB and still see
+            # every pair.
+            for s in range(math.ceil(len(ids) / 64)):
+                b = ids[s * 64:(s + 1) * 64]
                 prompts = [router[i][0] for i in b]
                 labels = torch.tensor([FAM_ID[router[i][1]] for i in b],
                                       device=device)
@@ -2850,6 +2963,21 @@ def _round_solve_metrics(model, device="cpu", corpus=None, solver=None,
 def eval_brain(model, corpus, device="cpu", tile_va=None, point_va_single=None,
                drag_va=None, bbox_va=None, pat_va=None, count_va=None,
                text_va=None, router_va=None, verbose=True):
+    """Inference-only wrapper: no autograd graph → saves several GB of VRAM
+    (and is faster) versus the graph-building forwards of the impl below."""
+    _prev = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)
+    try:
+        return _eval_brain_impl(model, corpus, device, tile_va, point_va_single,
+                                drag_va, bbox_va, pat_va, count_va, text_va,
+                                router_va, verbose)
+    finally:
+        torch.set_grad_enabled(_prev)
+
+def _eval_brain_impl(model, corpus, device, tile_va=None,
+                     point_va_single=None, drag_va=None, bbox_va=None,
+                     pat_va=None, count_va=None, text_va=None, router_va=None,
+                     verbose=True):
     log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
     model.eval()
     tile_size = corpus["tile_size"]

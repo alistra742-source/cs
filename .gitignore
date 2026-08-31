@@ -36,3 +36,6 @@ train/data/
 
 # live-camera / trainer challenge screenshots (kept on disk, never deleted)
 data/challenges/
+
+# brain.py rendered-corpus disk cache (multi-GB, rebuilt on demand)
+corpus_cache/

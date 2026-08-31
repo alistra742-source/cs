@@ -20,45 +20,51 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 ## 1. Kaggle notebook setup
 
 1. New **Python 3 notebook**, Internet ON (for the hCaptcha data download),
-   accelerator **P100 16 GB** (or T4 16 GB; T4 needs `--batch 8`).
-2. First cell:
+   accelerator **T4 16 GB** (use `--batch 8` on T4). Do NOT pick the P100:
+   current PyTorch builds no longer contain CUDA kernels for it (sm_60), so
+   it crashes with "no kernel image is available for execution on the
+   device" — T4 (sm_75) is fully supported and is what this runbook targets.
+2. First cell. Notes: use `%cd` (Jupyter magic, not `cd`), and clone into
+   `/kaggle/working` — `/kaggle/input` is read-only. Kaggle already ships a
+   current CUDA build of torch, so do NOT pin an old one.
 
 ```bash
-!pip install -q torch --index-url https://download.pytorch.org/whl/cu121
 !pip install -q numpy Pillow
-!git clone --depth 1 https://github.com/alistra742-source/cs /kaggle/working/cs
-cd /kaggle/working/cs
+!git clone --depth 1 -b arena/01a051bf-cs https://github.com/alistra742-source/cs /kaggle/working/cs
+%cd /kaggle/working/cs
 ```
 
 3. Real hCaptcha tiles (the "100k challenges" family data). Two public
    datasets, both already aliased into the 1000-class vocabulary
-   (motorbus→bus, seaplane→airplane, …):
+   (motorbus→bus, seaplane→airplane, …). Clone into `/kaggle/working`
+   (the input dir is read-only):
 
 ```bash
 # orlov-ai: 4,068 labelled vehicle tiles (quick, ~5 MB)
-!git clone --depth 1 https://github.com/orlov-ai/hcaptcha-dataset /kaggle/input/hcap
+!git clone --depth 1 https://github.com/orlov-ai/hcaptcha-dataset /kaggle/working/hcap
 
 # drandule: ~100,000 sorted vehicle tiles (the big one, ~1-2 GB)
-# !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/input/hcap
+# !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/working/hcap
 ```
 
 ## 2. Train the giga brain
 
 ```bash
-cd /kaggle/working/cs
-python brain.py train \
+!python brain.py train \
   --preset giga \
   --epochs 14 --phase2 4 \
-  --batch 16 \
+  --batch 8 \
   --per_class 310 \
   --n_point 18000 --n_count 12000 --n_drag 14000 --n_grid 9000 \
   --n_pattern 12000 --n_bbox 10000 --n_pipe 7000 --n_tower 7000 \
   --n_shape 7000 --n_text 6000 \
   --hard_frac 0.45 --degrade_frac 0.5 --clutter_frac 0.55 \
-  --hcap_dir /kaggle/input/hcap --hcap_views 16 \
+  --hcap_dir /kaggle/working/hcap --hcap_views 16 \
   --amp 1 \
   --split_parts --part_max_mb 96
 ```
+(`--batch 8` is the T4 setting; on a 16 GB card that's what fits the 1.1 GB
+giga model + optimizer states + the 160-char prompt transformer comfortably.)
 
 What this is:
 
@@ -81,13 +87,24 @@ What this is:
   (the exact class list + architecture + metrics) next to them.
 
 GPU sizing: 282 M params × 4 B = 1.13 GB weights, ×3 with Adam states;
-batch 16 at 96 px scenes fits a 16 GB P100 comfortably. On a T4 use
-`--batch 8` (the prompt LRU and the in-memory corpus still fit: ~6-8 GB
-RAM — add a 32 GB RAM dataset if you push `per_class` above 350).
+on the T4 use `--batch 8` (the 160-char prompt transformer's backward
+intermediates are the peak — a 256-prompt router chunk OOMs the 16 GB
+card, so the trainer already caps router steps at 64 prompts). The prompt
+LRU and the in-memory corpus still fit: ~6-8 GB RAM — add a 32 GB RAM
+dataset if you push `per_class` above 350.
 
-Rough wall time: corpus build ~30-45 min on the P100 CPU (Pillow-bound),
+Rough wall time: corpus build ~30-60 min on the Kaggle CPU (Pillow-bound),
 training ~6-12 h (14 + 4 phases, fp16). If you only have 8 h, use
 `--epochs 10 --phase2 3 --per_class 260` — still >260k tiles + 100k rounds.
+
+**Corpus disk cache (free speed-up):** after the first build the rendered
+corpus (~9 GB, `corpus_cache/corpus_<hash>.npz` next to `brain.py`) is kept
+on the notebook's working disk. Any re-run with the SAME settings (session
+restart, OOM retry, parameter tweak that leaves the generation config
+unchanged) prints `corpus cache HIT` and skips the whole render step —
+training starts in ~2 min instead of ~1 h. Change any generation parameter
+(`per_class`, `--n_*`, fracs, seed, hcap dir) and a fresh corpus is built
+and cached under a new hash. To force a rebuild, delete `corpus_cache/`.
 
 ## 3. Publish the parts (so the Test tab picks them up)
 
