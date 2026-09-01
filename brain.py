@@ -2668,13 +2668,24 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                     m = re.match(r"brain_ep(\d+)\.pt$", base)
                     ep = int(m.group(1)) if m else 0
                     if ep == 0:
-                        sj = os.path.join(os.path.dirname(resume) or ".",
-                                          "brain.json")
-                        if os.path.isfile(sj):
-                            try:
-                                ep = int(json.load(open(sj)).get("epoch", 0))
-                            except Exception:  # noqa: BLE001
-                                ep = 0
+                        # sidecar next to the file, or (separate-dataset
+                        # uploads) the newest brain.json anywhere in inputs
+                        import glob
+                        sjs = [os.path.join(os.path.dirname(resume) or ".",
+                                            "brain.json")]
+                        if os.path.isdir("/kaggle/input"):
+                            sjs += sorted(
+                                glob.glob("/kaggle/input/**/brain.json",
+                                          recursive=True),
+                                key=os.path.getmtime)
+                        for sj in sjs:
+                            if os.path.isfile(sj):
+                                try:
+                                    ep = int(json.load(open(sj)).get("epoch", 0))
+                                except Exception:  # noqa: BLE001
+                                    ep = 0
+                            if ep:
+                                break
                     try:
                         model.load_state_dict(ck, strict=True)
                     except Exception as e:  # noqa: BLE001
