@@ -29,6 +29,8 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
    current CUDA build of torch, so do NOT pin an old one.
 
 ```bash
+%cd /kaggle/working                    # MUST be before the rm — if the shell's
+                                       # cwd is inside cs/, deleting it breaks git
 !pip install -q numpy Pillow
 !rm -rf /kaggle/working/cs          # clean slate (safe: /kaggle/working is ephemeral)
 !git clone --depth 1 -b arena/01a051bf-cs https://github.com/alistra742-source/cs /kaggle/working/cs
