@@ -34,43 +34,26 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 %cd /kaggle/working/cs
 ```
 
-3. Real hCaptcha tiles (the "100k challenges" family data). Two public
-   datasets, both already aliased into the 1000-class vocabulary
-   (motorbus→bus, seaplane→airplane, …). Clone into `/kaggle/working`
-   (the input dir is read-only):
+3. **All real data — one line.** `kaggle_setup.sh` wires in every real-image
+   source (idempotent, safe to re-run after a kill):
 
 ```bash
-# orlov-ai: 4,068 labelled vehicle tiles (quick, ~5 MB)
-!git clone --depth 1 https://github.com/orlov-ai/hcaptcha-dataset /kaggle/working/hcap
-
-# real hCaptcha animal/object tiles (cat, dog, elephant, giraffe, penguin,
-# hedgehog, rabbit, shark, fish, tractor, car, tv, keyboard, ...) — 2,529
-# images SHIPPED IN THE REPO, just merge them in:
-!cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/
-
-# GENERATED two-style set (hcap_gen/): the drawn animal roster, each class
-# in BOTH looks hCaptcha serves — photorealistic (photo_*.jpg) and
-# hCaptcha's flat illustration style (illus_*.jpg). Split by style so each
-# gets the right crop: photos -> photos/ (centre-biased), illustrations ->
-# hcap/ (tile crop). With --real_only these classes stop rendering entirely.
-!for d in /kaggle/working/cs/hcap_gen/*/; do c=$(basename "$d"); \
-    mkdir -p /kaggle/working/hcap/$c /kaggle/working/photos/$c; \
-    cp -n "$d"illus_*.jpg /kaggle/working/hcap/$c/   2>/dev/null; \
-    cp -n "$d"photo_*.jpg  /kaggle/working/photos/$c/ 2>/dev/null; done
-
-# drandule: ~100,000 sorted vehicle tiles (the big one, ~1-2 GB)
-# !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/working/hcap
+!bash kaggle_setup.sh
 ```
 
-4. **Real photos for the non-vehicle classes** (Wikimedia Commons, ~10-20
-   min, ~300 MB). One folder per class; each photo becomes 16 augmented +
-   degraded training views, exactly like the hCaptcha tiles. The fetch is
-   idempotent — re-running it resumes/skips, so a kill + re-run is safe:
+It does: orlov vehicle tiles (clone, once) → repo-shipped real hCaptcha tiles
+(`hcap_real/`, 2,529 images) → the generated roster set (`hcap_gen/`: 4
+photoreal → `photos/`, 2 hCaptcha-style flats → `hcap/` per class) → real
+photos for the remaining ~970 classes (mounted `brain-photos` dataset if
+present, else a one-time Wikimedia fetch).
 
-```bash
-# all 1003 classes x 4 photos (test with --limit 20 first if you like)
-!python fetch_photos.py --out /kaggle/working/photos --per_class 4
-```
+- **One-time, after the first session's fetch (~15 min):** zip
+  `/kaggle/working/photos` to `/kaggle/output`, download it from the Output
+  tab, upload it as a Kaggle **dataset named `brain-photos`** (with a
+  `photos/` folder at its root). Add it to the notebook's Data inputs.
+  Every later session then skips the fetch entirely (~40 min saved each).
+- Optional: the ~100k-tile drandule vehicle set — add it inside
+  `kaggle_setup.sh` (commented line) if you want maximum vehicle volume.
 
 ## 2. Train the giga brain
 
@@ -82,7 +65,9 @@ session picks up where the last one stopped with `--resume`. Point
 `--models_dir` at `/kaggle/output/ckpt` so the checkpoint survives the kill
 and is downloadable.
 
-**Session 1** (first run):
+**Fast all-real config** (every class trains on real pixels; `--real_only`
+means classes that have real photos render **zero** synthetic tiles, so the
+corpus builds far faster too):
 
 ```bash
 !python brain.py train \
@@ -90,20 +75,39 @@ and is downloadable.
   --epochs 14 --phase2 4 \
   --batch 8 \
   --per_class 310 \
-  --n_point 18000 --n_count 12000 --n_drag 14000 --n_grid 9000 \
-  --n_pattern 12000 --n_bbox 10000 --n_pipe 7000 --n_tower 7000 \
-  --n_shape 7000 --n_text 6000 \
+  --n_point 18000 --n_count 12000 --n_drag 14000 --n_odrag 9000 \
+  --n_grid 9000 --n_pattern 12000 --n_bbox 10000 \
+  --n_pipe 7000 --n_tower 7000 --n_shape 7000 --n_text 6000 \
   --hard_frac 0.45 --degrade_frac 0.5 --clutter_frac 0.55 \
-  --hcap_dir /kaggle/working/hcap --hcap_views 16 \
-  --photos_dir /kaggle/working/photos --photo_views 16 \
+  --hcap_dir /kaggle/working/hcap --hcap_views 12 \
+  --photos_dir /kaggle/working/photos --photo_views 12 \
+  --real_only \
   --amp 1 \
   --models_dir /kaggle/output/ckpt --resume \
   --split_parts --part_max_mb 96
 ```
+
+**Per-session timing (T4, this config):**
+
+| step | time |
+|---|---|
+| `kaggle_setup.sh` (orlov clone + merges + roster split) | ~2 min |
+| photo fetch (session 1 only; ~0 with `brain-photos` dataset) | 15–40 min |
+| corpus build (`--real_only` ≈ 0 renders + ~200k real views + 104k scenes) | ~45–60 min |
+| training | ~2 h/epoch → **~5–5.5 epochs per 12 h session** |
+
+So: **14 + 4 epochs ≈ 3 sessions (~36 h total)**; with the one-time
+`brain-photos` dataset every session after the first gains back ~30 min.
+
+**Fastest option — warm start from your current giga brain:** upload your
+latest `brain.pt`/`brain_epNN.pt` as a dataset before starting; `--resume`
+carries its 1000 shared classes into the 1003-class run automatically
+(class-tolerant warm start), so the first ~5 epochs of relearning are
+skipped → **~2 sessions total**. (True from-scratch: just don't upload one.)
+
 It trains ~5 epochs, then Kaggle stops it at 12 h. The `Logs` tab will say
 `canceled after ~43200s (timeout exceeded)` — **that is expected, not an
-error.** The corpus is rebuilt each session (~1 h, Kaggle storage is
-ephemeral), so budget ~1 h of that 12 h on data, not training.
+error.**
 
 **Continuing (sessions 2, 3, …)** — each time Kaggle stops you:
 1. **Output** tab → download `ckpt/resume.pt` (~3.5 GB for giga).
