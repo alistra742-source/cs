@@ -1877,10 +1877,11 @@ def _corpus_cache_load(npz, pkl, log):
 
 def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                        n_drag=9000, n_grid=6000, n_pattern=6000, n_bbox=7000,
-                       n_pipe=3000, n_tower=3000, n_shape=3000, n_text=4000,
+                       n_pipe=3000, n_tower=3000, n_shape=3000,
+                       n_odrag=4000, n_text=4000,
                        degrade_frac=0.40, hard_frac=0.30, clutter_frac=0.5,
                        router_bank=True, hcap_dir=None, hcap_views=16,
-                       photos_dir=None, photo_views=16,
+                       photos_dir=None, photo_views=16, real_only=False,
                        tile_size=DEFAULT_TILE_SIZE,
                        scene_size=DEFAULT_SCENE_SIZE,
                        seed=7, verbose=True):
@@ -1903,7 +1904,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     """
     from make_challenges import (make_point_round, make_count_round,
                                  make_drag_round, make_pattern_round,
-                                 make_grid_round)
+                                 make_grid_round, make_object_drag_round)
     log = (lambda *a: print(*a)) if verbose else (lambda *a: None)
     t0 = time.time()
 
@@ -1911,11 +1912,13 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     ck_npz, ck_pkl, ck_dir = _corpus_cache_paths(
         per_class=per_class, n_point=n_point, n_count=n_count,
         n_drag=n_drag, n_grid=n_grid, n_pattern=n_pattern, n_bbox=n_bbox,
-        n_pipe=n_pipe, n_tower=n_tower, n_shape=n_shape, n_text=n_text,
+        n_pipe=n_pipe, n_tower=n_tower, n_shape=n_shape, n_odrag=n_odrag,
+        n_text=n_text,
         hard_frac=hard_frac, degrade_frac=degrade_frac,
         clutter_frac=clutter_frac, router_bank=router_bank,
         hcap_dir=hcap_dir, hcap_views=hcap_views,
         photos_dir=photos_dir, photo_views=photo_views,
+        real_only=real_only,
         tile_size=tile_size, scene_size=scene_size, seed=seed,
         n_classes=N_CLASSES)
     if os.path.exists(ck_npz) and os.path.exists(ck_pkl):
@@ -1935,20 +1938,53 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     os.makedirs(ck_dir, exist_ok=True)
 
     # ── tile classification: painted tiles + REAL hCaptcha tiles ──────────
-    log("  tiles: %d/class x %d classes  (generating %d images...)" % (
-        per_class, N_CLASSES, per_class * N_CLASSES))
-    tx = torch.empty((per_class * N_CLASSES, 3, tile_size, tile_size), dtype=torch.uint8)
-    ty = torch.empty(per_class * N_CLASSES, dtype=torch.long)
+    # REAL-ONLY mode: any class that has real photos (hcap or photos_dir)
+    # is trained EXCLUSIVELY on those real images - zero renders for it.
+    # Only classes with no real photo anywhere fall back to renders (and
+    # are listed, so the gap is visible, not hidden).
+    real_counts = {}
+    if real_only:
+        for d in (hcap_dir, photos_dir):
+            if not d or not os.path.isdir(d):
+                continue
+            for sub in sorted(os.listdir(d)):
+                p = os.path.join(d, sub)
+                if not os.path.isdir(p):
+                    continue
+                folder = sub.lower().replace("-", "_")
+                cls = HCAP_FOLDER_ALIAS.get(folder) or hct.canonical(folder)
+                if cls in CID:
+                    n = len([f for f in os.listdir(p)
+                             if f.lower().endswith((".jpg", ".jpeg",
+                                                   ".png"))])
+                    if n:
+                        real_counts[CID[cls]] = \
+                            real_counts.get(CID[cls], 0) + n
+        n_render_total = sum(0 if real_counts.get(cid, 0) > 0 else per_class
+                             for cid in range(N_CLASSES))
+        log("  tiles: REAL-ONLY mode - %d/%d classes have real photos and "
+            "train render-free; %d class(es) fall back to renders: %s" % (
+                len(real_counts), N_CLASSES, N_CLASSES - len(real_counts),
+                ", ".join(CLASSES[c] for c in range(N_CLASSES)
+                          if real_counts.get(c, 0) == 0)[:600]))
+    else:
+        n_render_total = per_class * N_CLASSES
+    log("  tiles: rendering %d painted images (%d/class where needed)..."
+        % (n_render_total, per_class))
+    tx = torch.empty((n_render_total, 3, tile_size, tile_size),
+                     dtype=torch.uint8)
+    ty = torch.empty(n_render_total, dtype=torch.long)
     i = 0
     for cid, name in enumerate(CLASSES):
-        for k in range(per_class):
+        n = 0 if (real_only and real_counts.get(cid, 0) > 0) else per_class
+        for k in range(n):
             rng = random.Random("tile|%s|%d|%d" % (name, seed, k))
             im = md.render(name, tile_size, rng)
             im = _degrade(im, rng, _degrade_roll(rng, hard_frac, degrade_frac))
             tx[i] = _img_to_u8(im, tile_size)
             ty[i] = cid
             i += 1
-        if (cid + 1) % 5 == 0 or cid == N_CLASSES - 1:
+        if n and ((cid + 1) % 5 == 0 or cid == N_CLASSES - 1):
             log("    tiles: %d/%d classes done (%d images)" % (
                 cid + 1, N_CLASSES, i))
 
@@ -2038,7 +2074,8 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
     # drag training pool so the drag head learns all the looks. ───────────
     for kind, fn, n in (("pipe", make_pipe_round, n_pipe),
                         ("tower", make_tower_round, n_tower),
-                        ("shape", make_shape_round, n_shape)):
+                        ("shape", make_shape_round, n_shape),
+                        ("odrag", make_object_drag_round, n_odrag)):
         if n <= 0:
             continue
         log("  %s: generating %d..." % (kind, n))
@@ -2483,6 +2520,72 @@ def _focus_and_acc(model, corpus, tile_tr, device, ep, sample=2048,
     return focus, acc
 
 
+def _class_tolerant_load(model, ck, log):
+    """Warm start when a checkpoint has FEWER classes than the current
+    vocabulary.
+
+    Class ids are stable (new classes are APPENDED at the end), so a
+    1000-class giga brain carries over perfectly into a 1003-class one:
+    the shared backbone is copied verbatim; for the class-dependent
+    tensors (tile head, knowledge bank, heatmap channels) the overlapping
+    class rows are copied and the new class rows keep their init values
+    (the heatmap background channel is relocated to its new slot).
+
+    Returns True if the model was updated in place, False otherwise.
+    """
+    try:
+        n_old = int(ck["tile_head.fc.bias"].shape[0])
+    except Exception:  # noqa: BLE001
+        return False
+    n_new = int(model.n_classes)
+    if not (0 < n_old < n_new):
+        return False
+    want = model.state_dict()
+    filt = {}
+    for k, v in want.items():
+        src = ck.get(k)
+        if src is None:
+            continue
+        if tuple(src.shape) == tuple(v.shape):
+            filt[k] = src
+            continue
+        if k == "knowledge.concept.weight":            # (C, d)
+            t = v.clone()
+            t[:n_old].copy_(src)
+            filt[k] = t
+        elif k == "knowledge.rel":                     # (C, C)
+            t = v.clone()
+            t[:n_old, :n_old].copy_(src)
+            filt[k] = t
+        elif k == "tile_head.fc.weight":               # (C, c_in)
+            t = v.clone()
+            t[:n_old].copy_(src)
+            filt[k] = t
+        elif k == "tile_head.fc.bias":                 # (C,)
+            t = v.clone()
+            t[:n_old].copy_(src)
+            filt[k] = t
+        elif k in ("heatmap_head.lo.weight", "heatmap_head.hi.weight"):
+            # (C+1, c, 1, 1): channel i = class i, channel C = background
+            t = v.clone()
+            t[:n_old].copy_(src[:n_old])
+            t[n_new].copy_(src[n_old])                 # bg -> new slot
+            filt[k] = t
+        elif k in ("heatmap_head.lo.bias", "heatmap_head.hi.bias"):
+            t = v.clone()
+            t[:n_old].copy_(src[:n_old])
+            t[n_new].copy_(src[n_old])
+            filt[k] = t
+        # any other shape mismatch: keep init (not in filt)
+    if len(filt) < len(want) // 2:
+        return False  # too much missing (foreign/v1 format) - don't risk it
+    model.load_state_dict(filt, strict=False)
+    log("   resume: class-tolerant warm start - %d -> %d classes "
+        "(%d shared classes carried over, %d new classes initialised)"
+        % (n_old, n_new, n_old, n_new - n_old))
+    return True
+
+
 def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                 device=None, corpus=None, corpus_kwargs=None,
                 models_dir=MODELS_DIR, resume=None, verbose=True,
@@ -2636,8 +2739,30 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                                             "prompt_layers", "d_concept",
                                             "pattern_d", "pattern_layers")))
                     if not ok:
-                        log("   resume: arch mismatch (%s) - starting fresh"
-                            % resume)
+                        if ck.get("n_classes") not in (None, N_CLASSES):
+                            log("   resume: class count changed %s -> %d "
+                                "(%s): the optimizer state can't transfer, "
+                                "but the WEIGHTS can - trying to carry the "
+                                "shared classes over"
+                                % (ck.get("n_classes"), N_CLASSES, resume))
+                        else:
+                            log("   resume: arch mismatch (%s)" % resume)
+                        # salvage: transfer the weights class-tolerantly,
+                        # keep the checkpoint's epoch counter, discard the
+                        # optimizer (fresh AdamW moments are fine)
+                        if _class_tolerant_load(model, ck.get("model", {}),
+                                                log):
+                            ep = int(ck.get("epoch", 0))
+                            start_ep = min(ep, total_epochs - 1)
+                            step_ctr[0] = start_ep * steps_per_epoch
+                            _place_schedule()
+                            log("   resume: weights carried over from %s "
+                                "(epoch %d) - fresh optimizer, continuing "
+                                "from epoch %d/%d"
+                                % (resume, ep, start_ep, total_epochs))
+                        else:
+                            log("   resume: weights don't fit either - "
+                                "starting fresh")
                     else:
                         # optimizer state first: if it doesn't fit, NOTHING
                         # is applied and we start fresh; if it fits, the
@@ -2686,12 +2811,15 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                                     ep = 0
                             if ep:
                                 break
+                    loaded = True
                     try:
                         model.load_state_dict(ck, strict=True)
                     except Exception as e:  # noqa: BLE001
-                        log("   resume: weights don't match this preset "
-                            "(%s) - starting fresh" % e)
-                    else:
+                        loaded = _class_tolerant_load(model, ck, log)
+                        if not loaded:
+                            log("   resume: weights don't match this preset "
+                                "(%s) - starting fresh" % e)
+                    if loaded:
                         start_ep = min(ep, total_epochs - 1)
                         step_ctr[0] = start_ep * steps_per_epoch
                         _place_schedule()
@@ -3900,6 +4028,10 @@ def main(argv=None):
     t.add_argument("--n_pipe", type=int, default=7000)
     t.add_argument("--n_tower", type=int, default=7000)
     t.add_argument("--n_shape", type=int, default=7000)
+    t.add_argument("--n_odrag", type=int, default=9000,
+                   help="object-drag rounds: 'Flytte' format - move a real "
+                        "object (hCaptcha roster: bear, raccoon, red panda, "
+                        "boar, ...) to a highlighted cell")
     t.add_argument("--n_text", type=int, default=6000)
     # degradation + hard-condition knobs
     t.add_argument("--hard_frac", type=float, default=0.35,
@@ -3917,6 +4049,10 @@ def main(argv=None):
                         "class) — ingested like the hcap tiles")
     t.add_argument("--photo_views", type=int, default=16,
                    help="random training views per real photo")
+    t.add_argument("--real_only", action="store_true",
+                   help="tile classes that have real photos (hcap/photos) "
+                        "train EXCLUSIVELY on real images - no renders for "
+                        "them; only photo-less classes fall back to renders")
     t.add_argument("--resume", nargs="?", const="auto", default=None,
                    help="continue from a training checkpoint: a path to "
                         "resume.pt, or bare --resume to auto-find the newest "
@@ -3971,12 +4107,13 @@ def main(argv=None):
                 per_class=a.per_class, n_point=a.n_point, n_count=a.n_count,
                 n_drag=a.n_drag, n_grid=a.n_grid, n_pattern=a.n_pattern,
                 n_bbox=a.n_bbox, n_pipe=a.n_pipe, n_tower=a.n_tower,
-                n_shape=a.n_shape, n_text=a.n_text,
+                n_shape=a.n_shape, n_odrag=a.n_odrag, n_text=a.n_text,
                 hard_frac=a.hard_frac, degrade_frac=a.degrade_frac,
                 clutter_frac=a.clutter_frac,
                 router_bank=not a.no_router_bank,
                 hcap_dir=a.hcap_dir, hcap_views=a.hcap_views,
-                photos_dir=a.photos_dir, photo_views=a.photo_views))
+                photos_dir=a.photos_dir, photo_views=a.photo_views,
+                real_only=a.real_only))
         if a.split_parts:
             pt = os.path.join(models_dir, "brain.pt")
             n = split_brain_parts(pt, max_mb=a.part_max_mb)

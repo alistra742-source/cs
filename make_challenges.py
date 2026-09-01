@@ -448,6 +448,93 @@ def make_drag_round(rng: random.Random, size: int = 96):
     return img, meta
 
 
+# The live hCaptcha drag/point object roster (documented from production
+# challenges + the roboflow/hcaptcha-challenger capture): illustrated
+# animals + vehicles. hCaptcha draws its drag objects from this curated
+# set, not from an arbitrary vocabulary — so object-drag rounds weight
+# the roster heavily (mirrors production) and sample the long tail the
+# rest of the time.
+HCAP_DRAG_ROSTER = [
+    "bear", "cat", "elephant", "lion", "penguin", "duck", "raccoon",
+    "squirrel", "parrot", "hedgehog", "chicken", "rooster", "red_panda",
+    "boar", "warthog", "pig", "wolf", "fox", "deer", "horse", "cow",
+    "guitar", "bat", "lighthouse",
+    "airplane", "bicycle", "boat", "motorbus", "motorcycle", "seaplane",
+    "train", "truck",
+]
+HCAP_DRAG_ROSTER = [c for c in HCAP_DRAG_ROSTER if c in set(POINT_CLASSES)]
+
+
+def make_object_drag_round(rng: random.Random, size: int = 96):
+    """hCaptcha 'Flytte' (move) drag — the production format: MOVE THE
+    OBJECT. The draggable piece is a real object from the live hCaptcha
+    roster (bear, raccoon, red panda, boar, vehicle, ...) rendered in
+    hCaptcha's own art style (real photos/cutouts when available via
+    realdata, painted layer otherwise), and the drop target is a
+    highlighted cell on the same canvas.
+
+    Same (fx, fy) -> (tx, ty) piece->slot supervision as make_drag_round,
+    so the drag head learns BOTH abstract puzzle pieces AND live-style
+    object moves with one head.
+    """
+    S = size
+    img = _scene_bg(S, rng)
+    d = ImageDraw.Draw(img)
+
+    # ~55% roster object (what hCaptcha actually serves), rest any class
+    if rng.random() < 0.55:
+        name = rng.choice(HCAP_DRAG_ROSTER)
+    else:
+        name = rng.choice(POINT_CLASSES)
+
+    # drop target: a highlighted cell (light tint + outlined border),
+    # where hCaptcha marks the landing spot
+    cell = S * rng.uniform(0.26, 0.38)
+    tx = rng.uniform(cell / S / 2 + 0.04, 1 - cell / S / 2 - 0.04)
+    ty = rng.uniform(cell / S / 2 + 0.04, 1 - cell / S / 2 - 0.04)
+    x0, y0 = (tx - cell / S / 2) * S, (ty - cell / S / 2) * S
+    d.rounded_rectangle([x0, y0, x0 + cell, y0 + cell], radius=6,
+                        fill=(255, 244, 196, 96))
+    d.rounded_rectangle([x0, y0, x0 + cell, y0 + cell], radius=6,
+                        outline=(196, 158, 44), width=2)
+
+    # the draggable object, clearly apart from the target cell
+    ob = S * rng.uniform(0.24, 0.32)
+    while True:
+        fx, fy = rng.uniform(0.14, 0.86), rng.uniform(0.16, 0.84)
+        if math.hypot(fx - tx, fy - ty) >= 0.36:
+            break
+    _paste_object(img, name, (fx, fy, ob / S), rng)
+
+    # "Move" hint bubble above the object (hCaptcha's drag affordance)
+    try:
+        font = ImageFont.load_default(size=max(9, S // 9))
+    except TypeError:  # pragma: no cover - old Pillow
+        font = ImageFont.load_default()
+    label = "Move"
+    d = ImageDraw.Draw(img)
+    tb = d.textbbox((0, 0), label, font=font)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    bx = int(fx * S - tw / 2)
+    by = int(fy * S - ob / 2) - th - 8
+    by = max(2, by)
+    d.rounded_rectangle([bx - 5, by - 3, bx + tw + 5, by + th + 4],
+                        radius=4, fill=(250, 250, 252, 235),
+                        outline=(60, 60, 66))
+    d.text((bx, by), label, font=font, fill=(40, 40, 46))
+
+    meta = {
+        "type": "drag",
+        "prompt": "Move the %s to the highlighted area"
+                  % name.replace("_", " "),
+        "shape": "object",
+        "fx": round(fx, 4), "fy": round(fy, 4),
+        "tx": round(tx, 4), "ty": round(ty, 4),
+        "cls": name,
+    }
+    return img, meta
+
+
 # ── grid rounds ───────────────────────────────────────────────────────────
 
 GRID_TILE = 96

@@ -80,6 +80,17 @@ PALETTES = [
 
 COLOUR_KEYS = {"W": (250, 250, 252), "Bk": (24, 24, 28)}
 
+# Species-true palettes for the hCaptcha object-roster animals: hCaptcha's
+# own illustrations are colour-consistent (the red panda is always
+# rust/cream, the boar brown, the warthog grey-brown), so these classes
+# render in a FIXED palette instead of the random per-image pick.
+# (A primary, B secondary, C dark, D accent)
+PALETTE_OVERRIDES = {
+    "red_panda": ((204, 96, 44), (244, 232, 208), (96, 40, 18), (250, 250, 252)),
+    "boar": ((146, 98, 66), (196, 156, 116), (74, 48, 32), (250, 250, 252)),
+    "warthog": ((148, 128, 112), (188, 164, 150), (72, 58, 50), (250, 250, 252)),
+}
+
 
 def _poly_smoke(d, pts, S, fill, outline=None, width=0):
     d.polygon([(x * S, y * S) for x, y in pts], fill=fill,
@@ -1120,6 +1131,13 @@ LONGTAIL = [
     ('bollard', 'street', 8, [('rr', 0.42, 0.34, 0.58, 0.8, 0.05, 'A'), ('a', 0.5, 0.34, 0.08, 180, 360, 0.03, 'C'), ('l', 0.42, 0.5, 0.58, 0.5, 0.025, 'D')]),
     ('envelope', 'household', 6, [('rr', 0.24, 0.34, 0.76, 0.66, 0.02, 'A'), ('p', [(0.24, 0.34), (0.5, 0.56), (0.76, 0.34)], 'D'), ('l', 0.24, 0.66, 0.42, 0.5, 0.012, 'C'), ('l', 0.76, 0.66, 0.58, 0.5, 0.012, 'C')]),
     ('photo_frame', 'household', 10, [('rr', 0.26, 0.28, 0.74, 0.72, 0.02, 'A'), ('r', 0.33, 0.35, 0.67, 0.65, 'D'), ('p', [(0.33, 0.62), (0.46, 0.48), (0.58, 0.62)], 'B'), ('c', 0.6, 0.44, 0.03, 'W')]),
+    # hCaptcha object roster (ids 1000..1002): the illustrated animals hCaptcha
+    # serves in grid/drag/point challenges (see the live "Flytte" drag set —
+    # raccoon / rooster / red panda / boar). Red panda + boar + warthog are
+    # the ones missing from the 1000-class vocabulary.
+    ('red_panda', 'animal', 15, [('e', 0.44, 0.55, 0.21, 0.135, 'A'), ('e', 0.72, 0.40, 0.105, 0.095, 'A'), ('e', 0.795, 0.44, 0.055, 0.04, 'B'), ('p', [(0.655, 0.33), (0.665, 0.19), (0.715, 0.30)], 'B'), ('p', [(0.745, 0.30), (0.795, 0.19), (0.81, 0.33)], 'B'), ('l', 0.675, 0.385, 0.725, 0.375, 0.02, 'C'), ('l', 0.755, 0.375, 0.805, 0.385, 0.02, 'C'), ('c', 0.74, 0.415, 0.011, 'Bk'), ('r', 0.27, 0.62, 0.32, 0.80, 'C'), ('r', 0.36, 0.64, 0.41, 0.82, 'C'), ('r', 0.50, 0.64, 0.55, 0.82, 'C'), ('r', 0.59, 0.62, 0.64, 0.80, 'C'), ('e', 0.17, 0.52, 0.085, 0.06, 'A'), ('l', 0.115, 0.495, 0.205, 0.49, 0.016, 'C'), ('l', 0.13, 0.555, 0.22, 0.56, 0.016, 'C')]),
+    ('boar', 'animal', 20, [('e', 0.44, 0.56, 0.22, 0.14, 'A'), ('e', 0.72, 0.44, 0.10, 0.085, 'A'), ('e', 0.80, 0.47, 0.05, 0.035, 'B'), ('p', [(0.66, 0.37), (0.68, 0.28), (0.72, 0.36)], 'A'), ('p', [(0.76, 0.36), (0.80, 0.28), (0.825, 0.37)], 'A'), ('c', 0.74, 0.42, 0.011, 'Bk'), ('l', 0.82, 0.455, 0.865, 0.425, 0.014, 'W'), ('l', 0.30, 0.47, 0.60, 0.42, 0.02, 'C'), ('r', 0.28, 0.64, 0.34, 0.82, 'C'), ('r', 0.38, 0.66, 0.44, 0.84, 'C'), ('r', 0.50, 0.66, 0.56, 0.84, 'C'), ('r', 0.60, 0.64, 0.66, 0.82, 'C'), ('c', 0.16, 0.55, 0.012, 'C')]),
+    ('warthog', 'animal', 21, [('e', 0.44, 0.56, 0.22, 0.135, 'A'), ('e', 0.72, 0.44, 0.105, 0.09, 'A'), ('e', 0.805, 0.465, 0.055, 0.04, 'B'), ('p', [(0.655, 0.36), (0.66, 0.27), (0.71, 0.35)], 'A'), ('p', [(0.75, 0.35), (0.80, 0.27), (0.82, 0.36)], 'A'), ('c', 0.74, 0.415, 0.011, 'Bk'), ('a', 0.835, 0.465, 0.035, 180, 330, 0.014, 'W'), ('l', 0.79, 0.50, 0.80, 0.54, 0.016, 'C'), ('l', 0.30, 0.46, 0.62, 0.42, 0.024, 'C'), ('r', 0.28, 0.63, 0.34, 0.81, 'C'), ('r', 0.38, 0.65, 0.44, 0.83, 'C'), ('r', 0.50, 0.65, 0.56, 0.83, 'C'), ('r', 0.60, 0.63, 0.66, 0.81, 'C'), ('c', 0.155, 0.54, 0.011, 'C')]),
 ]
 
 
@@ -1134,6 +1152,9 @@ LONGTAIL_SIZE = {t[0]: t[2] for t in LONGTAIL}
 
 # ── aliases (merged into hcaptcha_types.SYNONYMS) ─────────────────────────
 ALIASES = {
+    'red_panda': ["red panda", "redpanda", "little panda", "fire fox"],
+    'boar': ["wild pig", "boars"],
+    'warthog': ["warthogs", "wild hog"],
     'french_fries': ["fries", "chips"],
     'hotdog': ["hot dog"],
     'double_decker': ["double decker bus", "double decker"],
@@ -1226,11 +1247,11 @@ def recipe_painter(name):
     ops = LONGTAIL_RECIPE[name]
 
     def paint(d, w, h, rng, mood=None):
-        pal = {"A": PALETTES[rng.randrange(len(PALETTES))][0],
-               "B": PALETTES[0][1], "C": PALETTES[0][2], "D": PALETTES[0][3],
-               **COLOUR_KEYS}
-        # one palette per image (consistent A/B/C/D), with light jitter
-        base = PALETTES[rng.randrange(len(PALETTES))]
+        # one palette per image (consistent A/B/C/D); hCaptcha roster
+        # animals use their species-true fixed palette (see
+        # PALETTE_OVERRIDES), everything else picks a random one
+        base = PALETTE_OVERRIDES.get(name) \
+            or PALETTES[rng.randrange(len(PALETTES))]
         pal = {"A": base[0], "B": base[1], "C": base[2], "D": base[3],
                **COLOUR_KEYS}
         _draw_ops(d, w, h, ops, pal)

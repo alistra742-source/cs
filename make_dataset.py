@@ -561,7 +561,14 @@ try:
 except Exception:  # pragma: no cover
     _ml = None
 if _ml is not None:
+    # hCaptcha object-roster classes are APPENDED AT THE END of CLASSES
+    # (after the colour compounds) so that every pre-existing class keeps
+    # its stable id — a 1000-class brain warm-starts into a 1003-class one
+    # with ids 0..999 untouched (see brain._class_tolerant_load).
+    _HCAP_ROSTER = ("red_panda", "boar", "warthog")
     for _name, _cat, _sz, _rec in _ml.LONGTAIL:
+        if _name in _HCAP_ROSTER:
+            continue
         PAINTERS[_name] = _ml.recipe_painter(_name)
         CLASSES.append(_name)
         GEOMETRY[_name] = _ml.size_geometry(_sz,
@@ -572,6 +579,13 @@ if _ml is not None:
         CLASSES.append(_name)
         GEOMETRY[_name] = GEOMETRY.get(_base, (0.30, 0.80, 1.0))
         GROUND_KIND[_name] = GROUND_KIND.get(_base, "road")
+    for _name in _HCAP_ROSTER:
+        _sz = _ml.LONGTAIL_SIZE[_name]
+        PAINTERS[_name] = _ml.recipe_painter(_name)
+        CLASSES.append(_name)
+        GEOMETRY[_name] = _ml.size_geometry(_sz,
+                                            _ml._GEOMETRY_OVERRIDES.get(_name, 1.0))
+        GROUND_KIND[_name] = _ml.longtail_ground_kind(_name)
     for _name in CLASSES:
         if _name not in PROMPTS:
             PROMPTS[_name] = ("Please click each image containing a %s"
@@ -580,7 +594,7 @@ if _ml is not None:
 del _ml
 
 N_CLASSES = len(CLASSES)
-assert N_CLASSES == 1000, N_CLASSES
+assert N_CLASSES == 1003, N_CLASSES
 
 
 # ── one image ─────────────────────────────────────────────────────────────

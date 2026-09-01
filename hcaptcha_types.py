@@ -420,6 +420,8 @@ SIZE_RANK = {
     "car": 25, "lion": 26, "bear": 27, "horse": 26, "boat": 27, "truck": 28,
     "bus": 29, "giraffe": 30, "train": 30, "airplane": 31, "elephant": 32,
     "tree": 33, "house": 34, "mountain": 35,
+    # hCaptcha illustrated object roster
+    "red_panda": 15, "boar": 20, "warthog": 21,
     # tools / street furniture / surfaces (relational "largest/smallest"
     # rounds over tools or urban objects)
     "screwdriver": 5, "paintbrush": 6, "wrench": 7, "hammer": 8,
@@ -488,6 +490,7 @@ WOODEN = {"wood", "table", "chair", "guitar"}
 FURRY = {
     "dog", "cat", "rabbit", "horse", "cow", "kangaroo",
     "zebra", "giraffe", "lion", "bear", "sheep",
+    "red_panda", "boar", "warthog",  # hCaptcha illustrated roster
 }
 PLANTS = {"tree", "flower", "cactus"}
 
