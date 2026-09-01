@@ -261,3 +261,79 @@ python brain.py train --preset small --epochs 2 --phase2 1 \
 - **Set predicates** ("animals", "metal", "edible"): `ANIMALS`/`METAL`/
   `EDIBLE`/`WHEELED`/`MOTORISED`/`PLANTS` all extend automatically with
   the new categories (260 animals, 290 metal items, …).
+
+## 6. Full hCaptcha coverage (roster animals, Flytte drag, all-real)
+
+### The live object roster
+Live hCaptcha serves a **curated** object set in grid/drag/point challenges:
+the 8 vehicles (airplane, bicycle, boat, bus, motorcycle, seaplane, train,
+truck) plus hCaptcha's own **illustrated animals** (bear, raccoon, rooster,
+red panda, boar, cat, elephant, lion, penguin, duck, squirrel, parrot,
+hedgehog, bat, guitar, lighthouse, …). The three animals from the live
+"Flytte" (move) screenshot that were missing are now first-class classes:
+**`red_panda` (id 1000), `boar` (1001), `warthog` (1002)** — vocabulary is
+now **1003** classes. They were appended at the **end** of `CLASSES`, so
+every pre-existing class id is unchanged.
+
+### Object-drag ("Flytte") rounds
+`make_object_drag_round` generates the production drag format: move a real
+object to a highlighted cell, with the "Move" hint bubble. It's trained into
+the same drag head via `--n_odrag` (default 9000). ~55% of these rounds draw
+from the documented `HCAP_DRAG_ROSTER` (the animals + vehicles hCaptcha
+actually serves), 45% any class. If you have real hCaptcha photos for a
+roster class (see below), those real pixels are used automatically via
+`realdata` — no extra flag.
+
+### All-real mode (`--real_only`)
+Any tile class that has **real** hCaptcha photos (in `--hcap_dir` or
+`--photos_dir`) is trained **exclusively** on those real images — zero
+renders for it. Only classes with no real photo anywhere fall back to
+renders, and they are **named in the log** (the gap is visible, not hidden).
+Add `--real_only` to the train command once you've loaded real art for the
+roster + vehicles:
+
+```bash
+!python brain.py train \
+  --preset giga --epochs 14 --phase2 4 --batch 8 \
+  --per_class 310 \
+  --n_point 18000 --n_count 12000 --n_drag 14000 --n_odrag 9000 \
+  --n_grid 9000 --n_pattern 12000 --n_bbox 10000 \
+  --n_pipe 7000 --n_tower 7000 --n_shape 7000 --n_text 6000 \
+  --hard_frac 0.45 --degrade_frac 0.5 --clutter_frac 0.55 \
+  --hcap_dir /kaggle/working/hcap --hcap_views 16 \
+  --photos_dir /kaggle/working/photos --photo_views 16 \
+  --real_only \
+  --amp 1 --models_dir /kaggle/output/ckpt --resume \
+  --split_parts --part_max_mb 96
+```
+
+### Getting the REAL hCaptcha animal art
+The illustrated animal tiles are hCaptcha's own art (not stock photos), so
+"real" for them = real hCaptcha challenge images. A public capture exists:
+**Roboflow Universe → `qin2dim/hcaptcha-challenger`** (v3, ~766 real hCaptcha
+images, 15 classes: cat, elephant, bear, lion, penguin, duck, raccoon,
+squirrel, parrot, guitar, bat, duck head, hedgehog, lighthouse, parrot head).
+
+Roboflow is **network-blocked from this sandbox** (and its export API needs a
+free Roboflow key), so fetch it yourself, one of:
+1. On the dataset page click **Download Dataset → "Folder of Images"** —
+   you get a zip of per-class folders, or
+2. With a free API key:
+   `curl -H "Authorization: Bearer <KEY>" \
+      "https://public.roboflow.com/dataset/hcaptcha-challenger/3/data?format=folder" -o hcap_animals.zip`
+
+Then unzip into `/kaggle/working/hcap/` **alongside** the vehicle folders
+(one folder per class name, e.g. `hcap/raccoon/*.jpg`). `load_hcap_tiles`
+canonicalises folder names automatically, so every real animal tile flows
+into the tile head with `--hcap_views` views — and with `--real_only` those
+classes stop rendering entirely.
+
+### Warm start across the vocab change
+A **1000-class** giga checkpoint warm-starts a **1003-class** run
+automatically (`_class_tolerant_load`): the backbone + the 1000 shared class
+rows carry over verbatim, the heatmap background channel is relocated, and
+the 3 new classes keep their ontology init. This works from **either** a
+`resume.pt` (epoch counter kept, optimizer rebuilt) or a
+`brain.pt`/`brain_epNN.pt` (weights only). You do **not** lose the giga
+progress already trained — the next hop just continues with the three new
+classes added.
