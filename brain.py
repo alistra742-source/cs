@@ -2287,11 +2287,17 @@ def _move(t, device):
     return t.to(device, non_blocking=True)
 
 
-def _checkpoint(model, corpus, models_dir, epoch, verbose=True):
+def _checkpoint(model, corpus, models_dir, epoch, verbose=True,
+                opt=None, scaler=None, step_ctr=None):
     """Save brain.pt + brain.json after every epoch so an interrupt (Ctrl+C)
     or a session timeout never loses progress. Writes weights + the full arch
     sidecar (no held-out metrics - those are added by the final _save_brain).
-    BrainSolver can load this checkpoint as-is at any time."""
+    BrainSolver can load this checkpoint as-is at any time.
+
+    With ``opt`` given it also writes resume.pt — the FULL training state
+    (weights + optimizer + AMP scaler + epoch + scheduler position) — so a
+    killed 12 h Kaggle session can be continued with --resume from the next
+    session instead of restarting at epoch 1."""
     os.makedirs(models_dir, exist_ok=True)
     pt = os.path.join(models_dir, "brain.pt")
     torch.save(model.state_dict(), pt)
@@ -2313,8 +2319,43 @@ def _checkpoint(model, corpus, models_dir, epoch, verbose=True):
     }
     with open(os.path.join(models_dir, "brain.json"), "w") as f:
         json.dump(sidecar, f, indent=2)
+    if opt is not None:
+        # atomic: write .tmp then rename, so a mid-write kill can never
+        # corrupt the previous good resume point
+        tmp = os.path.join(models_dir, "resume.pt.tmp")
+        torch.save({
+            "model": model.state_dict(),
+            "opt": opt.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "epoch": epoch,
+            "step_ctr": step_ctr[0] if step_ctr is not None else 0,
+            "n_classes": N_CLASSES,
+            "arch": {k: getattr(model, k) for k in
+                     ("width", "prompt_dim", "prompt_layers", "d_concept",
+                      "pattern_d", "pattern_layers")},
+        }, tmp)
+        os.replace(tmp, os.path.join(models_dir, "resume.pt"))
     if verbose:
-        print("    [checkpoint] models/brain.pt saved (after epoch %d)" % epoch)
+        print("    [checkpoint] models/brain.pt saved (after epoch %d)"
+              % epoch)
+
+
+def _find_resume(explicit, models_dir):
+    """Resolve --resume: an explicit path, or (bare --resume / 'auto') the
+    newest resume.pt in the models dir, else in any Kaggle input upload."""
+    if not explicit:
+        return None
+    if explicit != "auto":
+        return explicit if os.path.isfile(explicit) else None
+    cand = os.path.join(models_dir, "resume.pt")
+    if os.path.isfile(cand):
+        return cand
+    if os.path.isdir("/kaggle/input"):
+        import glob
+        hits = glob.glob("/kaggle/input/**/resume.pt", recursive=True)
+        if hits:
+            return max(hits, key=os.path.getmtime)
+    return None
 
 
 def _save_brain(model, metrics, corpus, models_dir):
@@ -2427,7 +2468,7 @@ def _focus_and_acc(model, corpus, tile_tr, device, ep, sample=2048,
 
 def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
                 device=None, corpus=None, corpus_kwargs=None,
-                models_dir=MODELS_DIR, verbose=True,
+                models_dir=MODELS_DIR, resume=None, verbose=True,
                 preset="large", width=None,
                 prompt_dim=None, prompt_layers=None, d_concept=None,
                 pattern_d=None, pattern_layers=None,
@@ -2542,6 +2583,34 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
         "warmup %d, kreg %.3f, focus %s" % (
             total_epochs, phase2, steps_per_epoch, warmup, kreg, focus))
 
+    # ── resume: continue a killed session (Kaggle 12h cap) from the last
+    # completed epoch, with optimizer + AMP scaler + scheduler position ────
+    start_ep = 0
+    if resume:
+        if not os.path.isfile(resume):
+            log("   resume: %r not found - starting fresh" % resume)
+        else:
+            ck = torch.load(resume, map_location=device)
+            ok = (ck.get("n_classes") == N_CLASSES
+                  and all(ck.get("arch", {}).get(k) == getattr(model, k)
+                          for k in ("width", "prompt_dim", "prompt_layers",
+                                    "d_concept", "pattern_d",
+                                    "pattern_layers")))
+            if not ok:
+                log("   resume: arch mismatch (%s) - starting fresh" % resume)
+            else:
+                model.load_state_dict(ck["model"])
+                opt.load_state_dict(ck["opt"])
+                if ck.get("scaler") is not None and scaler is not None:
+                    scaler.load_state_dict(ck["scaler"])
+                step_ctr[0] = int(ck.get("step_ctr", 0))
+                for _ in range(step_ctr[0]):      # fast-forward the schedule
+                    sched.step()
+                start_ep = min(int(ck.get("epoch", 0)), total_epochs - 1)
+                log("   resume: loaded %s - continuing from epoch %d/%d "
+                    "(%d steps done)" % (resume, start_ep, total_epochs,
+                                         step_ctr[0]))
+
     ont_target = torch.from_numpy(
         ontology_targets(N_CLASSES, CLASSES)).float().to(device)
     focus_idx = None
@@ -2562,7 +2631,7 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
         valid = (pts >= 0).all(dim=2)
         return pts, tc, valid, K
 
-    for ep in range(total_epochs):
+    for ep in range(start_ep, total_epochs):
         p2 = ep >= epochs
         model.train()
         random.Random(seed * 100 + ep).shuffle(tile_tr)
@@ -2840,7 +2909,8 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
             focus_idx, _ = _focus_and_acc(model, corpus, tile_tr, device, ep)
         # checkpoint after every epoch: an interrupt or session timeout then
         # only costs the in-progress epoch, never the whole run.
-        _checkpoint(model, corpus, models_dir, ep + 1, verbose=verbose)
+        _checkpoint(model, corpus, models_dir, ep + 1, verbose=verbose,
+                    opt=opt, scaler=scaler, step_ctr=step_ctr)
 
     metrics = eval_brain(model, corpus, device=device,
                          tile_va=tile_va, point_va_single=point_va_single,
@@ -3758,6 +3828,14 @@ def main(argv=None):
                         "class) — ingested like the hcap tiles")
     t.add_argument("--photo_views", type=int, default=16,
                    help="random training views per real photo")
+    t.add_argument("--resume", nargs="?", const="auto", default=None,
+                   help="continue from a training checkpoint: a path to "
+                        "resume.pt, or bare --resume to auto-find the newest "
+                        "(models dir, then any /kaggle/input upload)")
+    t.add_argument("--models_dir", default=None,
+                   help="where brain.pt/resume.pt are written (default: the "
+                        "repo models/ dir). On Kaggle use /kaggle/output/ckpt "
+                        "so checkpoints survive the 12h session kill")
     t.add_argument("--no_router_bank", action="store_true",
                    help="use the small v1 prompt set instead of the ~30k bank")
     t.add_argument("--kreg", type=float, default=0.02,
@@ -3789,6 +3867,8 @@ def main(argv=None):
     assert _TORCH, "torch is required: pip install torch numpy Pillow"
 
     if a.cmd == "train":
+        models_dir = a.models_dir or MODELS_DIR
+        resume = _find_resume(a.resume, models_dir)
         model, metrics = train_brain(
             epochs=a.epochs, batch=a.batch, lr=a.lr, seed=a.seed,
             device=a.device, preset=a.preset,
@@ -3797,6 +3877,7 @@ def main(argv=None):
             pattern_d=a.pattern_d, pattern_layers=a.pattern_layers,
             phase2=a.phase2, kreg=a.kreg, focus=not a.no_focus,
             amp=(True if a.amp == "1" else False if a.amp == "0" else None),
+            models_dir=models_dir, resume=resume,
             corpus_kwargs=dict(
                 per_class=a.per_class, n_point=a.n_point, n_count=a.n_count,
                 n_drag=a.n_drag, n_grid=a.n_grid, n_pattern=a.n_pattern,
@@ -3808,9 +3889,9 @@ def main(argv=None):
                 hcap_dir=a.hcap_dir, hcap_views=a.hcap_views,
                 photos_dir=a.photos_dir, photo_views=a.photo_views))
         if a.split_parts:
-            pt = os.path.join(MODELS_DIR, "brain.pt")
+            pt = os.path.join(models_dir, "brain.pt")
             n = split_brain_parts(pt, max_mb=a.part_max_mb)
-            sidecar = json.load(open(os.path.join(MODELS_DIR, "brain.json")))
+            sidecar = json.load(open(os.path.join(models_dir, "brain.json")))
             write_arch_sidecar(
                 {"tile_size": sidecar.get("tile_size", DEFAULT_TILE_SIZE),
                  "scene_size": sidecar.get("scene_size", DEFAULT_SCENE_SIZE)},

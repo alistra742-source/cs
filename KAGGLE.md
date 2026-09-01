@@ -59,6 +59,16 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 
 ## 2. Train the giga brain
 
+Kaggle kills any notebook run after **12 h (43200 s)** — this is a hard cap,
+not a crash. A full giga run (14 + 4 epochs, batch 8 on a T4) is ~2 h/epoch,
+so it spans **multiple 12 h sessions**. Every epoch writes a full checkpoint
+(weights + optimizer + scheduler position) to `--models_dir`; the next
+session picks up where the last one stopped with `--resume`. Point
+`--models_dir` at `/kaggle/output/ckpt` so the checkpoint survives the kill
+and is downloadable.
+
+**Session 1** (first run):
+
 ```bash
 !python brain.py train \
   --preset giga \
@@ -72,8 +82,50 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
   --hcap_dir /kaggle/working/hcap --hcap_views 16 \
   --photos_dir /kaggle/working/photos --photo_views 16 \
   --amp 1 \
+  --models_dir /kaggle/output/ckpt --resume \
   --split_parts --part_max_mb 96
 ```
+It trains ~5 epochs, then Kaggle stops it at 12 h. The `Logs` tab will say
+`canceled after ~43200s (timeout exceeded)` — **that is expected, not an
+error.** The corpus is rebuilt each session (~1 h, Kaggle storage is
+ephemeral), so budget ~1 h of that 12 h on data, not training.
+
+**Continuing (sessions 2, 3, …)** — each time Kaggle stops you:
+1. **Output** tab → download `ckpt/resume.pt` (~3.5 GB for giga).
+2. Kaggle → **Datasets** → *New Dataset* → upload `resume.pt` (any name; the
+   folder it lands in doesn't matter — `--resume` scans all of
+   `/kaggle/input`).
+3. Add that dataset to this notebook's **Settings → Add Input**.
+4. **Re-run the exact same training cell.** `--resume` auto-finds the newest
+   `/kaggle/input/**/resume.pt` and prints
+   `resume: ... continuing from epoch N/18` — it trains only the remaining
+   epochs. Repeat until a run prints the final metrics + split parts.
+
+`--resume` with no file found just starts fresh (a bare `--resume` is safe on
+the first run). A checkpoint whose arch doesn't match the current
+`--preset`/widths is rejected with a clear log line and it starts fresh
+instead of corrupting the run. The final run writes `brain_part_00…11` +
+`brain_arch.json` to `/kaggle/output/ckpt` — download those (see §3).
+
+**Want it to finish in a single 12 h session?** Use a smaller-but-strong
+config that fits ~9.5 h (≈4 epochs at ~2 h/epoch + ~1.5 h corpus):
+
+```bash
+!python brain.py train \
+  --preset giga --batch 8 --per_class 310 \
+  --epochs 4 --phase2 0 \
+  --n_point 18000 --n_count 12000 --n_drag 14000 --n_grid 9000 \
+  --n_pattern 12000 --n_bbox 10000 --n_pipe 7000 --n_tower 7000 \
+  --n_shape 7000 --n_text 6000 \
+  --hard_frac 0.45 --degrade_frac 0.5 --clutter_frac 0.55 \
+  --hcap_dir /kaggle/working/hcap --hcap_views 16 \
+  --photos_dir /kaggle/working/photos --photo_views 16 \
+  --amp 1 --models_dir /kaggle/output/ckpt \
+  --split_parts --part_max_mb 96
+```
+Same 100k+ rounds + 310k tiles + real hcap + real photos, just fewer epochs —
+a solid one-shot brain if you don't want to juggle resume across sessions.
+
 (`--batch 8` is the T4 setting; on a 16 GB card that's what fits the 1.1 GB
 giga model + optimizer states + the 160-char prompt transformer comfortably.
 Skip the `--photos_dir` line if you didn't run the fetch in step 4.)
