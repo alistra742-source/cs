@@ -43,6 +43,11 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 # orlov-ai: 4,068 labelled vehicle tiles (quick, ~5 MB)
 !git clone --depth 1 https://github.com/orlov-ai/hcaptcha-dataset /kaggle/working/hcap
 
+# real hCaptcha animal/object tiles (cat, dog, elephant, giraffe, penguin,
+# hedgehog, rabbit, shark, fish, tractor, car, tv, keyboard, ...) — 2,529
+# images SHIPPED IN THE REPO, just merge them in:
+!cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/
+
 # drandule: ~100,000 sorted vehicle tiles (the big one, ~1-2 GB)
 # !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/working/hcap
 ```
@@ -53,7 +58,7 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
    idempotent — re-running it resumes/skips, so a kill + re-run is safe:
 
 ```bash
-# all 1000 classes x 4 photos (test with --limit 20 first if you like)
+# all 1003 classes x 4 photos (test with --limit 20 first if you like)
 !python fetch_photos.py --out /kaggle/working/photos --per_class 4
 ```
 
@@ -327,6 +332,16 @@ Then unzip into `/kaggle/working/hcap/` **alongside** the vehicle folders
 canonicalises folder names automatically, so every real animal tile flows
 into the tile head with `--hcap_views` views — and with `--real_only` those
 classes stop rendering entirely.
+
+**Already in the repo (no download needed):** `hcap_real/` ships 2,529 real
+hCaptcha tiles for 22 classes — the photo-style objects (cat, dog,
+elephant, giraffe, penguin, hedgehog, rabbit, shark, fish, horse, cow,
+tractor, car, chair, clock, table, keyboard, tv, + 4 vehicles). The setup
+step `cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/` merges
+them in, so those classes are real from the first hop. Only the
+**illustrated** set (bear, lion, raccoon, rooster, red panda, boar, duck,
+squirrel, parrot, guitar, bat, lighthouse, warthog) still needs the
+Roboflow download above — that style exists nowhere else public.
 
 ### Warm start across the vocab change
 A **1000-class** giga checkpoint warm-starts a **1003-class** run
