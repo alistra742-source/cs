@@ -110,7 +110,7 @@ def _search(term, want, min_width=320):
     return out
 
 
-def _fetch_class(cls, terms, out_dir, per_class):
+def _fetch_class(cls, terms, out_dir, per_class, deadline=None):
     """One class folder: try the class name, then its synonyms. Idempotent —
     an interrupted run resumes where it left off, and content-hash dedup
     means a resumed search never re-saves a photo it already has."""
@@ -119,6 +119,11 @@ def _fetch_class(cls, terms, out_dir, per_class):
     have = len([f for f in os.listdir(d)
                 if f.lower().endswith((".jpg", ".png", ".jpeg"))])
     if have >= per_class:
+        return
+    # timebox: once past the deadline, don't START classes we haven't
+    # touched yet (in-flight ones still finish). A re-run tops these up —
+    # the fetch is idempotent, so nothing is lost.
+    if deadline is not None and have == 0 and time.time() > deadline:
         return
     need = per_class - have
     seen = set()                       # sha1 of everything already on disk
@@ -168,9 +173,15 @@ def main():
                     help="comma list of class names (default: all)")
     ap.add_argument("--limit", type=int, default=0,
                     help="only the first N classes (testing)")
-    ap.add_argument("--workers", type=int, default=4,
-                    help="parallel fetchers (4 keeps Wikimedia happy; more "
-                         "gets the IP throttled after a few hundred calls)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="parallel downloaders (the search API stays "
+                         "polite — it is rate-gated at 0.3 s — so extra "
+                         "workers only parallelise the photo downloads)")
+    ap.add_argument("--max_minutes", type=int, default=0,
+                    help="hard timebox: stop STARTING new classes after N "
+                         "minutes (in-flight ones finish), so a slow fetch "
+                         "never eats the training session; re-run next "
+                         "session to finish — it's idempotent. 0 = no limit")
     a = ap.parse_args()
 
     import make_dataset as md
@@ -210,10 +221,13 @@ def main():
         if os.path.isdir(p):
             n_files_before += len(os.listdir(p))
 
-    print("fetching %d classes x %d photos -> %s  (%d workers)" %
-          (len(classes), a.per_class, a.out, a.workers))
+    deadline = (t0 + a.max_minutes * 60) if a.max_minutes > 0 else None
+    print("fetching %d classes x %d photos -> %s  (%d workers%s)" %
+          (len(classes), a.per_class, a.out, a.workers,
+           ", timebox %d min" % a.max_minutes if deadline else ""))
     with cf.ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = {ex.submit(_fetch_class, c, terms[c], a.out, a.per_class): c
+        futs = {ex.submit(_fetch_class, c, terms[c], a.out, a.per_class,
+                          deadline): c
                 for c in classes}
         for fut in cf.as_completed(futs):
             c = futs[fut]
@@ -244,6 +258,13 @@ def main():
     print("== done: %d/%d classes have photos, %d total "
          "(+%d new) in %.0fs ==" % (covered, len(classes), total,
                                     total - n_files_before, dt))
+    if deadline is not None and time.time() >= deadline - 1 and covered \
+            < len(classes):
+        print("timebox hit: %d classes still photo-less (they fall back to "
+              "renders under --real_only and are named in the train log)." %
+              (len(classes) - covered))
+        print("re-run this fetch in the next session to top them up — it is "
+              "idempotent and skips what's already on disk.")
     print("train with:  --photos_dir %s" % a.out)
 
 

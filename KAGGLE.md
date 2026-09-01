@@ -51,11 +51,11 @@ photoreal → `photos/`, 2 hCaptcha-style flats → `hcap/` per class) → real
 photos for the remaining ~970 classes (mounted `brain-photos` dataset if
 present, else a one-time Wikimedia fetch).
 
-- **One-time, after the first session's fetch (~15 min):** zip
+- **One-time, after the first session's fetch (~1 h, hard-capped at 75 min):** zip
   `/kaggle/working/photos` to `/kaggle/output`, download it from the Output
   tab, upload it as a Kaggle **dataset named `brain-photos`** (with a
   `photos/` folder at its root). Add it to the notebook's Data inputs.
-  Every later session then skips the fetch entirely (~40 min saved each).
+  Every later session then skips the fetch entirely (up to 75 min saved each).
 - Optional: the ~100k-tile drandule vehicle set — add it inside
   `kaggle_setup.sh` (commented line) if you want maximum vehicle volume.
 
@@ -96,7 +96,7 @@ corpus builds far faster too):
 | step | time |
 |---|---|
 | `kaggle_setup.sh` (orlov clone + merges + roster split) | ~2 min |
-| photo fetch (session 1 only; ~0 with `brain-photos` dataset) | 15–40 min |
+| photo fetch (session 1 only; 16 workers, 75-min hard cap; ~0 with `brain-photos` dataset) | ~45–75 min |
 | corpus build (`--real_only` ≈ 0 renders + ~200k real views + 104k scenes) | ~45–60 min |
 | training | ~2 h/epoch → **~5–5.5 epochs per 12 h session** |
 

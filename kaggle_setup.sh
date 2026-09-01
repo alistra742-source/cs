@@ -44,8 +44,9 @@ if [ -d /kaggle/input/brain-photos/photos ]; then
     cp -rn /kaggle/input/brain-photos/photos/* /kaggle/working/photos/ \
         2>/dev/null || true
 else
-    echo "no brain-photos dataset - fetching from Wikimedia (~15-40 min)"
-    python fetch_photos.py --out /kaggle/working/photos --per_class 4
+    echo "no brain-photos dataset - fetching from Wikimedia (timeboxed 75 min)"
+    python fetch_photos.py --out /kaggle/working/photos --per_class 4 \
+        --workers 16 --max_minutes 75
 fi
 
 echo "── setup done ──"
