@@ -113,6 +113,7 @@ import pickle
 import math
 import os
 import random
+import re
 import time
 
 # Works both as a script (ROOT = brain.py's dir) AND when pasted into a
@@ -2297,10 +2298,17 @@ def _checkpoint(model, corpus, models_dir, epoch, verbose=True,
     With ``opt`` given it also writes resume.pt — the FULL training state
     (weights + optimizer + AMP scaler + epoch + scheduler position) — so a
     killed 12 h Kaggle session can be continued with --resume from the next
-    session instead of restarting at epoch 1."""
+    session instead of restarting at epoch 1. Also writes one loadable
+    brain file per epoch (brain_epNN.pt) so every epoch is a usable brain
+    and a valid --resume warm-start point."""
     os.makedirs(models_dir, exist_ok=True)
     pt = os.path.join(models_dir, "brain.pt")
     torch.save(model.state_dict(), pt)
+    try:
+        torch.save(model.state_dict(),
+                   os.path.join(models_dir, "brain_ep%02d.pt" % epoch))
+    except OSError:
+        pass
     sidecar = {
         "kind": "brain", "version": 2, "hr": True,
         "classes": CLASSES, "families": FAMILIES,
@@ -2342,19 +2350,28 @@ def _checkpoint(model, corpus, models_dir, epoch, verbose=True,
 
 def _find_resume(explicit, models_dir):
     """Resolve --resume: an explicit path, or (bare --resume / 'auto') the
-    newest resume.pt in the models dir, else in any Kaggle input upload."""
+    newest checkpoint in the models dir, else in any Kaggle input upload.
+    Preference order: resume.pt (full state) > brain_epNN.pt (newest) >
+    brain.pt + brain.json (the latest per-epoch weights)."""
     if not explicit:
         return None
     if explicit != "auto":
         return explicit if os.path.isfile(explicit) else None
+    import glob
     cand = os.path.join(models_dir, "resume.pt")
     if os.path.isfile(cand):
         return cand
+    epcs = glob.glob(os.path.join(models_dir, "brain_ep*.pt"))
+    if epcs:
+        return max(epcs, key=os.path.getmtime)
     if os.path.isdir("/kaggle/input"):
-        import glob
-        hits = glob.glob("/kaggle/input/**/resume.pt", recursive=True)
-        if hits:
-            return max(hits, key=os.path.getmtime)
+        for pat in ("resume.pt", "brain_ep*.pt"):
+            hits = glob.glob("/kaggle/input/**/%s" % pat, recursive=True)
+            if hits:
+                return max(hits, key=os.path.getmtime)
+        plain = glob.glob("/kaggle/input/**/brain.pt", recursive=True)
+        if plain:
+            return max(plain, key=os.path.getmtime)
     return None
 
 
@@ -2565,6 +2582,15 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
     sched = torch.optim.lr_scheduler.LambdaLR(opt, _lr_fn)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    def _place_schedule():
+        """Put the LR schedule exactly at the current step_ctr position in
+        one shot (no N-step loop). Works because _lr_fn reads step_ctr
+        directly rather than the scheduler's internal epoch counter."""
+        sched.last_epoch = step_ctr[0]
+        for pg, base_lr in zip(sched.optimizer.param_groups,
+                               sched.base_lrs):
+            pg["lr"] = base_lr * _lr_fn(step_ctr[0])
+
     log("== Brain v2 [%s]: %.1fM params (%.1f MB fp32) | device %s%s%s ==" % (
         preset, sum(p.numel() for p in model.parameters()) / 1e6,
         model.param_mb(), device,
@@ -2583,33 +2609,85 @@ def train_brain(epochs=12, batch=64, lr=1e-3, seed=0,
         "warmup %d, kreg %.3f, focus %s" % (
             total_epochs, phase2, steps_per_epoch, warmup, kreg, focus))
 
-    # ── resume: continue a killed session (Kaggle 12h cap) from the last
-    # completed epoch, with optimizer + AMP scaler + scheduler position ────
+    # ── resume: continue a killed session (Kaggle 12h cap) ────────────────
+    # Two kinds of checkpoint are accepted:
+    #   resume.pt            full state (weights+optimizer+scaler+epoch)
+    #   brain.pt/brain_epNN  weights only -> "warm start" (fresh optimizer,
+    #                        continue from the epoch the file represents)
     start_ep = 0
     if resume:
         if not os.path.isfile(resume):
             log("   resume: %r not found - starting fresh" % resume)
         else:
-            ck = torch.load(resume, map_location=device)
-            ok = (ck.get("n_classes") == N_CLASSES
-                  and all(ck.get("arch", {}).get(k) == getattr(model, k)
-                          for k in ("width", "prompt_dim", "prompt_layers",
-                                    "d_concept", "pattern_d",
-                                    "pattern_layers")))
-            if not ok:
-                log("   resume: arch mismatch (%s) - starting fresh" % resume)
-            else:
-                model.load_state_dict(ck["model"])
-                opt.load_state_dict(ck["opt"])
-                if ck.get("scaler") is not None and scaler is not None:
-                    scaler.load_state_dict(ck["scaler"])
-                step_ctr[0] = int(ck.get("step_ctr", 0))
-                for _ in range(step_ctr[0]):      # fast-forward the schedule
-                    sched.step()
-                start_ep = min(int(ck.get("epoch", 0)), total_epochs - 1)
-                log("   resume: loaded %s - continuing from epoch %d/%d "
-                    "(%d steps done)" % (resume, start_ep, total_epochs,
-                                         step_ctr[0]))
+            try:
+                ck = torch.load(resume, map_location=device,
+                                weights_only=False)
+            except Exception as e:  # noqa: BLE001 - corrupt/foreign file
+                log("   resume: could not load %s (%s) - starting fresh"
+                    % (resume, e))
+                ck = None
+            if ck is not None:
+                if isinstance(ck, dict) and ("model" in ck or "opt" in ck):
+                    # ---- full training state (resume.pt) ----
+                    ok = (ck.get("n_classes") == N_CLASSES
+                          and all(ck.get("arch", {}).get(k)
+                                  == getattr(model, k)
+                                  for k in ("width", "prompt_dim",
+                                            "prompt_layers", "d_concept",
+                                            "pattern_d", "pattern_layers")))
+                    if not ok:
+                        log("   resume: arch mismatch (%s) - starting fresh"
+                            % resume)
+                    else:
+                        # optimizer state first: if it doesn't fit, NOTHING
+                        # is applied and we start fresh; if it fits, the
+                        # weights must too (same param structure), so a
+                        # failure there crashes loudly instead of silently
+                        # continuing with a corrupted mix
+                        try:
+                            opt.load_state_dict(ck["opt"])
+                        except Exception as e:  # noqa: BLE001
+                            log("   resume: optimizer state doesn't match "
+                                "(%s) - starting fresh" % e)
+                        else:
+                            model.load_state_dict(ck["model"])
+                            if ck.get("scaler") is not None and \
+                                    scaler is not None:
+                                scaler.load_state_dict(ck["scaler"])
+                            step_ctr[0] = int(ck.get("step_ctr", 0))
+                            _place_schedule()
+                            start_ep = min(int(ck.get("epoch", 0)),
+                                           total_epochs - 1)
+                            log("   resume: loaded %s - continuing from "
+                                "epoch %d/%d (%d steps done)"
+                                % (resume, start_ep, total_epochs,
+                                   step_ctr[0]))
+                else:
+                    # ---- weights only (brain.pt / brain_epNN.pt) ----
+                    base = os.path.basename(resume)
+                    m = re.match(r"brain_ep(\d+)\.pt$", base)
+                    ep = int(m.group(1)) if m else 0
+                    if ep == 0:
+                        sj = os.path.join(os.path.dirname(resume) or ".",
+                                          "brain.json")
+                        if os.path.isfile(sj):
+                            try:
+                                ep = int(json.load(open(sj)).get("epoch", 0))
+                            except Exception:  # noqa: BLE001
+                                ep = 0
+                    try:
+                        model.load_state_dict(ck, strict=True)
+                    except Exception as e:  # noqa: BLE001
+                        log("   resume: weights don't match this preset "
+                            "(%s) - starting fresh" % e)
+                    else:
+                        start_ep = min(ep, total_epochs - 1)
+                        step_ctr[0] = start_ep * steps_per_epoch
+                        _place_schedule()
+                        log("   resume: warm-started weights from %s "
+                            "(epoch %d) - fresh optimizer, continuing from "
+                            "epoch %d/%d"
+                            % (resume, ep, start_ep, total_epochs))
 
     ont_target = torch.from_numpy(
         ontology_targets(N_CLASSES, CLASSES)).float().to(device)

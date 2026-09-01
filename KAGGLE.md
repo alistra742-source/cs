@@ -92,14 +92,21 @@ ephemeral), so budget ~1 h of that 12 h on data, not training.
 
 **Continuing (sessions 2, 3, …)** — each time Kaggle stops you:
 1. **Output** tab → download `ckpt/resume.pt` (~3.5 GB for giga).
-2. Kaggle → **Datasets** → *New Dataset* → upload `resume.pt` (any name; the
+   (Every epoch also writes `brain_epNN.pt` (~1.1 GB each) — one ready-to-use
+   brain per epoch. `brain.pt` is always the latest.)
+2. Kaggle → **Datasets** → *New Dataset* → upload the file(s) (any name; the
    folder it lands in doesn't matter — `--resume` scans all of
-   `/kaggle/input`).
+   `/kaggle/input`). Upload `resume.pt` for a full resume, or `brain.pt` /
+   `brain_epNN.pt` (+ its `brain.json` sidecar if you have it) for a
+   **warm start** — the weights load, the optimizer resets fresh, and
+   training continues from the epoch that file represents.
 3. Add that dataset to this notebook's **Settings → Add Input**.
 4. **Re-run the exact same training cell.** `--resume` auto-finds the newest
-   `/kaggle/input/**/resume.pt` and prints
-   `resume: ... continuing from epoch N/18` — it trains only the remaining
-   epochs. Repeat until a run prints the final metrics + split parts.
+   `resume.pt` > `brain_epNN.pt` > `brain.pt` under the models dir and
+   `/kaggle/input`, and prints either
+   `resume: ... continuing from epoch N/18 (… steps done)` (full state) or
+   `resume: warm-started weights from ... continuing from epoch N/18`.
+   Repeat until a run prints the final metrics + split parts.
 
 `--resume` with no file found just starts fresh (a bare `--resume` is safe on
 the first run). A checkpoint whose arch doesn't match the current
