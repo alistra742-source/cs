@@ -26,21 +26,56 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 API = "https://commons.wikimedia.org/w/api.php"
 UA = "BrainTrainer/1.0 (hCaptcha research; contact: local)"
 
+# ── Wikimedia is rate-limited by IP: a polite global gate + shared
+# 429-backoff so 1000 classes fetch in ~10-15 min instead of getting the
+# IP throttled after a few hundred fast requests ──────────────────────────
+_gate = threading.Lock()
+_last_api = [0.0]
+_backoff_until = [0.0]
+
+
+def _api_gate():
+    """Space search-API calls (>=0.3 s apart) and honour a shared 429 pause."""
+    with _gate:
+        while True:
+            now = time.time()
+            if now < _backoff_until[0]:
+                time.sleep(min(1.0, _backoff_until[0] - now))
+                continue
+            wait = 0.3 - (time.time() - _last_api[0])
+            if wait > 0:
+                time.sleep(wait)
+            _last_api[0] = time.time()
+            return
+
+
+def _signal_backoff(seconds=60):
+    with _gate:
+        _backoff_until[0] = max(_backoff_until[0], time.time() + seconds)
+
 
 def _get(url, timeout=20, tries=2):
     last = None
-    for _ in range(tries):
+    for t in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:      # throttled: back off, then retry
+                _signal_backoff(60 + 60 * t)
+                last = e
+                continue
+            raise                   # 404 etc. = genuinely missing, skip
         except Exception as e:  # noqa: BLE001 - network is flaky by nature
             last = e
             time.sleep(0.6)
@@ -49,11 +84,12 @@ def _get(url, timeout=20, tries=2):
 
 def _search(term, want, min_width=320):
     """Commons full-text search -> [(thumb_url, mime), ...] best matches."""
+    _api_gate()
     q = urllib.parse.urlencode({
         "action": "query", "format": "json", "generator": "search",
         "gsrnamespace": "6",                       # File: namespace
         "gsrsearch": 'filetype:bitmap "%s"' % term,
-        "gsrlimit": min(50, want * 4),             # pull extra, filter below
+        "gsrlimit": min(25, want * 4),             # pull extra, filter below
         "prop": "imageinfo", "iiprop": "url|size|mime",
         "iiurlwidth": "640",                       # serve 640-px thumbnails
     })
@@ -132,7 +168,9 @@ def main():
                     help="comma list of class names (default: all)")
     ap.add_argument("--limit", type=int, default=0,
                     help="only the first N classes (testing)")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="parallel fetchers (4 keeps Wikimedia happy; more "
+                         "gets the IP throttled after a few hundred calls)")
     a = ap.parse_args()
 
     import make_dataset as md
