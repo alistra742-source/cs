@@ -15,13 +15,19 @@ is a near-twin of the reference: indistinguishable from a real photograph.
 LAYOUT  (hcap_gen/<class>/)
 ---------------------------
     photo_1.jpg, photo_2.jpg         SEEDS  — the "real" reference photos
-    photo_3.jpg, photo_4.jpg, ...    VARIANTS — the "drawn" ones, but they are
-                                         photoreal, generated FROM the seeds,
-                                         and look exactly like real photos.
+    photo_3.jpg, photo_4.jpg, ...    VARIANTS — photoreal twins generated FROM
+                                         the seeds (indistinguishable from real)
+    photo_5.jpg, photo_6.jpg         FLAT — the ~30% "drawn but recognisable"
+                                         layer: hCaptcha-style flat
+                                         illustrations (clearly drawn, same
+                                         animal, similar look). Named photo_*
+                                         so the KAGGLE split routes them through
+                                         the same centre-crop path.
 
-    _flat_archive/<class>/...        old flat-vector illustrations, kept on
-                                         disk but NOT ingested (excluded from
-                                         the KAGGLE.md split step).
+    Mix per class = ~70% photoreal (photo_1-4) + ~30% flat (photo_5-6).
+
+    _archive/...                     extra generated images, kept on disk but
+                                         NOT ingested.
 
 The pipeline ingests every photo_*.jpg in a class folder as real photos
 (centre-biased crop, 16 augmented + degraded views each). So a class with 2
@@ -64,9 +70,9 @@ CLASSES = {
     "squirrel":   ["photo_1.jpg", "photo_2.jpg"],
     "parrot":     ["photo_1.jpg", "photo_2.jpg"],
     "guitar":     ["photo_1.jpg", "photo_2.jpg"],
-    "bat":        [],
-    "lighthouse": [],
-    "warthog":    [],
+    "bat":        ["photo_1.jpg", "photo_2.jpg"],
+    "lighthouse": ["photo_1.jpg", "photo_2.jpg"],
+    "warthog":    ["photo_1.jpg", "photo_2.jpg"],
 }
 
 # scene description baked into every variant prompt (matches the real photo).
@@ -108,6 +114,11 @@ def variant_files(cls):
     return ["photo_%d.jpg" % i for i in range(3, 3 + n)]
 
 
+def flat_files(cls):
+    """The ~30% 'drawn but recognisable' layer (hCaptcha-style flats)."""
+    return ["photo_5.jpg", "photo_6.jpg"]
+
+
 def variant_prompt(cls):
     return ("A photorealistic photograph of the same subject in the exact same "
             "scene: %s. Looks exactly like a real camera photograph with only "
@@ -116,14 +127,17 @@ def variant_prompt(cls):
 
 
 def status():
-    print("%-12s %8s  %s" % ("class", "real", "variants"))
+    print("%-12s  %10s  %10s   %s" % ("class", "photoreal", "flat ~30%", "mix"))
     for cls in CLASSES:
         seeds = [f for f in CLASSES[cls] if os.path.isfile(path(cls, f))]
         vars_ = [f for f in variant_files(cls) if os.path.isfile(path(cls, f))]
-        want = len(CLASSES[cls]) or 0
-        mark = "OK " if (seeds and len(vars_) == want) else (".." if seeds else "NO SEED")
-        print("%-12s %d seed(s)  %d/%d variants   %s"
-              % (cls, len(seeds), len(vars_), want, mark))
+        flats = [f for f in flat_files(cls) if os.path.isfile(path(cls, f))]
+        photo = len(seeds) + len(vars_)
+        tot = photo + len(flats)
+        flatpct = (100 * len(flats) // tot) if tot else 0
+        mark = "OK" if (photo >= 4 and len(flats) == 2) else (".." if photo else "NO SEED")
+        print("%-12s  %4d/4     %4d/2     %2d%% flat   %s"
+              % (cls, min(photo, 4), len(flats), flatpct, mark))
 
 
 def _panel(im, lab=None, col=None, C=300):
@@ -139,7 +153,7 @@ def sheet(labelled=True, out=None):
     rows = []
     for cls in CLASSES:
         items = []
-        for f in CLASSES[cls] + variant_files(cls):
+        for f in CLASSES[cls] + variant_files(cls) + flat_files(cls):
             p = path(cls, f)
             if os.path.isfile(p):
                 items.append((f, Image.open(p).convert("RGB").resize((C, C))))
@@ -151,7 +165,8 @@ def sheet(labelled=True, out=None):
     s = Image.new("RGB", (NW, NH), (255, 255, 255))
     d = ImageDraw.Draw(s)
     d.text((10, 12),
-           "real-vs-drawn QA" if labelled else "BLIND TEST - can you tell which are drawn?",
+           "70% photoreal / 30% flat-drawn QA" if labelled
+           else "BLIND TEST - can you tell which are drawn?",
            fill=(80, 80, 80))
     y = 40
     for cls, items in rows:
@@ -160,9 +175,9 @@ def sheet(labelled=True, out=None):
             x = 110 + i * (C + 8)
             s.paste(im, (x, y))
             if labelled:
-                is_seed = f in CLASSES[cls]
-                col = (0, 130, 0) if is_seed else (200, 110, 0)
-                _panel(im, "REAL" if is_seed else "DRAWN", col, C)
+                is_photo = f in CLASSES[cls] or f in variant_files(cls)
+                col = (0, 130, 0) if is_photo else (200, 110, 0)
+                _panel(im, "PHOTOREAL" if is_photo else "DRAWN-FLAT", col, C)
                 s.paste(im, (x, y))
     out = out or os.path.join(ROOT, "preview_indistinguishable.jpg")
     s.save(out, quality=92)
@@ -175,7 +190,7 @@ def blind(out=None):
     C = 300
     pool = []
     for cls in CLASSES:
-        for f in CLASSES[cls] + variant_files(cls):
+        for f in CLASSES[cls] + variant_files(cls) + flat_files(cls):
             p = path(cls, f)
             if os.path.isfile(p):
                 pool.append(Image.open(p).convert("RGB").resize((C, C)))
