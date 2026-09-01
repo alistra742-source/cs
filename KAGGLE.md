@@ -48,6 +48,16 @@ concepts, 8-layer 640-d pattern reasoner → **282 M parameters ≈ 1.10 GB**.
 # images SHIPPED IN THE REPO, just merge them in:
 !cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/
 
+# GENERATED two-style set (hcap_gen/): the drawn animal roster, each class
+# in BOTH looks hCaptcha serves — photorealistic (photo_*.jpg) and
+# hCaptcha's flat illustration style (illus_*.jpg). Split by style so each
+# gets the right crop: photos -> photos/ (centre-biased), illustrations ->
+# hcap/ (tile crop). With --real_only these classes stop rendering entirely.
+!for d in /kaggle/working/cs/hcap_gen/*/; do c=$(basename "$d"); \
+    mkdir -p /kaggle/working/hcap/$c /kaggle/working/photos/$c; \
+    cp -n "$d"illus_*.jpg /kaggle/working/hcap/$c/   2>/dev/null; \
+    cp -n "$d"photo_*.jpg  /kaggle/working/photos/$c/ 2>/dev/null; done
+
 # drandule: ~100,000 sorted vehicle tiles (the big one, ~1-2 GB)
 # !git clone --depth 1 https://github.com/drandule/hcaptcha_dataset /kaggle/working/hcap
 ```
@@ -333,15 +343,27 @@ canonicalises folder names automatically, so every real animal tile flows
 into the tile head with `--hcap_views` views — and with `--real_only` those
 classes stop rendering entirely.
 
-**Already in the repo (no download needed):** `hcap_real/` ships 2,529 real
-hCaptcha tiles for 22 classes — the photo-style objects (cat, dog,
-elephant, giraffe, penguin, hedgehog, rabbit, shark, fish, horse, cow,
-tractor, car, chair, clock, table, keyboard, tv, + 4 vehicles). The setup
-step `cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/` merges
-them in, so those classes are real from the first hop. Only the
-**illustrated** set (bear, lion, raccoon, rooster, red panda, boar, duck,
-squirrel, parrot, guitar, bat, lighthouse, warthog) still needs the
-Roboflow download above — that style exists nowhere else public.
+**Already in the repo (no download needed):**
+
+- `hcap_real/` ships 2,529 real hCaptcha tiles for 22 classes — the
+  photo-style objects (cat, dog, elephant, giraffe, penguin, hedgehog,
+  rabbit, shark, fish, horse, cow, tractor, car, chair, clock, table,
+  keyboard, tv, + 4 vehicles). The setup step
+  `cp -rn /kaggle/working/cs/hcap_real/* /kaggle/working/hcap/` merges them
+  in, so those classes are real from the first hop.
+- `hcap_gen/` ships the **two-style generated set** for the 13 illustrated
+  animals (bear, lion, raccoon, rooster, red panda, boar, duck, squirrel,
+  parrot, guitar, bat, lighthouse, warthog): each class has photorealistic
+  images (→ `photos/`, centre-biased crop) **and** hCaptcha-flat
+  illustrations (→ `hcap/`, tile crop). hCaptcha serves the same object as
+  a photo in some rounds and its own illustration in others, so training
+  on both looks makes the model recognise it either way. With
+  `--real_only` these classes train exclusively on that mix — zero
+  recipe renders.
+
+The optional **Roboflow download above** is now a *bonus*, not a
+requirement: it adds hCaptcha's own captured illustration art on top of the
+generated set for exactly these classes.
 
 ### Warm start across the vocab change
 A **1000-class** giga checkpoint warm-starts a **1003-class** run
