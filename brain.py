@@ -956,15 +956,15 @@ def _degrade_hard(im, rng):
     if rng.random() < 0.7:
         a = np.asarray(im).astype(np.int16)
         rs = np.random.RandomState(rng.randrange(1 << 30))
-        a = a + (rs.randn(*a.shape) * rng.uniform(5, 16)).astype(np.int16)
+        a = a + (rs.randn(*a.shape) * rng.uniform(7, 24)).astype(np.int16)
         im = _Im.fromarray(np.clip(a, 0, 255).astype(np.uint8))
     # salt & pepper
     if rng.random() < 0.4:
         a = np.asarray(im).astype(np.int16)
         rs = np.random.RandomState(rng.randrange(1 << 30))
         m = rs.rand(*a.shape[:2])
-        a[m < 0.012] = 255
-        a[(m >= 0.012) & (m < 0.026)] = 0
+        a[m < 0.018] = 255
+        a[(m >= 0.018) & (m < 0.040)] = 0
         im = _Im.fromarray(np.clip(a, 0, 255).astype(np.uint8))
     # per-channel colour cast
     g = (rng.uniform(0.70, 1.30), rng.uniform(0.70, 1.30),
@@ -987,11 +987,29 @@ def _degrade_hard(im, rng):
                                    0, 255).astype(np.uint8))
     elif rng.random() < 0.25:
         im = ImageEnhance.Color(im).enhance(rng.uniform(0.02, 0.18))
+    # Layered haze approximates translucent overlays and low-contrast night
+    # captures better than a single brightness transform.
+    if rng.random() < 0.48:
+        a = np.asarray(im).astype(np.float32)
+        h, w = a.shape[:2]
+        yy, xx = np.mgrid[0:h, 0:w]
+        edge = np.sqrt(((xx - w / 2) / max(w / 2, 1)) ** 2 +
+                       ((yy - h / 2) / max(h / 2, 1)) ** 2)
+        fog = rng.uniform(0.10, 0.34) * (0.65 + 0.35 * np.clip(edge, 0, 1))
+        a = a * (1.0 - fog[..., None]) + rng.uniform(205, 245) * fog[..., None]
+        if rng.random() < 0.55:
+            a = a * 0.92 + 235.0 * 0.08
+        im = _Im.fromarray(np.clip(a, 0, 255).astype(np.uint8))
     # hCaptcha dark-mode tint (the widget's dark theme tints tiles blue)
     if rng.random() < 0.5:
         a = np.asarray(im).astype(np.float32)
         a *= (0.84, 0.87, 1.00)
         a += (4, 6, 12)
+        im = _Im.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+    if rng.random() < 0.28:
+        a = np.asarray(im).astype(np.float32)
+        a *= (0.62, 0.92, 0.70)
+        a += (3, 14, 7)
         im = _Im.fromarray(np.clip(a, 0, 255).astype(np.uint8))
     # gamma
     if rng.random() < 0.5:
@@ -1010,7 +1028,7 @@ def _degrade_hard(im, rng):
     # scanlines
     if rng.random() < 0.3:
         a = np.asarray(im).astype(np.int16)
-        a[::2, :] = np.clip(a[::2, :] * 0.92, 0, 255)
+        a[::2, :] = np.clip(a[::2, :] * rng.uniform(0.82, 0.94), 0, 255)
         im = _Im.fromarray(a.astype(np.uint8))
     if rng.random() < 0.30:
         a = np.asarray(im).copy()
@@ -1667,6 +1685,23 @@ _BANK_BIN = [
     "Which images contain {n}?",
     "Click every picture with {n} in it",
 ]
+# Real-world paraphrases seen in challenge corpora.  These are deliberately
+# varied in syntax (not just noun synonyms) so the prompt encoder learns the
+# intent and not a handful of trigger phrases.
+_BANK_BIN += [
+    "Select every tile that depicts {n}", "Check each square showing {n}",
+    "Mark the photos where you can see {n}",
+    "Choose all pictures that include {n}",
+    "Touch every image in which {n} appears",
+    "Identify all of the {n} images", "Find and select every {n}",
+    "Select the squares containing a {n}",
+    "Click any tile that has a {n} in it",
+    "Which tiles show an example of {n}? Select them all",
+    "Select all photos depicting {n}",
+    "Click every image where there is {n}",
+    "Mark each picture featuring {n}",
+    "Pick the images that include an example of {n}",
+]
 _BANK_CNT = [
     "How many {ns} are in this image?",
     "How many {n} are in this image?",
@@ -1674,6 +1709,15 @@ _BANK_CNT = [
     "What number of {ns} do you see?",
     "How many {n} can you find?",
     "Count every {n} you see",
+]
+_BANK_CNT += [
+    "What is the total number of {ns} shown?",
+    "How many instances of {n} are visible?",
+    "Count all of the {ns} in this picture",
+    "Enter the number of {ns} you can see",
+    "Tell me how many {ns} appear in the image",
+    "How many separate {ns} are there?",
+    "What is the count of {ns} in this scene?",
 ]
 _BANK_PT = [
     "Please click on the {n}",
@@ -1685,6 +1729,11 @@ _BANK_PT = [
     "Click on the {n} in this picture",
     "Where is the {n}? Click it",
 ]
+_BANK_PT += [
+    "Locate the {n} and click its center", "Find and select the {n}",
+    "Point to the {n}", "Tap the object that is a {n}",
+    "Click the visible {n} in this scene",
+]
 _BANK_BB = [
     "Draw a box around the {n}",
     "Please draw a box around the {n}",
@@ -1692,6 +1741,11 @@ _BANK_BB = [
     "Box the {n}",
     "Draw a box around {n}",
     "Outline the {n} with a box",
+]
+_BANK_BB += [
+    "Enclose the {n} in a rectangle", "Mark the bounding box of the {n}",
+    "Draw a rectangle enclosing the {n}", "Put a box around the entire {n}",
+    "Drag a box to outline the {n}",
 ]
 _BANK_REL = {
     "SIZE": ["Click the largest {n}", "Click the smallest {n}",
@@ -1718,6 +1772,10 @@ _BANK_AFF = ["Pick all things you can work on with the {t}",
              "Click the surfaces the {t} works on",
              "Select everything the {t} can work on",
              "Which items can the {t} be used on?"]
+_BANK_AFF += ["Select every object suitable for the {t}",
+              "Which surfaces could you use the {t} on?",
+              "Mark all things that can be repaired with the {t}",
+              "Choose the items the {t} is intended to work on"]
 _BANK_MAT = ["Select items that are primarily metal",
              "Select all the metal objects",
              "Click things made of metal",
@@ -1729,11 +1787,20 @@ _BANK_MAT = ["Select items that are primarily metal",
              "Click the things with fur",
              "Select the plants",
              "Click every plant you see",
-             "Pick all the green plants"]
+             "Click the green plants"]
+_BANK_MAT += ["Choose every object made mostly of metal",
+              "Mark all wooden objects in the grid",
+              "Select each item covered in fur",
+              "Pick every plant or plant-like object",
+              "Which images show metal items? Select all of them"]
 _BANK_SET = ["Find places safe for setting down the item in the reference",
              "Click the surfaces you can set the item down on",
              "Pick safe places to put the item shown",
              "Which tiles can the item be placed on?"]
+_BANK_SET += ["Select every safe surface for the shown object",
+              "Where could you put down the item shown above?",
+              "Mark all suitable places to rest the reference item",
+              "Choose the tiles where the object can safely sit"]
 _BANK_DRAG = ["Drag the element to the place where it fits best",
               "Drag the piece to where it fits",
               "Move the shape into its matching hole",
@@ -1745,25 +1812,41 @@ _BANK_DRAG = ["Drag the element to the place where it fits best",
               "Drag the pipe to where it fits",
               "Drag the pipe segment to the place where it fits",
               "Move the pipe to where it fits best"]
+_BANK_DRAG += ["Move the matching piece into its slot",
+               "Place the object in the opening where it belongs",
+               "Drag the item onto its matching position",
+               "Move the loose segment into the gap",
+               "Drop the piece into the outlined shape"]
 _BANK_PATTERN = ["Put one of the animals into the empty spot to complete the pattern",
                  "Complete the pattern by dragging the right tile",
                  "Which tile completes the pattern?",
                  "Put one of the items into the empty spot",
                  "Select the tile that finishes the pattern"]
+_BANK_PATTERN += ["Choose the missing tile in the sequence",
+                  "Drag the candidate that completes the grid",
+                  "Which object belongs in the blank cell?"]
 _BANK_TOWER = ["Move the correct missing block segment onto the incomplete tower",
                "Move the missing block segment onto the incomplete tower",
                "Put the missing block segment on the tower",
                "Stack the block onto the shortest tower"]
+_BANK_TOWER += ["Place the missing wooden piece on the unfinished stack",
+                "Move the block to complete the shortest column",
+                "Drag the segment onto the tower with the gap"]
 _BANK_CHOICE = ["Select the most accurate description",
                 "Which of these is correct?",
                 "Choose the right answer",
                 "Select the correct statement",
                 "Pick the best description of the image"]
+_BANK_CHOICE += ["Choose the statement that best describes this picture",
+                 "Which answer correctly identifies the image?",
+                 "Select the description that matches the scene"]
 _BANK_TEXT = ["Type the text you see",
               "Enter the code below",
               "Type the characters you see",
               "Type the letters you see in the image",
               "Enter the code you see"]
+_BANK_TEXT += ["Transcribe the characters", "Read and enter the code",
+               "Enter the letters shown", "Type what is written in the image"]
 
 
 def _plural(name):
