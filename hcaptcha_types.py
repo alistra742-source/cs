@@ -684,12 +684,39 @@ if _mlt is not None:
         _water_vehicles, _air_vehicles
 del _mlt
 
+# Long-tail identity classes can shadow the coarse labels emitted by the
+# deployed 60-class Brain.  These high-confidence aliases keep prompt
+# extraction compatible with that checkpoint (while the larger vocabulary
+# can still be used by callers that bypass this coarse resolver).
+CORE_ALIAS_OVERRIDES = {
+    "helicopter": "airplane", "copter": "airplane",
+    "subway": "train", "tram": "train", "streetcar": "train",
+    "monorail": "train",
+    "sailboat": "boat", "ferry": "boat", "fire_truck": "truck",
+    "pickup_truck": "truck", "school_bus": "bus", "moped": "motorcycle",
+    "owl": "bird", "parrot": "bird", "penguin": "bird", "chicken": "bird",
+    "shark": "fish", "dolphin": "fish", "deer": "horse", "donkey": "horse",
+    "goat": "sheep", "llama": "sheep", "bison": "cow",
+    "police_car": "car", "taxi": "car", "race_car": "car",
+    "panda": "bear", "koala": "bear", "grizzly": "bear",
+    "palm_tree": "tree", "pine_tree": "tree", "forest": "tree",
+    "rose": "flower", "sunflower": "flower", "volcano": "mountain",
+    "building": "house", "barn": "house", "traffic_signal": "traffic_light",
+    "pedestrian_crossing": "crosswalk", "bench": "chair", "sofa": "chair",
+    "desk": "table", "pie": "pizza", "watch": "clock",
+    "alarm_clock": "clock", "nut": "bolt", "teacup": "cup",
+    "nightstand": "table", "night_stand": "table",
+    "dresser": "table", "bedside_table": "table",
+    "wooden_deck": "wood", "maple_leaf": "flower",
+}
 
 def canonical(word: str):
     """Map a surface word/phrase to the canonical class name (or None)."""
     if not word:
         return None
     key = re.sub(r"[^a-z]+", "_", word.lower()).strip("_")
+    if key in CORE_ALIAS_OVERRIDES:
+        return CORE_ALIAS_OVERRIDES[key]
     if key in SYNONYMS:
         return SYNONYMS[key]
     # naive singular/plural
@@ -711,7 +738,7 @@ def extract_target(prompt: str):
         stem = " %s" % phrase.replace("_", " ")
         for form in ("%s " % stem, "%ss " % stem, "%ses " % stem):
             if form in p:
-                return SYNONYMS[phrase]
+                return canonical(phrase)
     return None
 
 

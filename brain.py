@@ -3579,6 +3579,11 @@ class BrainSolver:
         self.tile_size = DEFAULT_TILE_SIZE
         self.width = 48
         self.min_conf = min_conf
+        # Robustness policy for deployed inference.  Flip TTA is checkpoint
+        # compatible and helps crops with off-centre/occluded subjects.
+        self.tta = os.environ.get("SOLVER_TTA", "1").lower() not in (
+            "0", "false", "no", "off")
+        self.target_min = float(os.environ.get("SOLVER_TARGET_MIN", "0.30"))
         if device is None:
             self.device = ("cuda" if (_TORCH and torch.cuda.is_available())
                            else "cpu")
@@ -3728,7 +3733,14 @@ class BrainSolver:
             return []
         ims = images if isinstance(images, (list, tuple)) else [images]
         xs = torch.cat([self._prep_tile(im) for im in ims], dim=0)
-        probs = F.softmax(self.model.tile_logits(self.model.features(xs)), dim=1)
+        logits = self.model.tile_logits(self.model.features(xs))
+        if self.tta:
+            # Average logits, not probabilities, to avoid making uncertain
+            # predictions artificially overconfident.
+            fx = torch.flip(xs, dims=[3])
+            flogits = self.model.tile_logits(self.model.features(fx))
+            logits = 0.70 * logits + 0.30 * flogits
+        probs = F.softmax(logits.float(), dim=1)
         return [{self.classes[i]: float(p) for i, p in enumerate(row)}
                 for row in probs.tolist()]
 
@@ -3747,8 +3759,16 @@ class BrainSolver:
         """(presence_map (C,H,W), location (C,2)) in one forward pass."""
         if not self.available:
             return None, None
-        f8, f4 = self._feat2(image, self.size)
-        hm = self.model.heatmaps(f8, f4).squeeze(0)
+        x = self._prep_tile(image, self.size)
+        f8, f4 = self.model.features2(x)
+        hm = self.model.heatmaps(f8, f4)
+        if self.tta:
+            fx = torch.flip(x, dims=[3])
+            ff8, ff4 = self.model.features2(fx)
+            # Map the flipped heatmap back before fusing coordinates.
+            fhm = torch.flip(self.model.heatmaps(ff8, ff4), dims=[3])
+            hm = 0.70 * hm + 0.30 * fhm
+        hm = hm.squeeze(0)
         presence = F.softmax(hm, dim=0)
         if hm.shape[0] > len(self.classes):
             presence = presence[:-1]
@@ -3958,6 +3978,27 @@ class BrainSolver:
         idx = hct.resolve_semantic(prompt, labels, example)
         if idx is None:                       # not understood -> defer
             return None
+        # For a direct select-all noun, argmax is unnecessarily brittle: the
+        # requested object can be the runner-up in a cluttered tile.  Score
+        # the requested class directly while retaining the conservative
+        # semantic resolver for relations, materials, and reference prompts.
+        target = hct.extract_target(prompt)
+        direct = hct.canonical(target) if target else None
+        if direct in self.classes and not example:
+            positives = []
+            for i, p in enumerate(probs):
+                pt = p.get(direct, 0.0)
+                alt = max((v for k, v in p.items() if k != direct),
+                          default=0.0)
+                if pt >= self.target_min and pt + 0.05 >= alt:
+                    positives.append(i)
+            if positives:
+                score = sum(probs[i].get(direct, 0.0)
+                            for i in positives) / len(positives)
+                return {"family": BINARY, "answer": positives,
+                        "confidence": score, "labels": labels,
+                        "target_scores": [probs[i].get(direct, 0.0)
+                                          for i in positives]}
         # confidence gate: a low-confidence labelling is vision territory
         if mean_conf < self.min_conf:
             return None
