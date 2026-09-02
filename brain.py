@@ -868,6 +868,14 @@ def _degrade_pil(im, rng):
         im = ImageEnhance.Color(im).enhance(rng.uniform(0.70, 1.30))
     if rng.random() < 0.6:
         im = im.filter(ImageFilter.GaussianBlur(rng.uniform(0.4, 1.4)))
+    # Mild atmospheric wash and desaturation also belong to the soft path.
+    if rng.random() < 0.35:
+        a = np.asarray(im).astype(np.float32)
+        fog = rng.uniform(0.04, 0.16)
+        im = _Im.fromarray(np.clip(a * (1.0 - fog) + 235.0 * fog,
+                                    0, 255).astype(np.uint8))
+    if rng.random() < 0.30:
+        im = ImageEnhance.Color(im).enhance(rng.uniform(0.15, 0.65))
     if rng.random() < 0.6:
         arr = np.asarray(im).astype(np.int16)
         rs = np.random.RandomState(rng.randrange(1 << 30))
@@ -921,15 +929,27 @@ def _degrade_hard(im, rng):
     from PIL import Image as _Im, ImageEnhance, ImageFilter
     resample = getattr(_Im, "Resampling", _Im).BILINEAR
     im = im.convert("RGB")
+    original_size = im.size
     # downscale (small rendered tiles / bad capture)
     if rng.random() < 0.7:
         w, h = im.size
         f = rng.uniform(0.35, 0.8)
         im = im.resize((max(8, int(w * f)), max(8, int(h * f))), resample)
-    # blur: motion or gaussian
+    # blur: motion, gaussian, or a radial-focus smear
     if rng.random() < 0.75:
-        if rng.random() < 0.45:
+        if rng.random() < 0.35:
             im = _motion_blur_pil(im, rng)
+        elif rng.random() < 0.25:
+            blurred = im.filter(ImageFilter.GaussianBlur(rng.uniform(1.2, 3.4)))
+            a = np.asarray(im).astype(np.float32)
+            b = np.asarray(blurred).astype(np.float32)
+            h, w = a.shape[:2]
+            yy, xx = np.mgrid[0:h, 0:w]
+            radial = np.sqrt(((xx - w / 2) / max(w / 2, 1)) ** 2 +
+                             ((yy - h / 2) / max(h / 2, 1)) ** 2)
+            mix = np.clip((radial - 0.25) * rng.uniform(0.35, 0.85), 0, 0.75)
+            im = _Im.fromarray(np.clip(a * (1 - mix[..., None]) +
+                                       b * mix[..., None], 0, 255).astype(np.uint8))
         else:
             im = im.filter(ImageFilter.GaussianBlur(rng.uniform(0.5, 2.4)))
     # gaussian noise
@@ -957,6 +977,16 @@ def _degrade_hard(im, rng):
     im = ImageEnhance.Brightness(im).enhance(rng.uniform(0.55, 1.45))
     im = ImageEnhance.Contrast(im).enhance(rng.uniform(0.55, 1.50))
     im = ImageEnhance.Color(im).enhance(rng.uniform(0.35, 1.60))
+    # Severe colour loss: monochrome, sepia, and near-monochrome captures.
+    if rng.random() < 0.28:
+        im = im.convert("L").convert("RGB")
+    elif rng.random() < 0.22:
+        gray = np.asarray(im.convert("L"), dtype=np.float32)
+        tint = rng.choice([(1.12, 0.94, 0.72), (0.82, 0.90, 1.08)])
+        im = _Im.fromarray(np.clip(np.stack([gray * x for x in tint], -1),
+                                   0, 255).astype(np.uint8))
+    elif rng.random() < 0.25:
+        im = ImageEnhance.Color(im).enhance(rng.uniform(0.02, 0.18))
     # hCaptcha dark-mode tint (the widget's dark theme tints tiles blue)
     if rng.random() < 0.5:
         a = np.asarray(im).astype(np.float32)
@@ -982,15 +1012,27 @@ def _degrade_hard(im, rng):
         a = np.asarray(im).astype(np.int16)
         a[::2, :] = np.clip(a[::2, :] * 0.92, 0, 255)
         im = _Im.fromarray(a.astype(np.uint8))
+    if rng.random() < 0.30:
+        a = np.asarray(im).copy()
+        shift = rng.choice([-2, -1, 1, 2])
+        a[..., 0] = np.roll(a[..., 0], shift, axis=1)
+        im = _Im.fromarray(a)
+    if rng.random() < 0.22:
+        from PIL import ImageOps
+        im = ImageOps.posterize(im, rng.choice([2, 3, 4]))
     # JPEG, possibly double-compressed
-    passes = (rng.randint(15, 60),)
-    if rng.random() < 0.4:
-        passes = passes + (rng.randint(15, 45),)
+    passes = (rng.randint(8, 55),)
+    if rng.random() < 0.65:
+        passes = passes + (rng.randint(8, 42),)
+    if rng.random() < 0.28:
+        passes = passes + (rng.randint(8, 30),)
     for q in passes:
         buf = _io.BytesIO()
         im.save(buf, "JPEG", quality=q)
         buf.seek(0)
         im = _Im.open(buf).convert("RGB")
+    if im.size != original_size:
+        im = im.resize(original_size, resample)
     return im
 
 
@@ -1320,16 +1362,26 @@ def make_pipe_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     horiz = rng.random() < 0.5
 
     def draw_pipe(x0, y0, x1, y1):
-        d.rectangle([x0, y0, x1, y1], fill=col, outline=dark, width=2)
-        if y1 - y0 > 0:                       # cylinder highlight
-            hy = y0 + (y1 - y0) * 0.28
-            d.line([x0 + 2, hy, x1 - 2, hy], fill=light, width=2)
+        d.rounded_rectangle([x0, y0, x1, y1], radius=max(2, int(pd * .18)),
+                            fill=dark, outline=tuple(max(0, v - 25) for v in dark), width=2)
+        # A stack of narrow bands approximates cylindrical shading at 96 px.
+        lo, hi = min(y0, y1), max(y0, y1)
+        for j in range(1, 7):
+            t = j / 7.0
+            c = tuple(int(dark[k] + (light[k] - dark[k]) *
+                          max(0.0, 1.0 - abs(t - .30) * 2.8)) for k in range(3))
+            d.line([x0 + 2, lo + (hi - lo) * t, x1 - 2,
+                    lo + (hi - lo) * t], fill=c, width=1)
+        d.line([x0 + 2, lo + 2, x1 - 2, lo + 2], fill=light, width=1)
 
     def flange(x, y):
         fw = pd * 0.28
         d.rectangle([x - fw / 2, y - pd * 0.12, x + fw / 2, y + pd * 1.12],
                     fill=dark, outline=tuple(int(v * 0.8) for v in dark),
                     width=1)
+        for yy in (y + pd * .12, y + pd * .88):
+            d.ellipse([x - fw * .28, yy - 1, x - fw * .05, yy + 1], fill=light)
+            d.ellipse([x + fw * .05, yy - 1, x + fw * .28, yy + 1], fill=light)
 
     if horiz:
         ry = S * rng.uniform(0.30, 0.68)     # run centre y
@@ -1412,9 +1464,15 @@ def make_tower_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
             y1 = bottom - k * bh
             c = tuple(min(255, v + rng.randint(-10, 10)) for v in col)
             oc = tuple(int(v * 0.62) for v in c)
-            d.rectangle([x, y0, x + bw, y1], fill=c, outline=oc, width=2)
-            d.line([x + 2, y0 + bh / 2, x + bw - 2, y0 + bh / 2],
-                   fill=tuple(int(v * 0.78) for v in c), width=1)
+            d.rounded_rectangle([x, y0, x + bw, y1], radius=2, fill=c,
+                                outline=oc, width=2)
+            d.line([x + 2, y0 + 2, x + bw - 2, y0 + 2],
+                   fill=tuple(min(255, int(v * 1.18)) for v in c), width=1)
+            d.line([x + 2, y1 - 2, x + bw - 2, y1 - 2],
+                   fill=tuple(int(v * 0.58) for v in c), width=1)
+            if rng.random() < 0.55:
+                d.ellipse([x + bw * .25, y0 + bh * .25,
+                           x + bw * .34, y0 + bh * .34], fill=oc)
         tops.append(bottom - h * bh)
 
     ph = rng.choice([1, 1, 2])               # piece height in blocks
@@ -1424,10 +1482,12 @@ def make_tower_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     for k in range(ph):
         y0 = ptop + k * bh
         c = tuple(min(255, v + rng.randint(-10, 10)) for v in pcol)
-        d.rectangle([px, y0, px + bw, y0 + bh], fill=c,
-                    outline=tuple(int(v * 0.62) for v in c), width=2)
-        d.line([px + 2, y0 + bh / 2, px + bw - 2, y0 + bh / 2],
-               fill=tuple(int(v * 0.78) for v in c), width=1)
+        d.rounded_rectangle([px, y0, px + bw, y0 + bh], radius=2, fill=c,
+                            outline=tuple(int(v * 0.62) for v in c), width=2)
+        d.line([px + 2, y0 + 2, px + bw - 2, y0 + 2],
+               fill=tuple(min(255, int(v * 1.18)) for v in c), width=1)
+        d.line([px + 2, y0 + bh - 2, px + bw - 2, y0 + bh - 2],
+               fill=tuple(int(v * 0.58) for v in c), width=1)
     try:
         font = ImageFont.load_default(size=max(9, S // 9))
     except TypeError:
@@ -1513,11 +1573,18 @@ def make_shape_round(rng: random.Random, size: int = DEFAULT_SCENE_SIZE):
     # punched slot: dark shape with a light outline ring
     base = _shape_points(kind, pw, ph)
     slot = [(x + tx * S - pw / 2, y + ty * S - ph / 2) for x, y in base]
+    shadow = [(x + 2, y + 3) for x, y in slot]
+    d.polygon(shadow, fill=(8, 8, 12))
     d.polygon(slot, fill=(28, 28, 34), outline=(250, 250, 252))
+    d.line(slot[: max(2, len(slot) // 3)], fill=(90, 90, 100), width=1)
     # loose piece: vivid fill, same silhouette
     col = tuple(rng.randint(60, 235) for _ in range(3))
     piece = [(x + fx * S - pw / 2, y + fy * S - ph / 2) for x, y in base]
+    d.polygon([(x + 2, y + 3) for x, y in piece], fill=(20, 20, 24))
     d.polygon(piece, fill=col, outline=tuple(int(v * 0.6) for v in col))
+    # Specular bevel on the loose piece makes shape identity survive blur.
+    d.line(piece[: max(2, len(piece) // 2)],
+           fill=tuple(min(255, int(v * 1.35)) for v in col), width=2)
     # "Move" badge above the piece
     try:
         font = ImageFont.load_default(size=max(9, S // 9))
@@ -1879,7 +1946,7 @@ def build_brain_corpus(per_class=1200, n_point=14000, n_count=8000,
                        n_drag=9000, n_grid=6000, n_pattern=6000, n_bbox=7000,
                        n_pipe=3000, n_tower=3000, n_shape=3000,
                        n_odrag=4000, n_text=4000,
-                       degrade_frac=0.40, hard_frac=0.30, clutter_frac=0.5,
+                       degrade_frac=0.40, hard_frac=0.48, clutter_frac=0.58,
                        router_bank=True, hcap_dir=None, hcap_views=16,
                        photos_dir=None, photo_views=16, real_only=False,
                        tile_size=DEFAULT_TILE_SIZE,
@@ -4075,11 +4142,11 @@ def main(argv=None):
                         "boar, ...) to a highlighted cell")
     t.add_argument("--n_text", type=int, default=6000)
     # degradation + hard-condition knobs
-    t.add_argument("--hard_frac", type=float, default=0.35,
-                   help="fraction of rounds with HARD degradation (blur/noise/dark-mode/double-JPEG)")
+    t.add_argument("--hard_frac", type=float, default=0.48,
+                   help="fraction of rounds with HARD degradation (blur/fog/B&W/noise/chromatic/JPEG)")
     t.add_argument("--degrade_frac", type=float, default=0.40,
                    help="fraction of rounds with SOFT degradation (the rest stay clean)")
-    t.add_argument("--clutter_frac", type=float, default=0.5,
+    t.add_argument("--clutter_frac", type=float, default=0.58,
                    help="fraction of point/count rounds with extra distractor objects")
     t.add_argument("--hcap_dir", default=None,
                    help="real hCaptcha challenge-image dataset (folder per class, e.g. the GitHub 'hcap' datasets)")
