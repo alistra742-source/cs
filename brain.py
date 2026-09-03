@@ -2632,6 +2632,195 @@ def write_arch_sidecar(corpus, arch, out_path=None):
     return out_path
 
 
+# ── brain.pt reassembly (the deployed solver's own self-heal) ────────────
+# models/brain.pt is a large artifact and is not committed as one file
+# (GitHub's 100 MB per-file limit): the repo ships it byte-split into
+# parts (brain_part_NN) + optionally a brain_arch.json sidecar. The Test
+# tab (brain_test.py) reassembles for itself; BrainSolver does it here too,
+# so a fresh clone of the deployed app does not silently run on the v1
+# point/drag/tile trio.
+_BRAIN_PART_PATTERNS = (("brain_part_%02d", 0),
+                        ("brain.pt.part-%02d", 0),
+                        ("brain.pt.part-%02d", 1))
+_BRAIN_PARTS_SHA = "5886f0e3c86ffc8cabbde701412f938bcecb9f5a"
+
+
+def _sidecar_for_state(state):
+    """Rebuild the brain.json sidecar from a freshly reassembled brain.pt.
+
+    The trainer saves brain.pt as a BARE state_dict (no embedded meta), so
+    everything is recovered from the tensors: n_classes is the out-dim of
+    tile_head.fc, and the v1 single-resolution vs v2/v3 dual-resolution
+    head layout selects that generation's training-time arch defaults.
+    """
+    state = state if isinstance(state, dict) else {}
+    n = None
+    t = state.get("tile_head.fc.weight")
+    if t is not None and getattr(t, "dim", lambda: 0)() == 2:
+        n = int(t.shape[0])
+    is_v1 = ("heatmap_head.head.weight" in state
+             and "heatmap_head.lo.weight" not in state)
+    arch = {"width": 48, "prompt_dim": 512, "text_len": 5}
+    if is_v1:
+        arch.update(prompt_layers=6, d_concept=256,
+                    pattern_d=256, pattern_layers=3)
+    else:
+        arch.update(prompt_layers=8, d_concept=320,
+                    pattern_d=320, pattern_layers=4)
+    d = {"kind": "brain", "version": 2, "hr": not is_v1,
+         "classes": CLASSES[:n] if n else list(CLASSES),
+         "families": list(FAMILIES),
+         "arch": arch,
+         "tile_size": DEFAULT_TILE_SIZE,
+         "scene_size": DEFAULT_SCENE_SIZE}
+    if n:
+        d["n_classes"] = n
+    return d
+
+
+def _ensure_brain_file(models_dir=None, log=None):
+    """Ensure models/brain.pt (+ brain.json) exist, reassembling if not.
+
+    Sources, in order: (1) loose part files at the repo root or in the
+    models dir, (2) part files stored in git (any ref), (3) GitHub raw
+    download at the pinned SHA. Returns True when both files are usable.
+    Never raises — a failed reassembly just means the caller falls back
+    to the vision model, exactly like a missing brain today.
+    """
+    models_dir = models_dir or MODELS_DIR
+    pt = os.path.join(models_dir, "brain.pt")
+    js = os.path.join(models_dir, "brain.json")
+    if os.path.exists(pt) and os.path.exists(js):
+        return True
+    log = log or (lambda s: print("[brain]", s))
+
+    def _write(parts, sidecar=None):
+        with open(pt, "wb") as f:
+            for chunk in parts:
+                f.write(chunk)
+        d = None
+        if isinstance(sidecar, dict) and sidecar.get("arch"):
+            d = dict(sidecar)
+            if d.get("classes") is None:
+                d["classes"] = (CLASSES[:d["n_classes"]]
+                                if d.get("n_classes") else list(CLASSES))
+            d.setdefault("families", list(FAMILIES))
+            d.setdefault("tile_size", DEFAULT_TILE_SIZE)
+            d.setdefault("scene_size", DEFAULT_SCENE_SIZE)
+        elif _TORCH:
+            # peek at the checkpoint to recover the exact arch (weights +
+            # class count) — same load the solver itself will do
+            try:
+                state = torch.load(pt, map_location="cpu")
+                d = _sidecar_for_state(state)
+            except Exception:
+                d = _sidecar_for_state({})
+        else:
+            d = _sidecar_for_state({})
+        with open(js, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+
+    def _gather(pattern, offset, base, ref):
+        parts, i = [], 0
+        while i < 24:
+            name = pattern % (i + offset)
+            if base is not None:
+                p = os.path.join(base, name)
+                if not os.path.isfile(p) or os.path.getsize(p) < 1000:
+                    break
+                with open(p, "rb") as f:
+                    parts.append(f.read())
+            else:
+                import subprocess
+                try:
+                    g = subprocess.run(
+                        ["git", "show", "%s:%s" % (ref, name)],
+                        cwd=ROOT, capture_output=True, timeout=120)
+                except Exception:
+                    break
+                if g.returncode != 0 or len(g.stdout) < 1000:
+                    break
+                parts.append(g.stdout)
+            i += 1
+        return parts
+
+    def _sidecar_from(ref):
+        import subprocess
+        for js_name in ("brain_arch.json", "models/brain.json",
+                        "brain.json"):
+            try:
+                j = subprocess.run(
+                    ["git", "show", "%s:%s" % (ref, js_name)],
+                    cwd=ROOT, capture_output=True, timeout=30)
+            except Exception:
+                continue
+            try:
+                if j.returncode == 0 and j.stdout[:1] == b"{":
+                    return json.loads(j.stdout)
+            except Exception:
+                continue
+        return None
+
+    # 1) loose part files (repo root, then the models dir)
+    for base in (ROOT, models_dir):
+        for pattern, offset in _BRAIN_PART_PATTERNS:
+            parts = _gather(pattern, offset, base, None)
+            if len(parts) >= 2:
+                sidecar = None
+                sp = os.path.join(base, "brain_arch.json")
+                if os.path.isfile(sp):
+                    try:
+                        with open(sp, "r", encoding="utf-8") as f:
+                            sidecar = json.load(f)
+                    except Exception:
+                        sidecar = None
+                _write(parts, sidecar)
+                log("models/brain.pt missing -> reassembled from %d "
+                    "loose parts" % len(parts))
+                return True
+    # 2) part files stored in git (any ref)
+    for ref in ("HEAD", "origin/arena/01a033e0-cs", "arena/01a033e0-cs",
+                "origin/main", "main"):
+        for pattern, offset in _BRAIN_PART_PATTERNS:
+            parts = _gather(pattern, offset, None, ref)
+            if len(parts) >= 2:
+                _write(parts, _sidecar_from(ref))
+                log("models/brain.pt missing -> reassembled from %d "
+                    "git parts (%s)" % (len(parts), ref))
+                return True
+    # 3) GitHub raw download at the pinned SHA (any machine with internet)
+    try:
+        import requests
+        parts = []
+        for i in range(24):
+            url = ("https://raw.githubusercontent.com/alistra742-source/"
+                   "cs/%s/brain_part_%02d" % (_BRAIN_PARTS_SHA, i))
+            r = requests.get(url, timeout=120)
+            if r.status_code != 200 or len(r.content) < 1000:
+                break
+            parts.append(r.content)
+        if len(parts) >= 2:
+            sidecar = None
+            for js_name in ("brain_arch.json", "brain.json"):
+                try:
+                    r = requests.get(
+                        "https://raw.githubusercontent.com/alistra742-"
+                        "source/cs/%s/%s" % (_BRAIN_PARTS_SHA, js_name),
+                        timeout=60)
+                    if r.status_code == 200:
+                        sidecar = json.loads(r.text)
+                        break
+                except Exception:
+                    continue
+            _write(parts, sidecar)
+            log("models/brain.pt missing -> downloaded %d parts from "
+                "GitHub" % len(parts))
+            return True
+    except Exception as exc:
+        log("could not obtain brain parts: %s" % exc)
+    return False
+
+
 def _focus_and_acc(model, corpus, tile_tr, device, ep, sample=2048,
                    verbose=True):
     """Confusion mining: sample tile train rows, count misclassified classes,
@@ -3752,6 +3941,14 @@ class BrainSolver:
         else:
             pt = os.path.join(models_dir, "brain.pt")
             js = os.path.join(models_dir, "brain.json")
+            if not (os.path.exists(pt) and os.path.exists(js)):
+                # self-heal: the repo ships brain.pt byte-split (parts at
+                # the repo root) — reassemble before giving up, so the
+                # deployed app never silently degrades to the v1 trio
+                try:
+                    _ensure_brain_file(models_dir)
+                except Exception:
+                    pass
             if not (os.path.exists(pt) and os.path.exists(js)):
                 return
             try:
