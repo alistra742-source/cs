@@ -404,5 +404,85 @@ class TestProbe405Fallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_check_error, "method")
 
 
+class TestWorkflowCandidateSearch(unittest.IsolatedAsyncioTestCase):
+    """check() should try every workflow id, not just the first."""
+
+    def _client(self):
+        return RoboflowVisionClient(api_key="rf_test",
+                                    log=lambda *a, **k: None)
+
+    async def test_second_candidate_is_adopted(self):
+        client = self._client()
+        client.workflow_candidates = ("bad-one", "good-one")
+        tried = []
+
+        async def fake_check_one():
+            tried.append(client.workflow)
+            if client.workflow == "good-one":
+                return True, [client.model]
+            client.last_check_error = "protocol"
+            return False, []
+
+        client._check_one = fake_check_one
+        ok, _ = await client.check()
+        self.assertTrue(ok)
+        self.assertEqual(tried, ["bad-one", "good-one"])
+        self.assertEqual(client.workflow, "good-one")
+
+    async def test_bad_key_stops_the_search_immediately(self):
+        client = self._client()
+        client.workflow_candidates = ("a", "b", "c")
+        tried = []
+
+        async def fake_check_one():
+            tried.append(client.workflow)
+            client.last_check_error = "authentication"
+            return False, []
+
+        client._check_one = fake_check_one
+        ok, _ = await client.check()
+        self.assertFalse(ok)
+        self.assertEqual(tried, ["a"])   # no point retrying a bad key
+
+    async def test_all_fail_but_backup_rescues(self):
+        client = self._client()
+        client.workflow_candidates = ("a", "b")
+
+        async def fake_check_one():
+            client.last_check_error = "protocol"
+            return False, []
+
+        async def backup_up():
+            return True
+
+        client._check_one = fake_check_one
+        client.check_rtdetr = backup_up
+        ok, models = await client.check()
+        self.assertTrue(ok)
+        self.assertEqual(models, ["rfdetr-small"])
+
+    async def test_all_fail_and_backup_down(self):
+        client = self._client()
+        client.workflow_candidates = ("a", "b")
+
+        async def fake_check_one():
+            client.last_check_error = "protocol"
+            return False, []
+
+        async def backup_down():
+            return False
+
+        client._check_one = fake_check_one
+        client.check_rtdetr = backup_down
+        ok, _ = await client.check()
+        self.assertFalse(ok)
+        self.assertEqual(client.last_check_error, "protocol")
+
+    def test_explicit_env_pin_disables_the_search(self):
+        client = RoboflowVisionClient(api_key="k", workflow="only-this",
+                                      log=lambda *a, **k: None)
+        self.assertEqual(client.workflow_candidates, ("only-this",))
+
+
 if __name__ == "__main__":
     unittest.main()

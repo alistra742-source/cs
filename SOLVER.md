@@ -304,7 +304,8 @@ and after.
 |---|---|---|
 | `API_KEY` | **Roboflow API key — required** (sent as `api_key` in the body) | — |
 | `ROBOFLOW_WORKSPACE` | workspace slug | `alistra742-gmail-com` |
-| `ROBOFLOW_WORKFLOW` | workflow id | `gemini-3-6-flash-object-detection` |
+| `ROBOFLOW_WORKFLOW` | pin ONE workflow id (skips the search) | — |
+| `ROBOFLOW_WORKFLOWS` | comma-separated ids to try in order | `gemini-3-6-flash-object-detection,coco-50-object-counter-1788536417919,gemini-3-6-flash,coco-50-object-counter` |
 | `ROBOFLOW_API_BASE` | serverless base URL | `https://serverless.roboflow.com` |
 | `GOOGLE_API_KEY` | optional BYO Google AI Studio key (sent as `model_api_key`; omitted when unset, so inference bills Roboflow credits) | — |
 | `ROBOFLOW_TIMEOUT` | per-solve timeout (seconds) | `60` |

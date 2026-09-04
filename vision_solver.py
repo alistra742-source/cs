@@ -96,8 +96,20 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
 
 ROBOFLOW_WORKSPACE = (os.environ.get("ROBOFLOW_WORKSPACE", "").strip()
                       or "alistra742-gmail-com")
+# Candidate workflow ids, tried in order until one probes healthy. Both
+# of the user's workflows are listed because the Roboflow "solutions/chat"
+# URLs do not make it obvious which slug the serverless API expects; the
+# probe settles it at runtime instead of us guessing. ROBOFLOW_WORKFLOW
+# pins a single id and skips the search.
+ROBOFLOW_WORKFLOW_CANDIDATES = tuple(
+    w.strip() for w in os.environ.get(
+        "ROBOFLOW_WORKFLOWS",
+        "gemini-3-6-flash-object-detection,"
+        "coco-50-object-counter-1788536417919,"
+        "gemini-3-6-flash,"
+        "coco-50-object-counter").split(",") if w.strip())
 ROBOFLOW_WORKFLOW = (os.environ.get("ROBOFLOW_WORKFLOW", "").strip()
-                     or "gemini-3-6-flash-object-detection")
+                     or ROBOFLOW_WORKFLOW_CANDIDATES[0])
 
 ROBOFLOW_TIMEOUT = float(os.environ.get("ROBOFLOW_TIMEOUT", "60"))
 ROBOFLOW_CHECK_TIMEOUT = float(os.environ.get("ROBOFLOW_CHECK_TIMEOUT", "60"))
@@ -657,6 +669,17 @@ class RoboflowVisionClient:
         self.base = (base or ROBOFLOW_API_BASE).rstrip("/")
         self.workspace = workspace or ROBOFLOW_WORKSPACE
         self.workflow = workflow or ROBOFLOW_WORKFLOW
+        # Every workflow id worth trying. If the caller pinned one
+        # explicitly, honour it and do not search.
+        if workflow or os.environ.get("ROBOFLOW_WORKFLOW", "").strip():
+            self.workflow_candidates = (self.workflow,)
+        else:
+            seen, cands = set(), []
+            for w in (self.workflow,) + tuple(ROBOFLOW_WORKFLOW_CANDIDATES):
+                if w and w not in seen:
+                    seen.add(w)
+                    cands.append(w)
+            self.workflow_candidates = tuple(cands)
         self._api_key = api_key or API_KEY
         self._google_api_key = google_api_key or GOOGLE_API_KEY
         self.model = MODEL_NAME
@@ -706,6 +729,48 @@ class RoboflowVisionClient:
         return inputs
 
     async def check(self) -> tuple:
+        """Probe every candidate workflow and keep the first healthy one.
+
+        The Roboflow console shows workflows under `solutions/chat` URLs
+        whose slug is not necessarily the id the serverless API wants, so
+        rather than guessing a single value we try each candidate and
+        adopt whichever answers. Falls back to the RT-DETR backup when no
+        workflow works but the key is still good.
+        """
+        candidates = getattr(self, "workflow_candidates", (self.workflow,))
+        first_error = first_status = None
+        for i, wf in enumerate(candidates):
+            self.workflow = wf
+            ok, models = await self._check_one()
+            if ok:
+                if i:
+                    self._log(f"[Vision] Using workflow {wf!r} "
+                              f"(candidate {i + 1}/{len(candidates)})")
+                return True, models
+            if first_error is None:
+                first_error = self.last_check_error
+                first_status = self.last_check_http_status
+            # A bad key fails identically for every workflow — stop early.
+            if self.last_check_error == "authentication":
+                return False, []
+            if len(candidates) > 1 and i < len(candidates) - 1:
+                self._log(f"[Vision] Workflow {wf!r} not usable "
+                          f"({self.last_check_error or 'error'}) — trying "
+                          f"{candidates[i + 1]!r}", level="warn")
+        # Nothing worked: restore the preferred id and report the first
+        # failure, but let the backup detector rescue the round.
+        self.workflow = candidates[0]
+        self.last_check_error = first_error or "http"
+        self.last_check_http_status = first_status
+        if await self.check_rtdetr():
+            self._log("[Vision] No workflow reachable — running in "
+                      "BACKUP-ONLY mode on the RT-DETR detector",
+                      level="warn")
+            self.last_check_error = ""
+            return True, [self.rtdetr_model_id]
+        return False, []
+
+    async def _check_one(self) -> tuple:
         """Probe the workflow endpoint.
 
         Returns ``(ok, models)`` where ``models`` is ``[self.model]`` when
@@ -747,18 +812,13 @@ class RoboflowVisionClient:
                           "not found (HTTP 404) — check ROBOFLOW_WORKSPACE / "
                           "ROBOFLOW_WORKFLOW", level="error")
             elif status == 405:
-                # The URL exists but does not accept this verb — that is a
-                # probe-shape problem, not a broken workflow. Verify with
-                # the RT-DETR backup before declaring vision dead.
+                # The URL exists but rejects this verb: a probe-shape
+                # problem, not proof the workflow is broken. Record it and
+                # let check() try the next candidate; the RT-DETR rescue
+                # happens there, once every candidate has been tried.
                 self.last_check_error = "method"
                 self._log("[Vision] describe_interface returned HTTP 405 "
-                          "(method not allowed) — probing the backup "
-                          "detector instead", level="warn")
-                if await self.check_rtdetr():
-                    self.last_check_error = ""
-                    self._log("[Vision] RT-DETR backup is reachable — "
-                              "running in BACKUP-ONLY mode")
-                    return True, [self.rtdetr_model_id]
+                          "(method not allowed)", level="warn")
             elif status == 429:
                 self.last_check_error = "rate_limit"
                 self._log("[Vision] Roboflow rate limited (HTTP 429)",
