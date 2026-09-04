@@ -1575,6 +1575,13 @@ class DiscordAutomation:
         # Roboflow workflow (Gemini 3.6 Flash) answers the image grid
         # directly (see vision_solver.py; configured with API_KEY).
         self._vision = RoboflowVisionClient(log=self._log)
+        # Outcome telemetry (Roboflow Vision Events). Disabled unless
+        # VISION_EVENTS=1; never allowed to affect a solve.
+        try:
+            from vision_events import VisionEvents
+            self._events = VisionEvents(log=self._log)
+        except Exception:
+            self._events = None
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
@@ -4329,6 +4336,12 @@ class DiscordAutomation:
                         ok = await self._solve_count_round(frame, prompt)
                     else:
                         ok = await self._solve_binary_round(frame, prompt, dom)
+                    if self._events is not None:
+                        self._events.report_nowait(
+                            "pass" if ok else "fail",
+                            family=str(family), round=round_i + 1,
+                            prompt=str(prompt)[:200],
+                            tiles=int((dom or {}).get("tiles") or 0))
                     if not ok:
                         self._log("[Captcha] Round not solved - retrying",
                                   level="warn")
@@ -4699,10 +4712,16 @@ class DiscordAutomation:
             if before != after:
                 self._log(f"[Captcha] Drag via {name} STUCK "
                           f"(surface changed)")
+                if self._events is not None:
+                    self._events.report_nowait(
+                        "pass", stage="drag_gesture", gesture=name)
                 return True
             self._log(f"[Captcha] Drag via {name} snapped back — "
                       f"trying the next gesture", level="warn")
         self._log("[Captcha] All drag gestures snapped back", level="warn")
+        if self._events is not None:
+            self._events.report_nowait("fail", stage="drag_gesture",
+                                       gesture="all-failed")
         return False
 
     _TOWER_PIECE_JS = r"""() => {

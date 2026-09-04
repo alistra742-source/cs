@@ -465,3 +465,28 @@ and no API key needed; the HTTP layer is mocked.
   read from the environment only.
 * Proxy/fingerprint quality still dominates the overall pass rate: a
   flagged IP never even sees a solvable challenge.
+
+## Outcome telemetry (Roboflow Vision Events)
+
+Every round is reported as pass/fail so accuracy is measured instead of
+guessed. Off by default; opt in with:
+
+```
+VISION_EVENTS = 1
+VISION_EVENTS_USE_CASE = hcaptcha-solver
+```
+
+Uses the same `API_KEY` as a bearer token. Two event streams are sent:
+
+| metadata | meaning |
+|---|---|
+| `family`, `round`, `prompt`, `tiles` | per-round solve outcome |
+| `stage=drag_gesture`, `gesture` | WHICH drag channel actually stuck |
+
+The second is the important one for drag rounds: `gesture` names the
+winning strategy (`pointer`, `slow-pointer`, `html5-dnd`,
+`pointer-events`) or `all-failed`. Once one channel proves itself, promote
+it to first in `_drag_verified` and drop the wasted attempts.
+
+Telemetry never blocks or breaks a solve — posts are fire-and-forget and
+every error is swallowed at debug level.
