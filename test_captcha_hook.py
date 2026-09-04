@@ -294,7 +294,9 @@ class TestCdpBodyInjection(unittest.TestCase):
         self.assertIn("async def intercept_request_bodies", src)
         self.assertIn("cdp.fetch.RequestPaused", src)
         self.assertIn("continue_request", src)
-        self.assertIn("post_data=new_body", src)
+        # post_data must be base64-encoded before it is sent.
+        self.assertIn("post_data=enc", src)
+        self.assertIn("b64encode", src)
 
     def test_interceptor_installed_before_submit(self):
         src = open("server.py").read()

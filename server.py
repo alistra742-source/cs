@@ -5231,8 +5231,14 @@ class DiscordAutomation:
         self._pending_captcha_token = token
         self._cdp_injections = 0
         self._cdp_inject_note = ""
-        await self._install_cdp_captcha_interceptor()
+        # Force a re-install: Fetch.enable is per-target, and the page has
+        # navigated since page-creation time.
+        self._cdp_interceptor_on = False
+        cdp_ok = await self._install_cdp_captcha_interceptor()
         await self._install_captcha_hook()
+        if not cdp_ok:
+            self._log("[NoneCap] CDP interceptor unavailable — the token "
+                      "can only ride the JS hook", level="warn")
         try:
             pub = await asyncio.wait_for(self._page.evaluate(
                 """(a) => {
