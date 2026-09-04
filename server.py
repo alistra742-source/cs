@@ -1260,6 +1260,12 @@ FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
 # (the bot is working in it). Returns 'scrolled' when it moved the page.
 _REVEAL_FORM_JS = r"""() => {
     try {
+        for (const f of document.querySelectorAll(
+                'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i], ' +
+                'iframe[src*="challenges.cloudflare.com"]')) {
+            const cr = f.getBoundingClientRect();
+            if (cr.width > 120 && cr.height > 120) return 'ok';
+        }
         const openMenu = document.querySelector(
             '[role="option"], [role="menuitem"], [class*="popout" i]');
         if (openMenu && openMenu.offsetParent !== null) return 'ok';
@@ -1287,6 +1293,17 @@ _REVEAL_FORM_LIVE_JS = r"""() => {
         const openMenu = document.querySelector(
             '[role="option"], [role="menuitem"], [class*="popout" i]');
         if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        // NEVER scroll while an hCaptcha challenge is up. The challenge is
+        // an overlay pinned to the viewport; scrolling to the register form
+        // underneath it moves the whole document and the camera frame comes
+        // back as an empty grey area with the challenge scrolled out of
+        // view. The challenge IS what the operator needs to see.
+        for (const f of document.querySelectorAll(
+                'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i], ' +
+                'iframe[src*="challenges.cloudflare.com"]')) {
+            const cr = f.getBoundingClientRect();
+            if (cr.width > 120 && cr.height > 120) return 'ok';
+        }
         const form = document.querySelector('form')
             || document.querySelector(
                 'input[name="email"], input[type="email"], input[name="password"]');
@@ -2836,7 +2853,9 @@ class DiscordAutomation:
         screenshot = await capture_page_screenshot(
             self._page, log=self._log, fullpage_timeout=20.0, reveal="live")
         if not screenshot or not png_is_complete(screenshot):
-            return ""
+            # Keep showing the last good frame rather than blanking the
+            # feed to grey — a dropped capture is not a dead browser.
+            return self._screenshots[-1] if self._screenshots else ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
         self._screenshots.append(b64)
         # Tiny ring on purpose: each frame is a full-viewport PNG in base64
