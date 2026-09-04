@@ -1630,6 +1630,11 @@ class DiscordAutomation:
         self._cdp_injections = 0
         self._cdp_inject_note = ""
         self._cdp_interceptor_on = False
+        # Discord's client fingerprint (from /api/v9/experiments) plus the
+        # form values the direct-API register submit needs.
+        self._discord_fingerprint = ""
+        self._dob_iso = ""
+        self._display_name_used = ""
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
@@ -2106,6 +2111,23 @@ class DiscordAutomation:
                     data = await response.json()
                     if isinstance(data, dict) and data.get("request_type"):
                         self._read_challenge_payload(data)
+                except Exception:
+                    pass
+                return
+
+            # ── 2b. Discord's client fingerprint ──
+            # /auth/register wants the fingerprint the client was issued.
+            if "discord.com/api" in url and "/experiments" in url \
+                    and status == 200:
+                try:
+                    data = await asyncio.wait_for(response.json(),
+                                                  timeout=5.0)
+                    fp = (data or {}).get("fingerprint")
+                    if isinstance(fp, str) and len(fp) > 8:
+                        if fp != getattr(self, "_discord_fingerprint", ""):
+                            self._discord_fingerprint = fp
+                            self._log(f"[Captcha] Captured Discord "
+                                      f"fingerprint ({len(fp)} chars)")
                 except Exception:
                     pass
                 return
@@ -5203,6 +5225,107 @@ class DiscordAutomation:
                       f"{type(e).__name__}", level="warn")
             return False
 
+    _DIRECT_REGISTER_JS = r"""(p) => {
+        // Submit the registration ourselves, with the captcha token in the
+        // body. Clicking the button does not work: after the first
+        // captcha-required response Discord's client holds the challenge
+        // open and never re-POSTs, so no interception point ever sees a
+        // second request. Issuing it directly is the only way the token
+        // reaches the API.
+        const body = {
+            fingerprint: p.fingerprint || undefined,
+            email: p.email,
+            username: p.username,
+            global_name: p.global_name || p.username,
+            password: p.password,
+            invite: null,
+            consent: true,
+            date_of_birth: p.dob,
+            gift_code_sku_id: null,
+            captcha_key: p.token,
+            promotional_email_opt_in: false
+        };
+        if (p.rqtoken) body.captcha_rqtoken = p.rqtoken;
+        return fetch('/api/v9/auth/register', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Discord-Locale': 'en-US',
+                'X-Debug-Options': 'bugReporterEnabled'
+            },
+            credentials: 'include',
+            body: JSON.stringify(body)
+        }).then(async (r) => {
+            let text = '';
+            try { text = await r.text(); } catch (e) {}
+            return {status: r.status, body: text.slice(0, 600)};
+        }).catch((e) => ({status: -1, body: String(e)}));
+    }"""
+
+    async def _direct_register_with_token(self, token: str) -> bool:
+        """POST /auth/register ourselves with the captcha token attached.
+
+        Returns True when Discord accepts it (2xx with a session token).
+        """
+        email = getattr(self, "_email", "") or ""
+        username = getattr(self, "_username", "") or ""
+        password = getattr(self, "_password", "") or ""
+        dob = getattr(self, "_dob_iso", "") or ""
+        if not (email and username and password and dob):
+            self._log(f"[NoneCap] Cannot submit directly — missing "
+                      f"credentials (email={bool(email)} user={bool(username)}"
+                      f" pass={bool(password)} dob={bool(dob)})",
+                      level="warn")
+            return False
+        payload = {
+            "email": email,
+            "username": username,
+            "global_name": getattr(self, "_display_name_used", "") or username,
+            "password": password,
+            "dob": dob,
+            "token": token,
+            "rqtoken": getattr(self, "_rqtoken", "") or "",
+            "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
+        }
+        try:
+            res = await asyncio.wait_for(
+                self._page.evaluate(self._DIRECT_REGISTER_JS, payload),
+                timeout=45.0)
+        except Exception as e:
+            self._log(f"[NoneCap] Direct register failed: "
+                      f"{type(e).__name__}: {e}", level="warn")
+            return False
+        if not isinstance(res, dict):
+            self._log(f"[NoneCap] Direct register returned {res!r}",
+                      level="warn")
+            return False
+        status = int(res.get("status") or 0)
+        body = str(res.get("body") or "")
+        self._log(f"[NoneCap] Direct register -> HTTP {status}: "
+                  f"{body[:220]}")
+        if status in (200, 201):
+            self._register_accepted = True
+            self._log("[Captcha] [OK] Discord accepted the registration")
+            return True
+        # Surface the reason so the next step is obvious.
+        try:
+            data = json.loads(body)
+            keys = data.get("captcha_key")
+            if isinstance(keys, list) and keys:
+                hint = _CAPTCHA_KEY_HINTS.get(str(keys[0]).strip(), "")
+                self._log(f"[NoneCap] Discord rejected the token: "
+                          f"{keys[0]}" + (f" — {hint}" if hint else ""),
+                          level="warn")
+            new_rq = data.get("captcha_rqdata")
+            if isinstance(new_rq, str) and len(new_rq) > 8:
+                self._rqdata = new_rq
+            new_rqt = data.get("captcha_rqtoken")
+            if isinstance(new_rqt, str) and new_rqt:
+                self._rqtoken = new_rqt
+        except Exception:
+            pass
+        return False
+
     async def _apply_hcaptcha_token(self, token: str) -> bool:
         """Inject a solved token and confirm the page actually advanced."""
         try:
@@ -5259,10 +5382,16 @@ class DiscordAutomation:
             await asyncio.wait_for(self._click_form_submit(), timeout=15.0)
         except Exception:
             pass
-        for _ in range(10):
+        for _ in range(6):
             await asyncio.sleep(1.0)
             if await self._past_captcha():
                 return True
+
+        # The click did not produce a register request (Discord keeps the
+        # challenge open instead of re-POSTing), so send it ourselves with
+        # the token attached.
+        if await self._direct_register_with_token(token):
+            return True
 
         # Did our token actually leave the browser? This separates "the
         # token was rejected" from "the token was never sent", which look
@@ -7077,6 +7206,14 @@ class DiscordAutomation:
                 self._log_exception("[Form] Verify read-back failed", e)
 
             # ── DOB ──
+            # Remember it: the direct-API captcha path needs date_of_birth.
+            try:
+                self._dob_iso = (f"{int(year_val):04d}-"
+                                 f"{months.index(month_name) + 1:02d}-"
+                                 f"{int(day_val):02d}")
+            except Exception:
+                self._dob_iso = ""
+            self._display_name_used = display_name or self._username
             self._log(f"DOB: {month_name} {day_val}, {year_val}")
             await self._select_dob("Month", month_name)
             await self._human_pause()
