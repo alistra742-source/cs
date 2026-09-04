@@ -4651,18 +4651,32 @@ class DiscordAutomation:
         # no class that separates them. Template matching on the glyph
         # signature answers it directly and for free.
         answer = None
+        # Primary: OpenCV contour matching (cv2.matchShapes / Hu moments),
+        # the standard tool for "which of these outlines is the same shape".
         try:
-            import shape_drag
-            answer = shape_drag.solve_shape_drag(shot, log=self._log)
+            import shape_match_cv
+            answer = shape_match_cv.solve_drag(shot, log=self._log)
             if answer:
-                self._log(f"[Captcha] Shape matcher paired the piece "
-                          f"(confidence {answer.get('confidence')})")
-            else:
-                self._log("[Captcha] Shape matcher found no pairing",
-                          level="warn")
+                self._log(f"[Captcha] OpenCV matcher paired the piece "
+                          f"(Hu distance {answer.get('distance')}, "
+                          f"{answer.get('candidates')} candidates)")
         except Exception as e:
-            self._log(f"[Captcha] Shape matcher error: {type(e).__name__}: {e}",
-                      level="warn")
+            self._log(f"[Captcha] OpenCV matcher error: "
+                      f"{type(e).__name__}: {e}", level="warn")
+        # Secondary: the radial-FFT matcher.
+        if not answer:
+            try:
+                import shape_drag
+                answer = shape_drag.solve_shape_drag(shot, log=self._log)
+                if answer:
+                    self._log(f"[Captcha] Radial matcher paired the piece "
+                              f"(confidence {answer.get('confidence')})")
+                else:
+                    self._log("[Captcha] Both shape matchers found no "
+                              "pairing", level="warn")
+            except Exception as e:
+                self._log(f"[Captcha] Radial matcher error: "
+                          f"{type(e).__name__}: {e}", level="warn")
         if not answer:
             # Tier 3 (Gemma) is a ~45s round trip that has timed out on
             # every drag round so far, and a drag round cannot be answered

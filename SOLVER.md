@@ -318,6 +318,34 @@ and after.
 | `RTDETR_TIMEOUT` | per-image backup timeout (seconds) | `30` |
 | `RTDETR_MIN_CONF` | minimum backup detection confidence | `0.35` |
 
+### Drag rounds: OpenCV contour matching
+
+"Drag the icon to the place where it fits" is answered BEFORE the vision
+tiers, because no detector can answer it (every candidate is the same kind
+of outlined glyph, and the question is relational).
+
+`shape_match_cv.py` uses the standard tool for this:
+
+| step | function |
+|---|---|
+| binarise the busy gradient | `cv2.adaptiveThreshold` (12 variants, scored) |
+| outline every glyph | `cv2.findContours` |
+| compare shapes | `cv2.matchShapes` (Hu moments) |
+| break same-family ties | `cv2.approxPolyDP` vertex count |
+
+Hu moments are invariant to translation, rotation and scale — the exact
+property needed, since the piece is the same glyph drawn elsewhere at a
+different angle. Two details matter in practice:
+
+* the piece sits on a light PANEL, whose contour is bigger than the glyph
+  inside it; comparing that rounded rectangle to flowers makes every
+  distance meaningless, so container contours are dropped and the glyph
+  inside the panel is re-detected;
+* Hu distance alone barely separates same-family glyphs (all flowers score
+  ~0.17), so the lobe count from `approxPolyDP` dominates the score.
+
+`shape_drag.py` (radial-FFT) stays as the fallback when OpenCV is absent.
+
 ### Tier 3: Gemma VLM (`gemma3:4b`)
 
 Last resort, tried only after BOTH the Gemini workflow and `rfdetr-small`
