@@ -226,5 +226,87 @@ class TestRejectionHints(unittest.TestCase):
         self.assertTrue(j > 0)
 
 
+class TestCdpBodyInjection(unittest.TestCase):
+    """Network-layer injection: the JS hook never saw the request.
+
+    Live evidence: {'installed': True, 'injections': 0, 'seen': []} — the
+    patched fetch/XHR observed NO register request, so Discord issued it
+    outside our context. Fetch.requestPaused sits below that.
+    """
+
+    class _Bot:
+        _pending_captcha_token = "P1_REALTOKEN"
+        _rqtoken = "RQTOK9"
+        _cdp_injections = 0
+        _cdp_inject_note = ""
+
+        def _log(self, *a, **k):
+            pass
+
+    def _mutate(self, bot, url, body):
+        import server
+        return server.DiscordAutomation._mutate_register_body(bot, url, body)
+
+    def test_injects_into_register(self):
+        bot = self._Bot()
+        out = self._mutate(bot, "https://discord.com/api/v9/auth/register",
+                           json.dumps({"email": "a@b.c"}))
+        obj = json.loads(out)
+        self.assertEqual(obj["captcha_key"], "P1_REALTOKEN")
+        self.assertEqual(obj["captcha_rqtoken"], "RQTOK9")
+
+    def test_preserves_original_fields(self):
+        bot = self._Bot()
+        out = self._mutate(bot, "https://discord.com/api/v9/auth/register",
+                           json.dumps({"email": "a@b.c", "username": "u"}))
+        obj = json.loads(out)
+        self.assertEqual(obj["email"], "a@b.c")
+        self.assertEqual(obj["username"], "u")
+
+    def test_ignores_unrelated_endpoints(self):
+        bot = self._Bot()
+        self.assertIsNone(
+            self._mutate(bot, "https://discord.com/api/v9/experiments",
+                         json.dumps({"x": 1})))
+
+    def test_no_token_means_no_mutation(self):
+        bot = self._Bot()
+        bot._pending_captcha_token = ""
+        self.assertIsNone(
+            self._mutate(bot, "https://discord.com/api/v9/auth/register",
+                         json.dumps({"email": "a@b.c"})))
+
+    def test_non_json_body_is_left_alone(self):
+        bot = self._Bot()
+        self.assertIsNone(
+            self._mutate(bot, "https://discord.com/api/v9/auth/register",
+                         "not json"))
+
+    def test_counts_injections(self):
+        bot = self._Bot()
+        self._mutate(bot, "https://discord.com/api/v9/auth/register",
+                     json.dumps({"email": "a@b.c"}))
+        self.assertEqual(bot._cdp_injections, 1)
+        self.assertIn("captcha_key", bot._cdp_inject_note)
+
+    def test_engine_exposes_the_interceptor(self):
+        src = open("nodriver_engine.py").read()
+        self.assertIn("async def intercept_request_bodies", src)
+        self.assertIn("cdp.fetch.RequestPaused", src)
+        self.assertIn("continue_request", src)
+        self.assertIn("post_data=new_body", src)
+
+    def test_interceptor_installed_before_submit(self):
+        src = open("server.py").read()
+        i = src.index("_install_cdp_captcha_interceptor()\n        await "
+                      "self._install_captcha_hook()")
+        j = src.index("_click_form_submit(), timeout=15.0")
+        self.assertLess(i, j)
+
+    def test_diagnostics_report_cdp_injections(self):
+        src = open("server.py").read()
+        self.assertIn("cdp_injections", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

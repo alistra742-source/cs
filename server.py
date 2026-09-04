@@ -1625,6 +1625,11 @@ class DiscordAutomation:
         # Set when Discord's /auth/register returns 2xx — the only
         # unambiguous proof the captcha token was accepted.
         self._register_accepted = False
+        # Network-layer token injection state.
+        self._pending_captcha_token = ""
+        self._cdp_injections = 0
+        self._cdp_inject_note = ""
+        self._cdp_interceptor_on = False
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
@@ -5109,6 +5114,60 @@ class DiscordAutomation:
         return 'installed';
     }"""
 
+    def _mutate_register_body(self, url: str, body):
+        """Insert captcha_key/captcha_rqtoken into a register POST body."""
+        token = getattr(self, "_pending_captcha_token", "") or ""
+        if not token or not body:
+            return None
+        low = url.lower()
+        if "/api/" not in low:
+            return None
+        if not any(p in low for p in ("/auth/register", "/auth/login")):
+            return None
+        try:
+            obj = json.loads(body)
+        except Exception:
+            self._cdp_inject_note = "body-not-json"
+            return None
+        if not isinstance(obj, dict):
+            return None
+        obj["captcha_key"] = token
+        rqt = getattr(self, "_rqtoken", "") or ""
+        if rqt:
+            obj["captcha_rqtoken"] = rqt
+        self._cdp_injections = getattr(self, "_cdp_injections", 0) + 1
+        self._cdp_inject_note = "injected:" + ",".join(obj.keys())
+        self._log(f"[Captcha] CDP injected captcha_key into "
+                  f"{url.split('/api')[-1][:40]}")
+        return json.dumps(obj)
+
+    async def _install_cdp_captcha_interceptor(self) -> bool:
+        """Rewrite the register body at the network layer.
+
+        The JS hook is defeated when Discord issues the request outside our
+        patched context — the live log proved it: hook installed, yet
+        injections=0 and seen=[] (the hook observed no register request at
+        all). Fetch.requestPaused sees every request regardless.
+        """
+        if getattr(self, "_cdp_interceptor_on", False):
+            return True
+        fn = getattr(self._page, "intercept_request_bodies", None)
+        if not callable(fn):
+            return False
+        try:
+            ok = await asyncio.wait_for(
+                fn(["/auth/register", "/auth/login"],
+                   self._mutate_register_body), timeout=10.0)
+        except Exception as e:
+            self._log(f"[Captcha] CDP interceptor failed: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+        if ok:
+            self._cdp_interceptor_on = True
+            self._log("[Captcha] CDP request interceptor active "
+                      "(network-layer token injection)")
+        return bool(ok)
+
     async def _install_captcha_hook_early(self) -> None:
         """Install the request hook as soon as the page exists.
 
@@ -5124,6 +5183,10 @@ class DiscordAutomation:
             pass
         try:
             await self._install_captcha_hook()
+        except Exception:
+            pass
+        try:
+            await self._install_cdp_captcha_interceptor()
         except Exception:
             pass
 
@@ -5163,8 +5226,12 @@ class DiscordAutomation:
                       "field and no widget callback)", level="warn")
             return False
 
-        # THE important step: hand the token to the request hook so
+        # THE important step: hand the token to both injection paths so
         # Discord's own /auth/register call carries captcha_key.
+        self._pending_captcha_token = token
+        self._cdp_injections = 0
+        self._cdp_inject_note = ""
+        await self._install_cdp_captcha_interceptor()
         await self._install_captcha_hook()
         try:
             pub = await asyncio.wait_for(self._page.evaluate(
@@ -5202,8 +5269,10 @@ class DiscordAutomation:
                     seen: (window.__ncSeen || []).slice(-6),
                     bodyKeys: window.__ncLastBodyKeys || ''
                 })"""), timeout=8.0)
+            diag["cdp_injections"] = getattr(self, "_cdp_injections", 0)
+            diag["cdp_note"] = getattr(self, "_cdp_inject_note", "")
             self._log(f"[NoneCap] Hook diagnostics: {diag}")
-            if not diag.get("injections"):
+            if not diag.get("injections") and not diag["cdp_injections"]:
                 self._log(
                     "[NoneCap] The token never reached a register request — "
                     "Discord's submit did not go through the patched "

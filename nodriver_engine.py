@@ -1225,6 +1225,58 @@ class _Context:
         self._pages: list = []
         self._used_tabs = set()
 
+    async def intercept_request_bodies(self, url_substrings, mutate) -> bool:
+        """Rewrite POST bodies at the CDP layer via Fetch.requestPaused.
+
+        Patching window.fetch/XHR is defeated whenever the page issues the
+        request from a context we do not own (service worker, a captured
+        reference taken before our patch, or a fresh document after
+        navigation). Fetch interception sits below all of that: Chrome
+        pauses the request and we hand back a modified body.
+
+        ``mutate(url, body) -> new_body_or_None`` is called for each paused
+        request whose URL contains one of ``url_substrings``.
+        """
+        if cdp is None:
+            return False
+        tab = self._tab
+        subs = [s.lower() for s in (url_substrings or []) if s]
+
+        async def _on_paused(event, _conn=None):
+            rid = getattr(event, "request_id", None)
+            req = getattr(event, "request", None)
+            url = (getattr(req, "url", "") or "")
+            body = getattr(req, "post_data", None)
+            new_body = None
+            try:
+                if rid is not None and any(x in url.lower() for x in subs):
+                    new_body = mutate(url, body)
+            except Exception:
+                new_body = None
+            try:
+                if new_body is not None:
+                    await tab.send(cdp.fetch.continue_request(
+                        request_id=rid, post_data=new_body))
+                else:
+                    await tab.send(cdp.fetch.continue_request(request_id=rid))
+            except Exception:
+                pass
+
+        def _handler(event, _conn=None):
+            try:
+                asyncio.create_task(_on_paused(event, _conn))
+            except RuntimeError:
+                pass
+
+        try:
+            tab.handlers[cdp.fetch.RequestPaused].append(_handler)
+            patterns = [cdp.fetch.RequestPattern(
+                url_pattern="*", request_stage=cdp.fetch.RequestStage.REQUEST)]
+            await tab.send(cdp.fetch.enable(patterns=patterns))
+            return True
+        except Exception:
+            return False
+
     async def add_init_script(self, script: str) -> None:
         self._init_scripts.append(script)
 
