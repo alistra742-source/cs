@@ -73,5 +73,39 @@ class TestSummarise(unittest.TestCase):
         self.assertEqual(got["family"], "drag")
 
 
+class TestDomClassificationRegression(unittest.TestCase):
+    """The live failure: a drag round shaped like a point round."""
+
+    def test_drag_prompt_beats_point_shaped_dom(self):
+        import hcaptcha_types as h
+        # Exactly what hCaptcha rendered: one canvas, no draggable node,
+        # no "Move" text leaf. The DOM alone says area_select_point.
+        facts = {"tiles": 1, "canvases": 1, "images": 1, "draggables": 0,
+                 "move_badge": False, "choices": 0, "inputs": 0,
+                 "examples": 0}
+        self.assertEqual(
+            h.classify_from_dom(
+                facts, "Please drag the icon to the place where it fits"),
+            h.DRAG_DROP)
+
+    def test_real_point_round_still_classifies_as_point(self):
+        import hcaptcha_types as h
+        facts = {"tiles": 1, "canvases": 1, "images": 1, "draggables": 0,
+                 "move_badge": False, "choices": 0, "inputs": 0,
+                 "examples": 0}
+        self.assertEqual(
+            h.classify_from_dom(facts, "Please click on the largest animal"),
+            h.AREA_POINT)
+
+    def test_grid_round_unaffected(self):
+        import hcaptcha_types as h
+        facts = {"tiles": 9, "canvases": 0, "images": 9, "draggables": 0,
+                 "move_badge": False, "choices": 0, "inputs": 0,
+                 "examples": 0}
+        self.assertEqual(
+            h.classify_from_dom(facts, "Select all images with a bus"),
+            h.BINARY)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -320,7 +320,7 @@ def _b64(data: bytes) -> str:
 # Empty GEMMA_BASE disables the tier entirely.
 GEMMA_BASE = _env_url("GEMMA_BASE", "OLLAMA_BASE")
 GEMMA_MODEL = (os.environ.get("GEMMA_MODEL", "").strip() or "gemma3:4b")
-GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "90"))
+GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "45"))
 GEMMA_TILE_TIMEOUT = float(os.environ.get("GEMMA_TILE_TIMEOUT", "30"))
 GEMMA_ENABLED = (os.environ.get("GEMMA_ENABLED", "1").strip()
                  not in ("0", "false", "no", "off"))

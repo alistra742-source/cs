@@ -167,6 +167,14 @@ async def drag(page, start, end, rng: random.Random = None):
     await asyncio.sleep(rng.uniform(0.10, 0.28))          # read/aim pause
     await page.mouse.down()
     await asyncio.sleep(rng.uniform(0.08, 0.16))          # grip the piece
+    # HTML5 drag-and-drop and canvas widgets both need to see the pointer
+    # MOVE while held before they consider the gesture started. Without a
+    # few small in-place jiggles the first real move can be treated as a
+    # stray event and the piece springs back to its origin on release.
+    for _ in range(3):
+        await page.mouse.move(sx + rng.uniform(-2.5, 2.5),
+                              sy + rng.uniform(-2.5, 2.5))
+        await asyncio.sleep(rng.uniform(0.03, 0.07))
     # travel: dense samples so motion sensors see a continuous trail
     dist = math.hypot(ex - sx, ey - sy)
     steps = max(16, min(60, int(dist / 10.0)))
@@ -182,6 +190,14 @@ async def drag(page, start, end, rng: random.Random = None):
         await page.mouse.move(jx, jy)
         await asyncio.sleep(rng.uniform(0.02, 0.07))
     await page.mouse.move(ex, ey)
-    await asyncio.sleep(rng.uniform(0.06, 0.16))          # hover before drop
+    # Dwell on the target long enough for the widget to register a hover /
+    # dragover and light up the drop zone. Releasing too fast is the other
+    # reason a piece snaps back.
+    await asyncio.sleep(rng.uniform(0.35, 0.60))
+    await page.mouse.move(ex, ey)                          # settle event
+    await asyncio.sleep(rng.uniform(0.10, 0.20))
     await page.mouse.up()
     _set_pos(page, (ex, ey))
+    # Let the drop animation commit before the caller screenshots or
+    # re-reads the DOM.
+    await asyncio.sleep(rng.uniform(0.25, 0.45))

@@ -4554,6 +4554,20 @@ class DiscordAutomation:
         shot, box = await self._challenge_surface(frame)
         if not shot or not box:
             return False
+        # Safety net: if the wording is a drag round that reached here via a
+        # mis-classification, do the drag instead of clicking. Clicking a
+        # drag round can never pass, so this is strictly better than
+        # answering the wrong gesture.
+        if not bbox:
+            try:
+                import hcaptcha_detect
+                if hcaptcha_detect.classify(prompt) in ("drag", "tower",
+                                                        "pattern"):
+                    self._log("[Captcha] Prompt is a DRAG round — switching "
+                              "gesture (was classified points)", level="warn")
+                    return await self._solve_drag_round(frame, prompt)
+            except Exception:
+                pass
         answer = await self._vision.solve(
             prompt, [shot], shape=("bbox" if bbox else "points"))
         if not answer:
