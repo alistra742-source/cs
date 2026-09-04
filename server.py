@@ -1184,6 +1184,35 @@ def _cgroup_oom_kills() -> int:
     return 0
 
 
+# What Discord's captcha_key values actually mean. These are the reasons
+# a register POST comes back 400 with a captcha challenge attached.
+_CAPTCHA_KEY_HINTS = {
+    "captcha-required":
+        "no token was sent at all — the hook did not reach this request",
+    "invalid-input-response":
+        "the token was malformed or already used",
+    "invalid-response":
+        "hCaptcha rejected the token (wrong sitekey, expired, or not bound "
+        "to this rqdata)",
+    "bad-request":
+        "the request shape was wrong",
+    "invalid-request":
+        "hCaptcha rejected the request parameters",
+    "expired":
+        "the token aged out (hCaptcha tokens live ~120s) — solve faster",
+    "timeout-or-duplicate":
+        "the token was already redeemed, or arrived too late",
+    "sitekey-secret-mismatch":
+        "the token was minted for a different sitekey",
+    "rqdata-mismatch":
+        "the token is not bound to THIS challenge's rqdata",
+    "rqtoken-mismatch":
+        "captcha_rqtoken did not match the challenge",
+    "ip-blocked":
+        "the exit IP is blocked — this is the proxy/TOR, not the token",
+}
+
+
 PAST_CAPTCHA_KEYWORDS = ['/channels', '/verify', '/welcome', '@me', 'discord.com/app']
 
 _BIO_POOL = [
@@ -1916,6 +1945,14 @@ class DiscordAutomation:
         )
         self._page = await self._context.new_page()
         self._attach_rqdata_capture()
+        # Patch fetch/XHR at page creation so EVERY register attempt is
+        # covered — installing it only at token time is a race with
+        # Discord's own submit.
+        try:
+            asyncio.get_running_loop().create_task(
+                self._install_captcha_hook_early())
+        except RuntimeError:
+            pass
         self._attach_crash_listener()
 
         # Automation-tell stripping (incl. navigator.webdriver) is done by
@@ -2097,6 +2134,32 @@ class DiscordAutomation:
                     await asyncio.sleep(0.35)
             if not isinstance(data, dict):
                 return
+            # ── DIAGNOSTIC: say exactly WHY Discord rejected us ──
+            # captcha_key is a list of machine-readable reasons. This is
+            # the difference between "the token was wrong" and "the token
+            # was never sent" and "you are IP-banned".
+            try:
+                keys = data.get("captcha_key")
+                if isinstance(keys, list) and keys:
+                    reasons = ", ".join(str(k) for k in keys[:6])
+                    self._log(f"[Captcha] Discord says: {reasons}",
+                              level="warn")
+                    hint = _CAPTCHA_KEY_HINTS.get(str(keys[0]).strip())
+                    if hint:
+                        self._log(f"[Captcha] -> {hint}", level="warn")
+                    if self._events is not None:
+                        self._events.report_nowait(
+                            "fail", stage="discord_reject",
+                            reason=str(keys[0])[:80])
+                # Anything else Discord chose to tell us.
+                for k in ("message", "code", "errors"):
+                    v = data.get(k)
+                    if v:
+                        self._log(f"[Captcha] Discord {k}: "
+                                  f"{str(v)[:200]}", level="warn")
+            except Exception:
+                pass
+
             rq = ""
             for key in ("captcha_rqdata", "captcha_rq_data", "rqdata"):
                 val = data.get(key)
@@ -4987,15 +5050,29 @@ class DiscordAutomation:
             } catch (e) { return false; }
         };
 
+        window.__ncSeen = [];        // every auth request we observed
+        window.__ncLastBodyKeys = '';
+
         const addCaptcha = (bodyText) => {
-            if (!window.__ncToken) return bodyText;
             let obj;
             try { obj = JSON.parse(bodyText || '{}'); }
-            catch (e) { return bodyText; }
-            if (!obj || typeof obj !== 'object') return bodyText;
+            catch (e) {
+                window.__ncSeen.push('unparseable-body');
+                return bodyText;
+            }
+            if (!obj || typeof obj !== 'object') {
+                window.__ncSeen.push('non-object-body');
+                return bodyText;
+            }
+            if (!window.__ncToken) {
+                window.__ncSeen.push('no-token-yet');
+                return bodyText;
+            }
             obj.captcha_key = window.__ncToken;
             if (window.__ncRqToken) obj.captcha_rqtoken = window.__ncRqToken;
             window.__ncInjections++;
+            window.__ncLastBodyKeys = Object.keys(obj).join(',');
+            window.__ncSeen.push('injected');
             return JSON.stringify(obj);
         };
 
@@ -5031,6 +5108,24 @@ class DiscordAutomation:
         };
         return 'installed';
     }"""
+
+    async def _install_captcha_hook_early(self) -> None:
+        """Install the request hook as soon as the page exists.
+
+        Also registered as an init script so it survives navigation — the
+        register POST can fire before any of our later code runs.
+        """
+        try:
+            add_init = getattr(self._page, "add_init_script", None)
+            if callable(add_init):
+                await asyncio.wait_for(
+                    add_init(f"({self._CAPTCHA_HOOK_JS})();"), timeout=8.0)
+        except Exception:
+            pass
+        try:
+            await self._install_captcha_hook()
+        except Exception:
+            pass
 
     async def _install_captcha_hook(self) -> bool:
         """Install the fetch/XHR patch (idempotent)."""
@@ -5095,6 +5190,27 @@ class DiscordAutomation:
             await asyncio.sleep(1.0)
             if await self._past_captcha():
                 return True
+
+        # Did our token actually leave the browser? This separates "the
+        # token was rejected" from "the token was never sent", which look
+        # identical from the outside.
+        try:
+            diag = await asyncio.wait_for(self._page.evaluate(
+                """() => ({
+                    installed: !!window.__ncHookInstalled,
+                    injections: window.__ncInjections || 0,
+                    seen: (window.__ncSeen || []).slice(-6),
+                    bodyKeys: window.__ncLastBodyKeys || ''
+                })"""), timeout=8.0)
+            self._log(f"[NoneCap] Hook diagnostics: {diag}")
+            if not diag.get("injections"):
+                self._log(
+                    "[NoneCap] The token never reached a register request — "
+                    "Discord's submit did not go through the patched "
+                    "fetch/XHR (service worker, or the request fired before "
+                    "the hook was installed)", level="warn")
+        except Exception:
+            pass
         return False
 
     async def _challenge_surface(self, frame):

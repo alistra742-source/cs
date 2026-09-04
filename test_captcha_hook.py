@@ -144,5 +144,87 @@ class TestWiring(unittest.TestCase):
             self.src.count("self._register_accepted = False"), 2)
 
 
+@unittest.skipUnless(NODE, "node not available")
+class TestDiagnostics(unittest.TestCase):
+    """The hook must report WHY a token did not ride the request."""
+
+    SCRIPT = """
+global.window = global;
+global.fetch = async () => ({ok:true});
+class XHR { open(m,u){this.u=u;} send(b){} }
+global.XMLHttpRequest = XHR;
+const install = %s;
+install();
+(async () => {
+  await fetch('https://discord.com/api/v9/auth/register',
+    {method:'POST', body: JSON.stringify({email:'a@b.c'})});
+  const before = {injections: window.__ncInjections,
+                  seen: window.__ncSeen.slice()};
+  window.__ncToken = 'P1_X'; window.__ncRqToken = 'RQ';
+  await fetch('https://discord.com/api/v9/auth/register',
+    {method:'POST', body: JSON.stringify({email:'a@b.c'})});
+  console.log(JSON.stringify({before, after: {
+    injections: window.__ncInjections, seen: window.__ncSeen,
+    bodyKeys: window.__ncLastBodyKeys}}));
+})();
+"""
+
+    def _run(self):
+        script = self.SCRIPT % hook_source()
+        with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                         delete=False) as f:
+            f.write(script)
+            path = f.name
+        out = subprocess.run([NODE, path], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[:300])
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_records_a_request_that_arrived_before_the_token(self):
+        r = self._run()
+        self.assertEqual(r["before"]["injections"], 0)
+        self.assertIn("no-token-yet", r["before"]["seen"])
+
+    def test_records_a_successful_injection(self):
+        r = self._run()
+        self.assertEqual(r["after"]["injections"], 1)
+        self.assertIn("injected", r["after"]["seen"])
+
+    def test_reports_the_outgoing_body_keys(self):
+        r = self._run()
+        self.assertIn("captcha_key", r["after"]["bodyKeys"])
+        self.assertIn("captcha_rqtoken", r["after"]["bodyKeys"])
+
+
+class TestRejectionHints(unittest.TestCase):
+    """Discord's captcha_key values must be translated, not just echoed."""
+
+    def setUp(self):
+        import server
+        self.hints = server._CAPTCHA_KEY_HINTS
+
+    def test_covers_the_common_reasons(self):
+        for key in ("captcha-required", "invalid-response",
+                    "sitekey-secret-mismatch", "rqdata-mismatch",
+                    "expired", "ip-blocked"):
+            self.assertIn(key, self.hints)
+
+    def test_hints_are_actionable_text(self):
+        for key, hint in self.hints.items():
+            self.assertGreater(len(hint), 15, key)
+
+    def test_reasons_are_logged(self):
+        src = open("server.py").read()
+        self.assertIn("[Captcha] Discord says:", src)
+        self.assertIn("_CAPTCHA_KEY_HINTS.get", src)
+
+    def test_hook_installed_at_page_creation(self):
+        src = open("server.py").read()
+        self.assertIn("_install_captcha_hook_early", src)
+        i = src.index("def _attach_rqdata_capture")
+        j = src.index("_install_captcha_hook_early")
+        self.assertTrue(j > 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
