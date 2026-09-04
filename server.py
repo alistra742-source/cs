@@ -351,20 +351,38 @@ _NAV_STATE_JS = r"""() => {
     const isLogin = /login|sign in|welcome back|anmelden|einloggen|logga in|logg inn|log ind|connexion|se connecter|iniciar sesi|acceder|entrar|conectar|accedi|inloggen|přihlásit|zaloguj|войти|вход|로그인|ログイン|登录|đăng nhập|giriş yap|kirjaudu/i.test(text.substring(0, 400));
     const hasQR = document.querySelector('img[src*="qr" i], [class*="qr" i]');
     const continueBtn = document.querySelector('button[type="submit"], button[class*="continue" i]');
+    // Discord sometimes paints the register form inside a same-origin
+    // iframe. document.querySelectorAll only sees the TOP document, so the
+    // poll reported inputs=0 while the form was plainly on screen. Walk
+    // reachable same-origin frames and fold their counts in.
+    let extraInputs = 0, extraButtons = 0;
+    let fEmail = null, fUser = null, fPass = null;
+    try {
+        for (const fr of Array.from(window.frames)) {
+            let doc = null;
+            try { doc = fr.document; } catch (e) { continue; }   // cross-origin
+            if (!doc) continue;
+            extraInputs += doc.querySelectorAll("input").length;
+            extraButtons += doc.querySelectorAll("button").length;
+            fEmail = fEmail || doc.querySelector('input[type="email"], input[name="email"], input[aria-label*="email" i]');
+            fUser = fUser || doc.querySelector('input[name="username"], input[aria-label*="username" i], input[aria-label*="display" i]');
+            fPass = fPass || doc.querySelector('input[type="password"], input[name="password"]');
+        }
+    } catch (e) { /* frame walk is best-effort */ }
     return JSON.stringify({
         url: location.href,
         title: document.title || "",
         readyState: document.readyState || "",
-        email: email !== null,
-        username: username !== null,
-        password: password !== null,
+        email: (email !== null) || (fEmail !== null),
+        username: (username !== null) || (fUser !== null),
+        password: (password !== null) || (fPass !== null),
         ageGate: hasAge || hasMonth !== null,
         isLogin: isLogin,
         hasQR: hasQR,
         hasButton: continueBtn !== null,
         hasAppMount: document.querySelector("#app-mount") !== null,
-        inputCount: document.querySelectorAll("input").length,
-        buttonCount: document.querySelectorAll("button").length,
+        inputCount: document.querySelectorAll("input").length + extraInputs,
+        buttonCount: document.querySelectorAll("button").length + extraButtons,
         cfClearance: document.cookie.indexOf("cf_clearance=") !== -1,
         challenge: challenge,
         textPreview: text.substring(0, 250)
@@ -2919,14 +2937,40 @@ class DiscordAutomation:
             # writing values during that window gets them wiped on the next
             # re-render (the "fields stay empty" bug). Wait a fixed 20s so
             # hydration fully finishes before the filler runs.
-            self._log("[Nav] Waiting 20s for Discord to fully settle before filling...")
-            settle_deadline = time.time() + 20.0
+            # ADAPTIVE settle: poll until the DOM stops changing instead of
+            # burning a flat 20s on every attempt. Discord usually settles
+            # in 2-4s; the old fixed wait cost ~16s per attempt for nothing.
+            settle_max = float(os.environ.get("SETTLE_MAX", "20"))
+            settle_quiet = float(os.environ.get("SETTLE_QUIET", "1.5"))
+            self._log(f"[Nav] Settling (adaptive, quiet={settle_quiet:g}s, "
+                      f"max={settle_max:g}s)...")
+            settle_deadline = time.time() + settle_max
+            _sig_js = ('() => { const d = document; return "" + '
+                       'd.querySelectorAll("input").length + ":" + '
+                       'd.querySelectorAll("button").length + ":" + '
+                       '(d.body ? d.body.innerHTML.length : 0); }')
+            last_sig, stable_since = None, None
             while time.time() < settle_deadline:
                 if self._stopped.is_set():
                     self._nav_error = "stopped by user"
                     self._log("[Nav] Stopped by user during settle wait")
                     return False
-                await asyncio.sleep(0.5)
+                try:
+                    sig = await asyncio.wait_for(
+                        self._page.evaluate(_sig_js), timeout=2.0)
+                except Exception:
+                    sig = None
+                now = time.time()
+                if sig is not None and sig == last_sig:
+                    if stable_since is None:
+                        stable_since = now
+                    elif now - stable_since >= settle_quiet:
+                        self._log(f"[Nav] DOM stable — settled in "
+                                  f"{now - (settle_deadline - settle_max):.1f}s")
+                        break
+                else:
+                    last_sig, stable_since = sig, None
+                await asyncio.sleep(0.3)
 
             # Fill the form
             if self._page is None:
@@ -4102,8 +4146,12 @@ class DiscordAutomation:
                 # and replaying the same request cannot fix them.  Only retry
                 # transient connection, timeout, rate-limit, and 5xx failures.
                 terminal_probe_errors = {"authentication", "authorization", "protocol"}
+                # A cold serverless workflow can take longer than 3 probes.
+                # Keep trying while the challenge is still on screen — the
+                # round is only lost when hCaptcha takes it away.
+                _probe_budget = int(os.environ.get("VISION_PROBE_TRIES", "6"))
                 probes_made = 0
-                for _probe in range(3):
+                for _probe in range(_probe_budget):
                     probes_made = _probe + 1
                     ok, models = await self._vision.check()
                     if ok:
@@ -4111,10 +4159,11 @@ class DiscordAutomation:
                     check_error = getattr(self._vision, "last_check_error", "")
                     if check_error in terminal_probe_errors:
                         break
-                    if _probe < 2:
+                    if _probe < _probe_budget - 1:
                         self._log(
                             f"[Captcha] Vision endpoint temporarily unavailable "
-                            f"(probe {_probe + 1}/3, {check_error or 'unknown error'}) - "
+                            f"(probe {_probe + 1}/{_probe_budget}, "
+                            f"{check_error or 'unknown error'}) - "
                             "retrying in 10s", level="warn")
                         await asyncio.sleep(10)
                 if not ok:
