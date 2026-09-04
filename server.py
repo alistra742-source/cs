@@ -1591,6 +1591,8 @@ class DiscordAutomation:
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
+        # Discord pairs rqdata with an rqtoken in the same challenge body.
+        self._rqtoken = ""
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
@@ -2036,18 +2038,74 @@ class DiscordAutomation:
             self._log(f"[Captcha] rqdata capture error: {e}", level="debug")
 
     async def _on_page_response(self, response) -> None:
-        """Stash the /getcaptcha JSON (the challenge payload) as it arrives."""
+        """Stash the challenge payload AND Discord's own captcha rqdata.
+
+        Two different sources, both arriving as responses:
+
+        1. hCaptcha's /getcaptcha JSON -> the challenge payload (family,
+           prompt, tiles).
+        2. Discord's OWN API. When registration needs a captcha, Discord
+           answers POST /api/v9/auth/register with HTTP 400 and a body
+           containing captcha_sitekey and **captcha_rqdata**. That is where
+           the enterprise blob actually lives for this flow — hCaptcha's
+           request never carries it, which is why the request hook found
+           nothing no matter how the body was read.
+        """
         try:
             url = (response.url or "").lower()
-            if "hcaptcha" not in url or "getcaptcha" not in url:
+            status = int(getattr(response, "status", 0) or 0)
+
+            # ── 1. hCaptcha challenge payload ──
+            if "hcaptcha" in url and "getcaptcha" in url and status == 200:
+                try:
+                    data = await response.json()
+                    if isinstance(data, dict) and data.get("request_type"):
+                        self._read_challenge_payload(data)
+                except Exception:
+                    pass
                 return
-            if response.status != 200:
+
+            # ── 2. Discord's captcha challenge response ──
+            if "discord.com/api" not in url:
                 return
-            data = await response.json()
-            if isinstance(data, dict) and data.get("request_type"):
-                self._read_challenge_payload(data)
-        except Exception:
-            pass
+            if not any(p in url for p in ("/auth/register", "/auth/login",
+                                          "/auth/", "/users/@me")):
+                return
+            # The captcha challenge is delivered as a 4xx error body.
+            if status not in (400, 403, 429):
+                return
+            data = None
+            for _try in range(3):
+                try:
+                    data = await asyncio.wait_for(response.json(),
+                                                  timeout=5.0)
+                    break
+                except Exception:
+                    # The body is not always in the CDP store the instant
+                    # responseReceived fires.
+                    await asyncio.sleep(0.35)
+            if not isinstance(data, dict):
+                return
+            rq = ""
+            for key in ("captcha_rqdata", "captcha_rq_data", "rqdata"):
+                val = data.get(key)
+                if isinstance(val, str) and len(val) > 8:
+                    rq = val
+                    break
+            sk = data.get("captcha_sitekey")
+            if isinstance(sk, str) and len(sk) > 8:
+                self._hcaptcha_sitekey = sk
+            rqtoken = data.get("captcha_rqtoken")
+            if isinstance(rqtoken, str) and rqtoken:
+                self._rqtoken = rqtoken
+            if rq:
+                self._rqdata = rq
+                self._log(f"[Captcha] Captured enterprise rqdata "
+                          f"({len(rq)} chars) from Discord's "
+                          f"{url.split('/api')[-1][:40]} response")
+        except Exception as e:
+            self._log(f"[Captcha] response capture error: {e}",
+                      level="debug")
 
     def _read_challenge_payload(self, data: dict = None) -> Optional[dict]:
         """Store /getcaptcha JSON and log the challenge family it carries.

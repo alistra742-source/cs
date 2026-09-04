@@ -98,5 +98,94 @@ class TestAsyncHandlerScheduling(unittest.TestCase):
         self.assertEqual(seen, ["https://hcaptcha.com/getcaptcha/x"])
 
 
+class TestDiscordChallengeResponse(unittest.IsolatedAsyncioTestCase):
+    """Discord returns rqdata in ITS OWN 400, not in hCaptcha's request."""
+
+    BODY = {
+        "captcha_key": ["captcha-required"],
+        "captcha_sitekey": "a9b5fb07-92ff-493f-86fe-352a2803b3df",
+        "captcha_service": "hcaptcha",
+        "captcha_rqdata": "eyJhbGciOiJIUzI1NiJ9.RQ_BLOB_1234567890abcdef",
+        "captcha_rqtoken": "RQTOKEN_abcdef123456",
+    }
+
+    class _Resp:
+        def __init__(self, url, status, body):
+            self.url = url
+            self.status = status
+            self._b = body
+
+        async def json(self):
+            return self._b
+
+    class _Bot:
+        _rqdata = ""
+        _rqtoken = ""
+        _hcaptcha_sitekey = ""
+        _challenge_payload = None
+
+        def _log(self, *a, **k):
+            pass
+
+        def _read_challenge_payload(self, data=None):
+            return self._challenge_payload
+
+    async def _run(self, url, status, body):
+        import server
+        bot = self._Bot()
+        await server.DiscordAutomation._on_page_response(
+            bot, self._Resp(url, status, body))
+        return bot
+
+    async def test_captures_rqdata_from_the_400(self):
+        bot = await self._run("https://discord.com/api/v9/auth/register",
+                              400, self.BODY)
+        self.assertEqual(bot._rqdata, self.BODY["captcha_rqdata"])
+
+    async def test_captures_rqtoken(self):
+        bot = await self._run("https://discord.com/api/v9/auth/register",
+                              400, self.BODY)
+        self.assertEqual(bot._rqtoken, "RQTOKEN_abcdef123456")
+
+    async def test_captures_the_sitekey_too(self):
+        bot = await self._run("https://discord.com/api/v9/auth/register",
+                              400, self.BODY)
+        self.assertEqual(bot._hcaptcha_sitekey,
+                         self.BODY["captcha_sitekey"])
+
+    async def test_successful_200_is_not_a_challenge(self):
+        bot = await self._run("https://discord.com/api/v9/auth/register",
+                              200, {"token": "ok"})
+        self.assertEqual(bot._rqdata, "")
+
+    async def test_unrelated_host_ignored(self):
+        bot = await self._run("https://example.com/api/v9/auth/register",
+                              400, self.BODY)
+        self.assertEqual(bot._rqdata, "")
+
+    async def test_hcaptcha_payload_path_still_works(self):
+        import server
+        bot = self._Bot()
+        seen = {}
+        bot._read_challenge_payload = lambda data=None: seen.update(
+            data or {})
+        await server.DiscordAutomation._on_page_response(
+            bot, self._Resp("https://hcaptcha.com/getcaptcha/x", 200,
+                            {"request_type": "image_drag_drop"}))
+        self.assertEqual(seen.get("request_type"), "image_drag_drop")
+
+    async def test_429_also_carries_a_challenge(self):
+        bot = await self._run("https://discord.com/api/v9/auth/register",
+                              429, self.BODY)
+        self.assertEqual(bot._rqdata, self.BODY["captcha_rqdata"])
+
+    async def test_body_read_is_retried(self):
+        """responseReceived can beat the body into the CDP store."""
+        src = open("server.py").read()
+        i = src.index("Discord's captcha challenge response")
+        block = src[i:i + 2500]
+        self.assertIn("for _try in range(3)", block)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
