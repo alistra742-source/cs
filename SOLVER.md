@@ -320,15 +320,17 @@ and after.
 
 ## NoneCap (hosted solver) — tried FIRST
 
-> **IP binding matters.** hCaptcha ties a token to the IP that solved it.
-> NoneCap solving on its own IP while the bot submits from a TOR exit
-> produces `invalid-response` — a real token, refused. Set
-> `NONECAP_PROXY` to the SAME egress the browser uses:
+> **If tokens come back `invalid-response`:** first confirm the direct
+> submit actually returned an HTTP status. A `HTTP 0` means the register
+> call never resolved and the token was never really judged.
+>
+> Only after a genuine 4xx is IP binding worth suspecting. hCaptcha can
+> tie a token to the solving IP; `NONECAP_PROXY` pins NoneCap's solve to
+> the same egress the browser uses:
 > ```
 > NONECAP_PROXY = socks5://user:pass@host:1080
 > ```
-> With TOR-only there is no shareable egress, so this combination is
-> expected to keep failing until residential proxies are back.
+> This is optional and unset by default — most sitekeys do not require it.
 
 
 NoneCap returns a real hCaptcha token (`P1_…`, the kind that passes

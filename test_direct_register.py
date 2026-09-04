@@ -149,5 +149,39 @@ class TestWiring(unittest.TestCase):
         self.assertIn("captcha_rqdata", block)
 
 
+class TestPromiseAwaiting(unittest.TestCase):
+    """`HTTP 0` was the engine not awaiting the register promise.
+
+    _wrap_js only set await_promise for JS literally starting with
+    `async`. The direct-register arrow returns fetch(...).then(...), so
+    Runtime.evaluate handed back the UNRESOLVED Promise, which marshals to
+    an empty value — reported as status 0. Nothing to do with proxies.
+    """
+
+    def setUp(self):
+        from nodriver_engine import _wrap_js
+        self._wrap = _wrap_js
+
+    def test_promise_returning_arrow_is_awaited(self):
+        js = '(p) => { return fetch("/x").then(r => ({status: r.status})); }'
+        self.assertTrue(self._wrap(js, {"a": 1})[1])
+
+    def test_the_real_register_js_is_awaited(self):
+        self.assertTrue(self._wrap(register_js(), {"email": "a"})[1])
+
+    def test_async_arrow_still_awaited(self):
+        js = 'async () => { const r = await fetch("/x"); return r.status; }'
+        self.assertTrue(self._wrap(js, None)[1])
+
+    def test_plain_arrow_not_awaited(self):
+        self.assertFalse(self._wrap("() => document.title", None)[1])
+
+    def test_bare_expression_not_awaited(self):
+        self.assertFalse(self._wrap("location.href", None)[1])
+
+    def test_bare_fetch_expression_is_awaited(self):
+        self.assertTrue(self._wrap('fetch("/x")', None)[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

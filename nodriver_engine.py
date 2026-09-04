@@ -82,8 +82,21 @@ def _wrap_js(js: Any, arg: Any = None) -> tuple:
             expr = f"({s})()"
         else:
             expr = f"({s})({json.dumps(arg)})"
-        return expr, s.startswith("async")
-    return s, False
+        # await_promise must be True for ANY function that hands back a
+        # promise, not just a literally `async` one. A plain arrow that
+        # returns fetch(...).then(...) is a promise too, and evaluating it
+        # without awaiting returns the unresolved Promise object — which
+        # marshals back as an empty value (the mystery `HTTP 0`).
+        returns_promise = (
+            s.startswith("async")
+            or ".then(" in s
+            or "fetch(" in s
+            or "await " in s
+            or "Promise" in s
+        )
+        return expr, returns_promise
+    # A bare expression can be a promise too (e.g. `fetch(...)`).
+    return s, ("fetch(" in s or ".then(" in s or s.startswith("await "))
 
 
 def _wrap_new_document(src: str) -> str:
