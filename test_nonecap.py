@@ -311,5 +311,82 @@ class TestNoStalls(unittest.TestCase):
         self.assertIn("[NoneCap] Starting hosted solve", src)
 
 
+class TestIpAndUaBinding(unittest.IsolatedAsyncioTestCase):
+    """hCaptcha binds a token to the solving IP/UA.
+
+    Live evidence: with the token finally reaching Discord, the verdict was
+    'invalid-response' — the token was real but solved on NoneCap's IP
+    while we submit from a TOR exit.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        STATE.update({"mode": "inline", "polls": 0, "last_payload": None})
+
+    def _c(self):
+        return NoneCapSolver(key="k", base=self.base,
+                             log=lambda *a, **kw: None)
+
+    async def test_proxy_is_forwarded(self):
+        await self._c().solve("sk", "https://x.test/",
+                              proxy="socks5://1.2.3.4:1080")
+        self.assertEqual(STATE["last_payload"]["proxy"],
+                         "socks5://1.2.3.4:1080")
+
+    async def test_user_agent_is_forwarded(self):
+        await self._c().solve("sk", "https://x.test/", user_agent="UA/1.0")
+        self.assertEqual(STATE["last_payload"]["user_agent"], "UA/1.0")
+
+    async def test_absent_by_default(self):
+        await self._c().solve("sk", "https://x.test/")
+        self.assertNotIn("proxy", STATE["last_payload"])
+        self.assertNotIn("user_agent", STATE["last_payload"])
+
+    async def test_env_proxy_is_used(self):
+        import nonecap_solver as ns
+        old = ns.NONECAP_PROXY
+        ns.NONECAP_PROXY = "http://env:9"
+        try:
+            await self._c().solve("sk", "https://x.test/")
+            self.assertEqual(STATE["last_payload"]["proxy"], "http://env:9")
+        finally:
+            ns.NONECAP_PROXY = old
+
+    def test_server_sends_the_browser_ua(self):
+        src = open("server.py").read()
+        self.assertIn("navigator.userAgent", src)
+        self.assertIn("user_agent=str(ua)", src)
+
+
+class TestNoSelfInjection(unittest.TestCase):
+    """Our own direct submit must not be rewritten by our interceptors."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_direct_body_is_marked(self):
+        self.assertIn("__nc_direct", self.src)
+
+    def test_cdp_mutator_skips_marked_bodies(self):
+        i = self.src.index("def _mutate_register_body")
+        block = self.src[i:i + 1200]
+        self.assertIn("__nc_direct", block)
+
+    def test_js_hook_skips_marked_bodies(self):
+        i = self.src.index("_CAPTCHA_HOOK_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("own-direct-request", block)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -48,6 +48,10 @@ NONECAP_TRIES = int(float(os.environ.get("NONECAP_TRIES", "3")))
 NONECAP_TIMEOUT = float(os.environ.get("NONECAP_TIMEOUT", "180"))
 NONECAP_ENABLED = (os.environ.get("NONECAP_ENABLED", "1").strip().lower()
                    not in ("0", "false", "no", "off"))
+# hCaptcha binds a token to the solving IP. Set this to the SAME egress the
+# browser uses (e.g. socks5://user:pass@host:1080) or tokens solved on
+# NoneCap's IP are rejected with invalid-response when submitted from ours.
+NONECAP_PROXY = (os.environ.get("NONECAP_PROXY", "").strip())
 
 _TERMINAL_BAD = ("failed", "error", "cancelled", "canceled", "expired")
 
@@ -96,9 +100,16 @@ class NoneCapSolver:
             return {"_raw": (await resp.text())[:300]}
 
     async def solve(self, sitekey: str, url: str, rqdata: str = "",
-                    invisible: bool = False,
+                    invisible: bool = False, proxy: str = "",
+                    user_agent: str = "",
                     timeout: float = NONECAP_TIMEOUT) -> Optional[str]:
-        """Return an hCaptcha token, or None. Never raises."""
+        """Return an hCaptcha token, or None. Never raises.
+
+        ``proxy`` matters: hCaptcha ties a token to the IP that solved it.
+        If NoneCap solves from its own IP and the token is then submitted
+        from a different exit, hCaptcha answers invalid-response. Passing
+        the SAME egress the browser uses keeps the two consistent.
+        """
         if not self.enabled:
             self.last_error = "not configured"
             return None
@@ -116,13 +127,21 @@ class NoneCapSolver:
             payload["rqdata"] = rqdata
         if invisible:
             payload["invisible"] = True
+        prox = (proxy or NONECAP_PROXY).strip()
+        if prox:
+            payload["proxy"] = prox
+        ua = (user_agent or "").strip()
+        if ua:
+            payload["user_agent"] = ua
 
         deadline = asyncio.get_event_loop().time() + timeout
         try:
             cfg = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=cfg) as session:
                 self._log(f"[NoneCap] Solving {payload['type']} for "
-                          f"{sitekey[:8]}… (wait={NONECAP_WAIT}s)")
+                          f"{sitekey[:8]}… (wait={NONECAP_WAIT}s"
+                          + (", via proxy" if prox else ", NoneCap IP")
+                          + ")")
                 async with session.post(
                         f"{self._base}/v1/solves",
                         params={"wait": NONECAP_WAIT},

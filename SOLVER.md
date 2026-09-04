@@ -320,6 +320,17 @@ and after.
 
 ## NoneCap (hosted solver) — tried FIRST
 
+> **IP binding matters.** hCaptcha ties a token to the IP that solved it.
+> NoneCap solving on its own IP while the bot submits from a TOR exit
+> produces `invalid-response` — a real token, refused. Set
+> `NONECAP_PROXY` to the SAME egress the browser uses:
+> ```
+> NONECAP_PROXY = socks5://user:pass@host:1080
+> ```
+> With TOR-only there is no shareable egress, so this combination is
+> expected to keep failing until residential proxies are back.
+
+
 NoneCap returns a real hCaptcha token (`P1_…`, the kind that passes
 siteverify) instead of image coordinates, so there is nothing to click,
 drag or shape-match. It runs before the local vision pipeline; anything it

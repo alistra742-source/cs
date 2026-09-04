@@ -4928,8 +4928,19 @@ class DiscordAutomation:
                     rqdata = fresh
             self._log(f"[NoneCap] Attempt {attempt}/{tries}"
                       + (" (enterprise)" if rqdata else " (plain)"))
+            # hCaptcha binds the token to the solving IP and UA. Give
+            # NoneCap the same ones this browser is using, or Discord
+            # answers invalid-response even for a perfect solve.
+            ua = ""
+            try:
+                ua = await asyncio.wait_for(
+                    self._page.evaluate("() => navigator.userAgent"),
+                    timeout=5.0) or ""
+            except Exception:
+                ua = ""
             token = await self._nonecap.solve(sitekey, str(page_url),
-                                              rqdata=rqdata)
+                                              rqdata=rqdata,
+                                              user_agent=str(ua))
             if not token:
                 # Failed solves are not charged, so retrying is free.
                 if self._nonecap.last_error in ("authentication",
@@ -5091,6 +5102,10 @@ class DiscordAutomation:
                 window.__ncSeen.push('non-object-body');
                 return bodyText;
             }
+            if (obj.__nc_direct) {
+                window.__ncSeen.push('own-direct-request');
+                return bodyText;
+            }
             if (!window.__ncToken) {
                 window.__ncSeen.push('no-token-yet');
                 return bodyText;
@@ -5140,6 +5155,10 @@ class DiscordAutomation:
         """Insert captcha_key/captcha_rqtoken into a register POST body."""
         token = getattr(self, "_pending_captcha_token", "") or ""
         if not token or not body:
+            return None
+        # Never rewrite our OWN direct submit: it already carries the
+        # token, and re-encoding the body produced HTTP 0.
+        if '"__nc_direct"' in body or "__nc_direct" in body:
             return None
         low = url.lower()
         if "/api/" not in low:
@@ -5232,6 +5251,9 @@ class DiscordAutomation:
         // open and never re-POSTs, so no interception point ever sees a
         // second request. Issuing it directly is the only way the token
         // reaches the API.
+        //
+        // __nc_direct marks this request so our OWN interceptors skip it —
+        // re-encoding an already-complete body produced HTTP 0.
         const body = {
             fingerprint: p.fingerprint || undefined,
             email: p.email,
@@ -5243,9 +5265,11 @@ class DiscordAutomation:
             date_of_birth: p.dob,
             gift_code_sku_id: null,
             captcha_key: p.token,
-            promotional_email_opt_in: false
+            promotional_email_opt_in: false,
+            __nc_direct: 1
         };
         if (p.rqtoken) body.captcha_rqtoken = p.rqtoken;
+        const payload = JSON.stringify(body);
         return fetch('/api/v9/auth/register', {
             method: 'POST',
             headers: {
@@ -5254,12 +5278,12 @@ class DiscordAutomation:
                 'X-Debug-Options': 'bugReporterEnabled'
             },
             credentials: 'include',
-            body: JSON.stringify(body)
+            body: payload
         }).then(async (r) => {
             let text = '';
             try { text = await r.text(); } catch (e) {}
             return {status: r.status, body: text.slice(0, 600)};
-        }).catch((e) => ({status: -1, body: String(e)}));
+        }).catch((e) => ({status: -1, body: String(e && e.message || e)}));
     }"""
 
     async def _direct_register_with_token(self, token: str) -> bool:
