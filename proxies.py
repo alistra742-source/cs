@@ -118,12 +118,29 @@ def parse_proxy_list(text: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def tor_only() -> bool:
+    """True when residential proxies are disabled and TOR is the only exit.
+
+    Set FORCE_TOR=1 (or PROXY_MODE=tor) to ignore every configured
+    vaultproxy session — useful when the provider's sessions are all dead
+    and each one costs a browser launch before it fails.
+    """
+    if (os.environ.get("PROXY_MODE") or "").strip().lower() == "tor":
+        return True
+    return (os.environ.get("FORCE_TOR") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _vault_proxy_urls() -> List[str]:
     """Residential proxy session URLs (user:pass@host:port).
     Priority: VAULTPROXY_URLS env -> composed from VAULTPROXY_HOST/PORT/
     USER_PREFIX/PASS/TTL + VAULTPROXY_SESSIONS (comma/newline list — just
     change the string after -s- when sessions rotate) -> proxies.txt /
     vaultproxies.txt files (both read, deduped)."""
+    global loaded_files
+    if tor_only():
+        loaded_files = []
+        return []
     urls: List[str] = []
     env_urls = (os.environ.get("VAULTPROXY_URLS") or "").strip()
     if env_urls:
@@ -138,7 +155,6 @@ def _vault_proxy_urls() -> List[str]:
         for s in re.split(r"[\s,;]+", sessions):
             if s:
                 urls.append(f"{user_prefix}{s}-ttl-{ttl}:{passwd}@{host}:{port}")
-    global loaded_files
     loaded_files = []
     root = Path(__file__).resolve().parent
     for fname in VAULTPROXY_FILES:
