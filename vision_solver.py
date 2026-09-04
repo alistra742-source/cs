@@ -785,8 +785,13 @@ class RoboflowVisionClient:
             self._log("[Vision] No API_KEY configured for Roboflow",
                       level="error")
             return False, []
-        url = f"{self.base}/infer/workflows/{self.workspace}/{self.workflow}/describe_interface"
-        payload = {"api_key": self._api_key}
+        # Probe the RUN url itself, not describe_interface: the serverless
+        # host does not expose describe_interface for every workflow and
+        # answers 405 there, which tells us nothing about the workflow. A
+        # run with no inputs returns 4xx-with-a-body when the workflow
+        # exists and 404 when it does not.
+        url = self.endpoint
+        payload = {"api_key": self._api_key, "inputs": {}}
         try:
             timeout = aiohttp.ClientTimeout(total=ROBOFLOW_CHECK_TIMEOUT)
             async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -811,13 +816,15 @@ class RoboflowVisionClient:
                 self._log(f"[Vision] Workflow {self.workspace}/{self.workflow} "
                           "not found (HTTP 404) — check ROBOFLOW_WORKSPACE / "
                           "ROBOFLOW_WORKFLOW", level="error")
+            elif status in (400, 422):
+                # The workflow RESOLVED and validated our (empty) inputs —
+                # that is exactly what a healthy workflow does here.
+                self._log(f"[Vision] Roboflow OK: {self.workspace}/"
+                          f"{self.workflow} (validated inputs)")
+                return True, [self.model]
             elif status == 405:
-                # The URL exists but rejects this verb: a probe-shape
-                # problem, not proof the workflow is broken. Record it and
-                # let check() try the next candidate; the RT-DETR rescue
-                # happens there, once every candidate has been tried.
                 self.last_check_error = "method"
-                self._log("[Vision] describe_interface returned HTTP 405 "
+                self._log(f"[Vision] {self.workflow!r} returned HTTP 405 "
                           "(method not allowed)", level="warn")
             elif status == 429:
                 self.last_check_error = "rate_limit"
@@ -859,23 +866,41 @@ class RoboflowVisionClient:
         png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
             "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
-        payload = {"api_key": self._api_key,
-                   "model_id": self.rtdetr_model_id,
-                   "image": {"type": "base64", "value": _b64(png)}}
-        try:
-            timeout = aiohttp.ClientTimeout(total=RTDETR_TIMEOUT)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.post(self.rtdetr_endpoint, json=payload) as r:
-                    ok = r.status == 200
-                    if not ok:
-                        body = (await r.text())[:200]
-                        self._log(f"[RT-DETR] probe HTTP {r.status}: {body}",
-                                  level="warn")
-                    return ok
-        except Exception as e:
-            self._log(f"[RT-DETR] probe failed: {type(e).__name__}",
-                      level="warn")
-            return False
+        data = await self._rtdetr_post(png, RTDETR_TIMEOUT)
+        return data is not None
+
+    async def _rtdetr_post(self, image: bytes, timeout: float):
+        """POST an image to the hosted alias. Returns parsed JSON or None.
+
+        Tries the documented alias form first (base64 body, key in the
+        query string), then the workflow-style JSON form as a fallback so
+        a self-hosted inference server also works.
+        """
+        b64 = _b64(image)
+        attempts = (
+            ("alias", f"{self.rtdetr_endpoint}?api_key={self._api_key}",
+             {"data": b64,
+              "headers": {"Content-Type":
+                          "application/x-www-form-urlencoded"}}),
+            ("json", f"{self.base}/infer/object_detection",
+             {"json": {"api_key": self._api_key,
+                       "model_id": self.rtdetr_model_id,
+                       "image": {"type": "base64", "value": b64}}}),
+        )
+        last = ""
+        for name, url, kw in attempts:
+            try:
+                cfg = aiohttp.ClientTimeout(total=timeout)
+                async with aiohttp.ClientSession(timeout=cfg) as s:
+                    async with s.post(url, **kw) as r:
+                        if r.status == 200:
+                            return await r.json()
+                        last = f"{name} HTTP {r.status}: {(await r.text())[:160]}"
+            except Exception as e:
+                last = f"{name} {type(e).__name__}"
+        if last:
+            self._log(f"[RT-DETR] {last}", level="warn")
+        return None
 
     async def _run(self, image: bytes, question: str, timeout: float,
                    classes: Optional[List[str]] = None) -> Optional[dict]:
@@ -1017,29 +1042,20 @@ class RoboflowVisionClient:
 
     @property
     def rtdetr_endpoint(self) -> str:
-        return f"{self.base}/infer/object_detection"
+        """Hosted alias URL.
+
+        COCO aliases are served at ``POST {base}/{model_id}?api_key=...``
+        with a base64 body — NOT at /infer/object_detection, which expects
+        a registered workspace project and 404s for aliases.
+        """
+        return f"{self.base}/{self.rtdetr_model_id}"
 
     async def _rtdetr_infer(self, image: bytes, timeout: float):
         """One rfdetr-small call. Returns normalised detections or None."""
         img = shrink_image(image)
         size = image_size(img) or (0, 0)
-        payload = {
-            "api_key": self._api_key,
-            "model_id": self.rtdetr_model_id,
-            "image": {"type": "base64", "value": _b64(img)},
-        }
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(self.rtdetr_endpoint, json=payload) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        self._log(f"[RT-DETR] rejected (HTTP {r.status}): "
-                                  f"{body[:200]}", level="warn")
-                        return None
-                    data = await r.json()
-        except Exception as e:
-            self._log(f"[RT-DETR] error: {e}", level="error")
+        data = await self._rtdetr_post(img, timeout)
+        if data is None:
             return None
         preds, _ = self.read_response(data)
         return self.predictions_to_points(preds, size,

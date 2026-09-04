@@ -200,8 +200,9 @@ class TestRTDetrBackup(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coco_targets(""), ())
 
     def test_rtdetr_endpoint(self):
+        # COCO aliases live at {base}/{model_id}, not /infer/object_detection
         self.assertEqual(self._client().rtdetr_endpoint,
-                         "https://serverless.roboflow.com/infer/object_detection")
+                         "https://serverless.roboflow.com/rfdetr-small")
 
     def test_filter_by_labels(self):
         pts = [(0.5, 0.5, 0.1, 0.1, 0.9, "boat"),
