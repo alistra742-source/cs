@@ -8,7 +8,7 @@ import base64
 import unittest
 from unittest import mock
 
-from vision_solver import RoboflowVisionClient
+from vision_solver import RoboflowVisionClient, coco_targets
 
 
 class _FakeResponse:
@@ -165,6 +165,112 @@ class TestWorkflowRequest(unittest.IsolatedAsyncioTestCase):
         with mock.patch("vision_solver.aiohttp.ClientSession",
                         return_value=_FakeSession(_FakeResponse(500, "boom"))):
             got = await client.solve("x", [b"img"], shape="points")
+        self.assertIsNone(got)
+
+
+class TestRTDetrBackup(unittest.IsolatedAsyncioTestCase):
+    """rfdetr-small backup: knowledge-base driven, abstains when unmapped."""
+
+    def _client(self, **kw):
+        return RoboflowVisionClient(api_key="rf_test",
+                                    log=lambda *a, **k: None, **kw)
+
+    def test_coco_targets_uses_the_alias_table(self):
+        self.assertEqual(coco_targets("click each image with a boat"),
+                         ("boat",))
+        # helicopter -> airplane comes from the knowledge base
+        self.assertEqual(coco_targets("select every helicopter"),
+                         ("airplane",))
+        self.assertIn("sports ball", coco_targets("click the tennis ball"))
+
+    def test_coco_targets_expands_set_predicates(self):
+        got = coco_targets("select all images containing an animal")
+        self.assertIn("dog", got)
+        self.assertIn("zebra", got)
+        self.assertNotIn("pizza", got)
+
+    def test_coco_targets_setdown_surfaces(self):
+        got = coco_targets(
+            "Find places safe for setting down the item in the reference")
+        self.assertIn("dining table", got)
+
+    def test_coco_targets_abstains_when_unmapped(self):
+        self.assertEqual(coco_targets("click the two identical elements"), ())
+        self.assertEqual(coco_targets(""), ())
+
+    def test_rtdetr_endpoint(self):
+        self.assertEqual(self._client().rtdetr_endpoint,
+                         "https://serverless.roboflow.com/infer/object_detection")
+
+    def test_filter_by_labels(self):
+        pts = [(0.5, 0.5, 0.1, 0.1, 0.9, "boat"),
+               (0.2, 0.2, 0.1, 0.1, 0.8, "person")]
+        keep = RoboflowVisionClient.filter_by_labels(pts, ("boat",))
+        self.assertEqual(len(keep), 1)
+        self.assertEqual(keep[0][5], "boat")
+        self.assertEqual(RoboflowVisionClient.filter_by_labels(pts, ()), [])
+
+    async def test_rtdetr_grid_selects_matching_tiles(self):
+        client = self._client()
+        replies = [
+            [(0.5, 0.5, 0.1, 0.1, 0.9, "boat")],
+            [(0.5, 0.5, 0.1, 0.1, 0.9, "person")],   # wrong class -> no hit
+            [(0.4, 0.4, 0.1, 0.1, 0.8, "boat")],
+        ]
+
+        async def fake_infer(image, timeout):
+            return replies.pop(0)
+
+        client._rtdetr_infer = fake_infer
+        got = await client.solve_rtdetr("click each image with a boat",
+                                        [b"a", b"b", b"c"], shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [1, 3]})
+
+    async def test_rtdetr_abstains_on_unmapped_prompt(self):
+        client = self._client()
+
+        async def boom(*a, **k):
+            raise AssertionError("must not call the detector")
+
+        client._rtdetr_infer = boom
+        self.assertIsNone(await client.solve_rtdetr(
+            "click the two identical images", [b"a", b"b"], shape="tiles"))
+
+    async def test_rtdetr_abstains_on_reasoning_shapes(self):
+        client = self._client()
+
+        async def boom(*a, **k):
+            raise AssertionError("must not call the detector")
+
+        client._rtdetr_infer = boom
+        self.assertIsNone(await client.solve_rtdetr(
+            "drag the boat into the slot", [b"a"], shape="drag"))
+
+    async def test_gemini_failure_falls_back_to_rtdetr(self):
+        client = self._client()
+
+        async def dead_detect(*a, **k):
+            return None, None, None      # workflow down
+
+        async def fake_infer(image, timeout):
+            return [(0.5, 0.5, 0.1, 0.1, 0.9, "boat")]
+
+        client._detect = dead_detect
+        client._rtdetr_infer = fake_infer
+        got = await client.solve("click each image with a boat",
+                                 [b"a", b"b"], shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [1, 2]})
+        self.assertEqual(client.stats["rtdetr"], 1)
+
+    async def test_backup_can_be_disabled(self):
+        client = self._client(rtdetr_enabled=False)
+
+        async def dead_detect(*a, **k):
+            return None, None, None
+
+        client._detect = dead_detect
+        got = await client.solve("click each image with a boat",
+                                 [b"a", b"b"], shape="tiles")
         self.assertIsNone(got)
 
 

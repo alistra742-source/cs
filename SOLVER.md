@@ -312,6 +312,44 @@ and after.
 | `ROBOFLOW_IMAGE_SIDE` | max image side (px) sent up | `640` |
 | `ROBOFLOW_MIN_CONF` | minimum detection confidence kept | `0.30` |
 | `ROBOFLOW_CHECK_TIMEOUT` | readiness-probe timeout (seconds) | `60` |
+| `RTDETR_ENABLED` | RT-DETR backup detector on/off | `1` |
+| `RTDETR_MODEL_ID` | backup model alias | `rfdetr-small` |
+| `RTDETR_TIMEOUT` | per-image backup timeout (seconds) | `30` |
+| `RTDETR_MIN_CONF` | minimum backup detection confidence | `0.35` |
+
+### Backup detector: RT-DETR small
+
+The Gemini workflow is primary. When it fails — host unreachable, 429, out
+of credits, or an answer that will not parse — `solve()` automatically
+retries the round through `solve_rtdetr()` against **`rfdetr-small`**.
+
+**There is no service to create and nothing to pull.** `rfdetr-small` is a
+built-in COCO-pretrained alias hosted on the same serverless endpoint and
+authenticated with the same `API_KEY`, so it works the moment your key is
+set:
+
+```
+POST https://serverless.roboflow.com/infer/object_detection
+{"api_key": "...", "model_id": "rfdetr-small",
+ "image": {"type": "base64", "value": "..."}}
+```
+
+It is ~13 ms of model time versus Gemini's ~13 s, but it only knows the 80
+COCO classes and cannot read a prompt. **The knowledge base closes that
+gap**: `coco_targets()` resolves the question through `hcaptcha_types`'
+~1700-entry alias table and set predicates down to COCO labels —
+`helicopter` → `airplane`, `nightstand` → `dining table`, "an animal" →
+every COCO animal, "setting down" → the flat surfaces. A prompt with no
+COCO equivalent (`odd one out`, most trees and tools) makes the backup
+**abstain** instead of answering with the wrong object.
+
+Optional self-hosting (a local GPU/CPU server instead of the cloud):
+
+```bash
+pip install inference-cli
+inference server start          # pulls the right image, listens on :9001
+export ROBOFLOW_API_BASE=http://localhost:9001
+```
 | `FULLPAGE_SHOTS` | whole scrollable page camera frames (default: full browser-view frames with the register form revealed when out of sight) | `0` |
 | `FULLPAGE_MAX_PX` | max page height (px) worth a full-page frame; taller pages fall back to viewport frames | `8000` |
 

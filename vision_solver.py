@@ -50,6 +50,22 @@ Configuration (env vars):
   ROBOFLOW_MIN_CONF   minimum prediction confidence to keep (default 0.30)
   ROBOFLOW_CHECK_TIMEOUT  readiness-probe timeout (default 60)
 
+  RTDETR_ENABLED      set to 0 to disable the backup detector (default on)
+  RTDETR_MODEL_ID     backup detector alias (default rfdetr-small — a
+                      BUILT-IN COCO-pretrained model on the same host and
+                      the same API_KEY; nothing to deploy or pull)
+  RTDETR_TIMEOUT      per-image backup timeout in seconds (default 30)
+  RTDETR_MIN_CONF     minimum backup detection confidence (default 0.35)
+
+BACKUP PATH. Whenever the Gemini workflow fails — unreachable, rate
+limited, out of credits, or an unparseable answer — ``solve()`` retries
+the round against RF-DETR via ``solve_rtdetr()``. RF-DETR is COCO-80 and
+cannot read a prompt, so the KNOWLEDGE BASE does that job:
+``coco_targets()`` resolves the prompt through hcaptcha_types' ~1700-entry
+alias table (helicopter -> airplane, nightstand -> dining table, "an
+animal" -> every COCO animal) down to COCO labels. Prompts with no COCO
+equivalent make it ABSTAIN rather than answer with the wrong object.
+
 Only aiohttp is used — no new dependencies.
 """
 
@@ -91,6 +107,135 @@ _MIN_CONF = float(os.environ.get("ROBOFLOW_MIN_CONF", "0.30"))
 
 # Model label, for logs only — the workflow decides the real model.
 MODEL_NAME = "gemini-3.6-flash (roboflow)"
+
+# ── RT-DETR backup detector ──────────────────────────────────────────────
+# When the Gemini workflow fails (down, rate limited, quota, unparseable),
+# the solver retries the round against RF-DETR, Roboflow's real-time
+# transformer detector. `rfdetr-small` is a BUILT-IN COCO-pretrained alias
+# on the same serverless host and the same API_KEY: no service to create,
+# no weights to pull, no workflow to build.
+#
+#     POST {base}/infer/object_detection
+#     {"api_key": ..., "model_id": "rfdetr-small",
+#      "image": {"type": "base64", "value": ...}}
+#
+# It is COCO-80 only, so it cannot read a prompt. The knowledge base
+# (hcaptcha_types SYNONYMS/aliases, ~1700 nouns) is what makes it usable:
+# `coco_targets()` walks the prompt noun -> canonical class -> COCO label,
+# and a detection of any mapped label counts as a hit.
+RTDETR_ENABLED = os.environ.get("RTDETR_ENABLED", "1").strip() not in (
+    "0", "false", "no", "off")
+RTDETR_MODEL_ID = (os.environ.get("RTDETR_MODEL_ID", "").strip()
+                   or "rfdetr-small")
+RTDETR_TIMEOUT = float(os.environ.get("RTDETR_TIMEOUT", "30"))
+RTDETR_MIN_CONF = float(os.environ.get("RTDETR_MIN_CONF", "0.35"))
+
+# The 80 COCO classes rfdetr-small can emit.
+COCO_CLASSES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush",
+)
+
+# Canonical knowledge-base class -> COCO label(s) rfdetr-small can detect.
+# Only visually defensible mappings: a "helicopter" tile is genuinely
+# airplane-shaped to COCO, a "nightstand" reads as dining table. Anything
+# not here has no COCO equivalent and RT-DETR abstains on it.
+_KB_TO_COCO = {
+    "airplane": ("airplane",), "bicycle": ("bicycle",), "car": ("car",),
+    "motorcycle": ("motorcycle",), "bus": ("bus",), "train": ("train",),
+    "truck": ("truck",), "boat": ("boat",), "traffic_light": ("traffic light",),
+    "red_light": ("traffic light",), "fire_hydrant": ("fire hydrant",),
+    "stop_sign": ("stop sign",), "parking_meter": ("parking meter",),
+    "bird": ("bird",), "cat": ("cat",), "dog": ("dog",), "horse": ("horse",),
+    "sheep": ("sheep",), "cow": ("cow",), "elephant": ("elephant",),
+    "bear": ("bear", "teddy bear"), "zebra": ("zebra",), "giraffe": ("giraffe",),
+    "umbrella": ("umbrella",), "backpack": ("backpack",), "tie": ("tie",),
+    "suitcase": ("suitcase",), "frisbee": ("frisbee",), "ski": ("skis",),
+    "snowboard": ("snowboard",), "ball": ("sports ball",),
+    "tennis_ball": ("sports ball",), "basketball": ("sports ball",),
+    "baseball": ("sports ball",), "football": ("sports ball",),
+    "volleyball": ("sports ball",), "golf_ball": ("sports ball",),
+    "kite": ("kite",), "skateboard": ("skateboard",),
+    "surfboard": ("surfboard",), "racket": ("tennis racket",),
+    "bottle": ("bottle",), "cup": ("cup", "wine glass"), "mug": ("cup",),
+    "fork": ("fork",), "knife": ("knife",), "spoon": ("spoon",),
+    "bowl": ("bowl",), "banana": ("banana",), "apple": ("apple",),
+    "sandwich": ("sandwich",), "burger": ("sandwich",), "orange": ("orange",),
+    "broccoli": ("broccoli",), "carrot": ("carrot",), "hotdog": ("hot dog",),
+    "pizza": ("pizza",), "donut": ("donut",), "cake": ("cake",),
+    "chair": ("chair", "couch", "bench"), "sofa": ("couch",),
+    "bench": ("bench",), "bed": ("bed",),
+    "table": ("dining table",), "nightstand": ("dining table",),
+    "desk": ("dining table",), "tv": ("tv",), "monitor": ("tv",),
+    "laptop": ("laptop",), "computer": ("laptop",), "mouse": ("mouse",),
+    "keyboard": ("keyboard",), "phone": ("cell phone",),
+    "remote_control": ("remote",), "microwave": ("microwave",),
+    "oven": ("oven",), "sink": ("sink",), "fridge": ("refrigerator",),
+    "book": ("book",), "clock": ("clock",), "watch": ("clock",),
+    "vase": ("vase",), "scissors": ("scissors",),
+    "toothbrush": ("toothbrush",), "flower": ("potted plant",),
+    "tree": ("potted plant",), "person": ("person",),
+}
+
+
+def coco_targets(prompt: str) -> tuple:
+    """COCO labels that satisfy ``prompt``, via the knowledge base.
+
+    Resolution order: the canonical noun (extract_target walks the ~1700
+    entry alias table), then the set predicates ("click each image with an
+    animal" -> every COCO animal), then the set-down surfaces. Returns ()
+    when the prompt has no COCO equivalent — the caller must then abstain
+    rather than guess.
+    """
+    p = (prompt or "").strip()
+    if not p:
+        return ()
+    labels: list = []
+
+    def add(name):
+        for lab in _KB_TO_COCO.get(name, ()):
+            if lab not in labels:
+                labels.append(lab)
+
+    try:
+        import hcaptcha_types as hct
+    except Exception:
+        return ()
+
+    target = hct.extract_target(p)
+    if target:
+        add(target)
+    if labels:
+        return tuple(labels)
+
+    # Set predicates: animals / edible / wheeled / motorised / surfaces.
+    low = p.lower()
+    groups = (
+        (("animal", "animals"), getattr(hct, "ANIMALS", ())),
+        (("eat", "edible", "food"), getattr(hct, "EDIBLE", ())),
+        (("wheel", "wheels", "wheeled"), getattr(hct, "WHEELED", ())),
+        (("motor", "motorised", "motorized", "engine"),
+         getattr(hct, "MOTORISED", ())),
+    )
+    for words, members in groups:
+        if any(re.search(r"\b%s\b" % w, low) for w in words):
+            for name in members:
+                add(name)
+    if not labels and hct.is_setdown_prompt(p):
+        for name in getattr(hct, "FLAT_SURFACES", ()):
+            add(name)
+    return tuple(labels)
 
 
 def shrink_image(data: bytes, max_side: int = _MAX_SIDE) -> bytes:
@@ -402,7 +547,9 @@ class RoboflowVisionClient:
                  workspace: str = ROBOFLOW_WORKSPACE,
                  workflow: str = ROBOFLOW_WORKFLOW,
                  api_key: str = "",
-                 google_api_key: str = ""):
+                 google_api_key: str = "",
+                 rtdetr_model_id: str = "",
+                 rtdetr_enabled: Optional[bool] = None):
         self._log = log or (lambda msg, level="info": None)
         self.base = (base or ROBOFLOW_API_BASE).rstrip("/")
         self.workspace = workspace or ROBOFLOW_WORKSPACE
@@ -410,7 +557,11 @@ class RoboflowVisionClient:
         self._api_key = api_key or API_KEY
         self._google_api_key = google_api_key or GOOGLE_API_KEY
         self.model = MODEL_NAME
-        self.stats = {"calls": 0, "ok": 0, "failed": 0}
+        # RT-DETR backup detector (COCO-80, knowledge-base driven).
+        self.rtdetr_model_id = rtdetr_model_id or RTDETR_MODEL_ID
+        self.rtdetr_enabled = (RTDETR_ENABLED if rtdetr_enabled is None
+                               else bool(rtdetr_enabled))
+        self.stats = {"calls": 0, "ok": 0, "failed": 0, "rtdetr": 0}
         # Machine-readable result of the latest reachability probe. Keeps
         # the public ``check() -> (ok, models)`` contract, while letting
         # callers separate a transient connection failure from a
@@ -657,6 +808,93 @@ class RoboflowVisionClient:
                   f"({answered}/{len(images)} answered)")
         return {"type": "tiles", "indices": hits}
 
+    # ── RT-DETR backup detector ─────────────────────────────────────────
+
+    @property
+    def rtdetr_endpoint(self) -> str:
+        return f"{self.base}/infer/object_detection"
+
+    async def _rtdetr_infer(self, image: bytes, timeout: float):
+        """One rfdetr-small call. Returns normalised detections or None."""
+        img = shrink_image(image)
+        size = image_size(img) or (0, 0)
+        payload = {
+            "api_key": self._api_key,
+            "model_id": self.rtdetr_model_id,
+            "image": {"type": "base64", "value": _b64(img)},
+        }
+        try:
+            timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
+                async with s.post(self.rtdetr_endpoint, json=payload) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        self._log(f"[RT-DETR] rejected (HTTP {r.status}): "
+                                  f"{body[:200]}", level="warn")
+                        return None
+                    data = await r.json()
+        except Exception as e:
+            self._log(f"[RT-DETR] error: {e}", level="error")
+            return None
+        preds, _ = self.read_response(data)
+        return self.predictions_to_points(preds, size,
+                                          min_conf=RTDETR_MIN_CONF)
+
+    @staticmethod
+    def filter_by_labels(points, labels) -> list:
+        """Keep detections whose class is one of ``labels`` (case-loose)."""
+        want = {str(l).lower().strip() for l in (labels or ())}
+        if not want:
+            return []
+        return [p for p in (points or []) if str(p[5]).lower().strip() in want]
+
+    async def solve_rtdetr(self, prompt: str, images: List[bytes],
+                           shape: str = "tiles",
+                           timeout: float = RTDETR_TIMEOUT) -> Optional[dict]:
+        """Backup solve with rfdetr-small + the knowledge base.
+
+        COCO-80 cannot read a prompt, so the prompt is resolved to COCO
+        labels through the alias table first. No mapping -> abstain
+        (returning None) rather than answer with the wrong object.
+        """
+        if not self.rtdetr_enabled or not self._api_key or not images:
+            return None
+        labels = coco_targets(prompt)
+        if not labels:
+            self._log(f"[RT-DETR] no COCO class for prompt {prompt[:60]!r} "
+                      "— abstaining", level="debug")
+            return None
+        if shape not in ("tiles", "points", "bbox", "count"):
+            self._log(f"[RT-DETR] shape={shape} needs reasoning a detector "
+                      "cannot do — abstaining", level="debug")
+            return None
+        self._log(f"[RT-DETR] backup solve with {self.rtdetr_model_id} "
+                  f"looking for {list(labels)[:6]}")
+        self.stats["rtdetr"] += 1
+
+        if shape == "tiles" and len(images) >= 2:
+            hits, answered = [], 0
+            for i, raw in enumerate(images, 1):
+                pts = await self._rtdetr_infer(raw, timeout)
+                if pts is None:
+                    continue
+                answered += 1
+                if self.filter_by_labels(pts, labels):
+                    hits.append(i)
+            if answered == 0:
+                return None
+            self._log(f"[RT-DETR] grid hits: {hits} "
+                      f"({answered}/{len(images)} answered)")
+            return {"type": "tiles", "indices": hits}
+
+        pts = await self._rtdetr_infer(images[0], timeout)
+        if pts is None:
+            return None
+        keep = self.filter_by_labels(pts, labels)
+        if not keep:
+            return None
+        return self.detections_to_answer(keep, shape, len(images))
+
     async def solve(self, prompt: str, images: List[bytes],
                     shape: str = "tiles", examples: Optional[List[bytes]] = None,
                     timeout: float = ROBOFLOW_TIMEOUT) -> Optional[dict]:
@@ -701,13 +939,13 @@ class RoboflowVisionClient:
                 self.stats["ok"] += 1
                 return got
             self.stats["failed"] += 1
-            return None
+            return await self._fallback(prompt, images, shape)
 
         question = self.shape_question(prompt, shape)
         points, texts, data = await self._detect(images[0], question, timeout)
         if data is None:
             self.stats["failed"] += 1
-            return None
+            return await self._fallback(prompt, images, shape)
 
         parsed = self.detections_to_answer(points, shape, len(images))
         if parsed is None and texts:
@@ -721,9 +959,19 @@ class RoboflowVisionClient:
                       f"({len(points or [])} detections, "
                       f"{len(texts or [])} text field(s))", level="warn")
             self.stats["failed"] += 1
-            return None
+            return await self._fallback(prompt, images, shape)
         self.stats["ok"] += 1
         return parsed
+
+    async def _fallback(self, prompt: str, images: List[bytes],
+                        shape: str) -> Optional[dict]:
+        """Gemini could not answer — try the RT-DETR backup detector."""
+        if not self.rtdetr_enabled:
+            return None
+        got = await self.solve_rtdetr(prompt, images, shape)
+        if got is not None:
+            self._log(f"[Vision] RT-DETR backup answered: {got}")
+        return got
 
     @staticmethod
     def shape_question(prompt: str, shape: str) -> str:
