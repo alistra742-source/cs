@@ -146,7 +146,10 @@ _FAMILY_PATTERNS = (
         r"\bdrag\b", r"\bmove the\b", r"\bplace the\b",
         r"where it fits", r"into (?:the )?(?:slot|hole|space|place)",
     )),
-    ("pattern", (r"complete the pattern", r"\bpattern\b", r"which piece")),
+    # NB: "click on the icon that breaks the pattern" only MENTIONS a
+    # pattern — it is a point round. Require completion/placement wording.
+    ("pattern", (r"complete the pattern", r"which piece completes",
+                 r"missing piece of the pattern", r"\bwhich piece\b")),
     ("count", (r"how many\b", r"\bcount\b", r"number of\b")),
     ("bbox", (r"draw a box", r"bounding box", r"\bbox around\b")),
     ("points", (
@@ -164,6 +167,12 @@ _FAMILY_PATTERNS = (
 )
 
 
+_CLICK_ONLY_RE = re.compile(
+    r"\bclick (?:on )?(?:the|each|all|any)\b|\btap (?:on )?the\b", re.I)
+_PLACE_RE = re.compile(
+    r"\bdrag\b|\bmove\b|where it fits|\bplace\b|\binto the\b", re.I)
+
+
 def classify(prompt: str) -> str:
     """hCaptcha challenge family for ``prompt``.
 
@@ -173,6 +182,13 @@ def classify(prompt: str) -> str:
     p = " ".join((prompt or "").split()).lower()
     if not p:
         return "tiles"
+    # An explicit "click on ..." with no placement verb is a POINT round,
+    # whatever else the sentence mentions. Routing it to a drag gesture
+    # guarantees a fail and looks like a bot.
+    if _CLICK_ONLY_RE.search(p) and not _PLACE_RE.search(p):
+        if re.search(r"\bimages?\b|\bsquares?\b|\btiles?\b", p):
+            return "tiles"
+        return "points"
     for family, patterns in _FAMILY_PATTERNS:
         for pat in patterns:
             if re.search(pat, p):

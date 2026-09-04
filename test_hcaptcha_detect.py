@@ -141,5 +141,49 @@ class TestDragStrategiesExist(unittest.TestCase):
             self.assertTrue(callable(getattr(hm, name, None)), name)
 
 
+class TestClickVsDragRouting(unittest.TestCase):
+    """A 'click on ...' prompt must never be answered with a drag."""
+
+    def test_breaks_the_pattern_is_a_click(self):
+        self.assertEqual(
+            classify("Please click on the icon that breaks the pattern"),
+            "points")
+
+    def test_mentioning_pattern_does_not_make_it_a_drag(self):
+        for p in ("Please click on the icon that breaks the pattern",
+                  "Click the shape that does not match the pattern"):
+            self.assertNotIn(classify(p), ("drag", "tower", "pattern"), p)
+
+    def test_genuine_pattern_completion_still_routes_there(self):
+        self.assertEqual(classify("Complete the pattern"), "pattern")
+
+    def test_click_each_image_is_still_a_grid(self):
+        self.assertEqual(classify("Please click each image with a bus"),
+                         "tiles")
+
+    def test_drag_wording_still_wins(self):
+        self.assertEqual(
+            classify("Please drag the icon to the place where it fits"),
+            "drag")
+
+
+class TestBlankSurfaceDiagnostics(unittest.TestCase):
+    """A blank crop must be reported as such, not as a matcher failure."""
+
+    def test_flat_image_reports_its_statistics(self):
+        import io
+        from PIL import Image
+        import shape_match_cv as scv
+        if not scv.HAS_CV2:
+            self.skipTest("opencv not installed")
+        im = Image.new("RGB", (300, 200), (0, 0, 0))
+        b = io.BytesIO(); im.save(b, "JPEG")
+        lines = []
+        scv.solve_drag(b.getvalue(), log=lambda m, **k: lines.append(m))
+        joined = " ".join(lines)
+        self.assertIn("std", joined)
+        self.assertIn("300x200", joined)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

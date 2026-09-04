@@ -4581,14 +4581,50 @@ class DiscordAutomation:
             import io as _io
             im = Image.open(_io.BytesIO(raw)).convert("RGB")
             x0 = int(info["x"]); y0 = int(info["y"])
-            crop = im.crop((x0, y0, x0 + int(info["width"]),
-                            y0 + int(info["height"])))
+            x1 = x0 + int(info["width"])
+            y1 = y0 + int(info["height"])
+            # The rect comes from getBoundingClientRect INSIDE the frame,
+            # but frame.screenshot() is not always that same coordinate
+            # space (device pixel ratio, or the element sitting in a nested
+            # document). A crop that lands off-image returns solid black —
+            # which is exactly the "0 contours on every round" symptom.
+            iw, ih = im.size
+            crop = im.crop((max(0, x0), max(0, y0),
+                            min(iw, x1), min(ih, y1)))
+            if not self._surface_is_usable(crop):
+                self._log(f"[Captcha] Cropped surface looks blank "
+                          f"({crop.size[0]}x{crop.size[1]} of {iw}x{ih} at "
+                          f"{x0},{y0}) — using the whole frame instead",
+                          level="warn")
+                crop = im
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
             buf = _io.BytesIO()
             crop.save(buf, "JPEG", quality=92)
             return buf.getvalue(), box
         except Exception as e:
             self._log(f"[Captcha] Surface screenshot failed: {e}", level="debug")
             return None, None
+
+    @staticmethod
+    def _surface_is_usable(im) -> bool:
+        """True when the crop actually contains a picture.
+
+        A degenerate crop (off-image, zero-size, or a flat fill) has almost
+        no pixel variance. Detecting that is what stops the solver from
+        analysing a black rectangle and reporting "0 contours" forever.
+        """
+        try:
+            w, h = im.size
+            if w < 60 or h < 60:
+                return False
+            import numpy as _np
+            a = _np.asarray(im.convert("L"), dtype=_np.float32)
+            if a.size == 0:
+                return False
+            return float(a.std()) >= 6.0
+        except Exception:
+            return True
 
     def _denorm(self, point, box):
         """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
@@ -4668,6 +4704,14 @@ class DiscordAutomation:
             return clicked > 0
         return False
 
+    async def _frame_shot(self, frame):
+        """Whole-frame screenshot bytes, used when the element crop fails."""
+        try:
+            raw = await frame.screenshot()
+            return raw or None
+        except Exception:
+            return None
+
     async def _solve_drag_round(self, frame, prompt) -> bool:
         """image_drag_drop: a REAL press/move/release drag (hCaptcha ignores
         synthetic clicks here — DragSolver only matches Arkose iframes, so
@@ -4693,6 +4737,34 @@ class DiscordAutomation:
         except Exception as e:
             self._log(f"[Captcha] OpenCV matcher error: "
                       f"{type(e).__name__}: {e}", level="warn")
+        # If the cropped surface yielded nothing, retry on the FULL frame.
+        # The crop depends on getBoundingClientRect matching the screenshot
+        # coordinate space, which is not guaranteed; the whole frame always
+        # contains the board.
+        if not answer:
+            full = await self._frame_shot(frame)
+            if full:
+                try:
+                    import shape_match_cv
+                    alt = shape_match_cv.solve_drag(full, log=self._log)
+                except Exception:
+                    alt = None
+                if alt:
+                    self._log("[Captcha] Matched on the full frame "
+                              "(element crop was unusable)")
+                    # Coordinates are now relative to the frame, not the
+                    # element box — remap the answer's reference box.
+                    try:
+                        ox, oy = await self._frame_origin(frame)
+                        wh = await frame.evaluate(
+                            "() => ({w: window.innerWidth,"
+                            " h: window.innerHeight})")
+                        box = {"x": ox, "y": oy,
+                               "width": float(wh.get("w") or 0),
+                               "height": float(wh.get("h") or 0)}
+                        answer = alt
+                    except Exception:
+                        pass
         # Secondary: the radial-FFT matcher.
         if not answer:
             try:

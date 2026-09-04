@@ -267,7 +267,15 @@ def solve_drag(image: bytes, log=None) -> Optional[dict]:
 
     contours = find_glyphs(bgr, log=log)
     if len(contours) < 2:
-        log(f"[ShapeCV] only {len(contours)} contour(s) — cannot pair")
+        # Report WHAT we were given, so a blank/wrong crop is obvious
+        # instead of looking like a matcher failure.
+        try:
+            g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            log(f"[ShapeCV] only {len(contours)} contour(s) on a {w}x{h} "
+                f"surface (mean {float(g.mean()):.1f}, "
+                f"std {float(g.std()):.1f}) — cannot pair")
+        except Exception:
+            log(f"[ShapeCV] only {len(contours)} contour(s) — cannot pair")
         return None
 
     pi = pick_piece(contours, bgr.shape, log=log)

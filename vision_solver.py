@@ -324,6 +324,9 @@ GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "45"))
 GEMMA_TILE_TIMEOUT = float(os.environ.get("GEMMA_TILE_TIMEOUT", "30"))
 # Geometry rounds (drag/points/bbox): a 4B VLM is slow and unreliable here.
 GEMMA_GEOMETRY_TIMEOUT = float(os.environ.get("GEMMA_GEOMETRY_TIMEOUT", "20"))
+# Set GEMMA_ALLOW_DRAG=1 to let the VLM attempt drag/pattern rounds anyway.
+GEMMA_ALLOW_DRAG = (os.environ.get("GEMMA_ALLOW_DRAG", "").strip().lower()
+                    in ("1", "true", "yes", "on"))
 GEMMA_ENABLED = (os.environ.get("GEMMA_ENABLED", "1").strip()
                  not in ("0", "false", "no", "off"))
 
@@ -1470,7 +1473,16 @@ class RoboflowVisionClient:
         # Geometry shapes are where a 4B model is weakest AND slowest — on
         # drag rounds it has timed out every time, stalling the challenge
         # for the full budget. Cap them hard so the round moves on.
-        if shape in ("drag", "pattern", "tower", "bbox", "points"):
+        if shape in ("drag", "pattern", "tower"):
+            # Measured: gemma3:4b timed out on 100% of drag rounds across
+            # four production runs, costing 20-45s each and stalling the
+            # challenge. It cannot answer "which outline matches" anyway.
+            if not GEMMA_ALLOW_DRAG:
+                self._log("[Gemma] skipping drag/pattern round — the local "
+                          "VLM cannot answer relational geometry")
+                return None
+            timeout = min(timeout, GEMMA_GEOMETRY_TIMEOUT)
+        if shape in ("bbox", "points"):
             timeout = min(timeout, GEMMA_GEOMETRY_TIMEOUT)
         text = await self._gemma_chat(system, question, bundle, timeout)
         if not text:
