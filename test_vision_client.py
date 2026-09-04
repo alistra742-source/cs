@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from vision_solver import (RoboflowVisionClient, coco_targets,
-                           rewrite_question)
+                           rewrite_question, pair_drag, score_drag_roles)
 
 
 class _FakeResponse:
@@ -287,8 +287,8 @@ class TestQuestionRewriting(unittest.TestCase):
     def test_drag_becomes_two_point_localisation(self):
         got = rewrite_question("Drag the shape to where it fits", "drag")
         self.assertTrue(got.startswith("Box and coordinate the shape"), got)
-        self.assertIn("source", got)
-        self.assertIn("destination", got)
+        self.assertIn("piece", got)
+        self.assertIn("hole", got)
 
     def test_articles_are_not_left_stranded(self):
         for q in ("Select all images containing a bus",
@@ -583,6 +583,63 @@ class TestGemmaTier3(unittest.IsolatedAsyncioTestCase):
         got = await c.solve("click the boats", [b"a", b"b"], shape="tiles")
         self.assertEqual(got, {"type": "tiles", "indices": [1]})
         self.assertEqual(called, ["rtdetr"])
+
+
+class TestDragGeometry(unittest.TestCase):
+    """Which box is the piece and which is the hole is GEOMETRY, not rank."""
+
+    # A typical drag scene: three filled shapes clustered in the middle,
+    # one small loose piece off at the right edge, one empty slot in the
+    # cluster. Confidence order deliberately does NOT match the answer.
+    SCENE = [
+        (0.35, 0.45, 0.18, 0.18, 0.91, "shape"),
+        (0.50, 0.42, 0.17, 0.17, 0.88, "shape"),
+        (0.44, 0.62, 0.18, 0.18, 0.86, "shape"),
+        (0.93, 0.50, 0.09, 0.09, 0.72, "piece"),
+        (0.42, 0.30, 0.16, 0.16, 0.65, "empty slot"),
+    ]
+
+    def test_picks_the_loose_edge_piece_as_source(self):
+        src, _ = pair_drag(self.SCENE)
+        self.assertEqual(src, (0.93, 0.50))
+
+    def test_picks_the_empty_slot_as_destination(self):
+        _, dst = pair_drag(self.SCENE)
+        self.assertEqual(dst, (0.42, 0.30))
+
+    def test_ignores_confidence_ranking(self):
+        """The 0.91 detection is a filled shape — never the answer."""
+        src, dst = pair_drag(self.SCENE)
+        self.assertNotEqual(src, (0.35, 0.45))
+        self.assertNotEqual(dst, (0.35, 0.45))
+
+    def test_source_and_destination_are_never_the_same_box(self):
+        for scene in (self.SCENE, self.SCENE[:2], self.SCENE[3:]):
+            pair = pair_drag(scene)
+            if pair:
+                self.assertNotEqual(pair[0], pair[1])
+
+    def test_needs_two_detections(self):
+        self.assertIsNone(pair_drag([]))
+        self.assertIsNone(pair_drag([self.SCENE[0]]))
+
+    def test_hole_labels_push_toward_destination(self):
+        pts = [(0.5, 0.5, 0.1, 0.1, 0.8, "gap"),
+               (0.9, 0.5, 0.1, 0.1, 0.8, "block")]
+        src, dst = pair_drag(pts)
+        self.assertEqual(dst, (0.5, 0.5))
+        self.assertEqual(src, (0.9, 0.5))
+
+    def test_answer_mapper_uses_the_geometry(self):
+        got = RoboflowVisionClient.detections_to_answer(self.SCENE, "drag")
+        self.assertEqual(got["type"], "drag")
+        self.assertEqual(got["from"], (0.93, 0.50))
+        self.assertEqual(got["to"], (0.42, 0.30))
+
+    def test_tower_and_pattern_use_it_too(self):
+        for shape in ("tower", "pattern"):
+            got = RoboflowVisionClient.detections_to_answer(self.SCENE, shape)
+            self.assertEqual(got["from"], (0.93, 0.50))
 
 
 if __name__ == "__main__":

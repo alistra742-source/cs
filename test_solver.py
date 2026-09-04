@@ -686,9 +686,12 @@ class TestRoboflowHelpers(unittest.TestCase):
         bb = d2a(pts, "bbox")["bbox"]
         self.assertAlmostEqual(bb["x1"], 0.4)
         self.assertAlmostEqual(bb["y2"], 0.6)
+        # Roles come from GEOMETRY, not confidence order: the small box
+        # in the corner is the loose piece, the big central one is the
+        # target it gets dragged into.
         drag = d2a(pts, "drag")
-        self.assertEqual(drag["from"], (0.5, 0.5))
-        self.assertEqual(drag["to"], (0.9, 0.1))
+        self.assertEqual(drag["from"], (0.9, 0.1))
+        self.assertEqual(drag["to"], (0.5, 0.5))
         self.assertEqual(d2a(pts, "count"), {"type": "count", "count": 2})
         self.assertIsNone(d2a([], "points"))
         self.assertIsNone(d2a(pts[:1], "drag"))

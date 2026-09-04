@@ -326,6 +326,96 @@ GEMMA_ENABLED = (os.environ.get("GEMMA_ENABLED", "1").strip()
                  not in ("0", "false", "no", "off"))
 
 
+# ── drag geometry ────────────────────────────────────────────────────────
+# "Drag the icon to the place where it fits" is NOT a detection problem.
+# A detector returns a bag of boxes with confidences; nothing in that
+# ranking says which box is the loose piece and which is the hole. Picking
+# pts[0] as source and pts[1] as destination — the old behaviour — is a
+# coin flip that also silently swaps the two.
+#
+# The geometry does say, though. hCaptcha drag rounds are built the same
+# way every time:
+#   * the DRAGGABLE piece is small, high-contrast, and sits apart from the
+#     scene — usually in a side rail or a corner, often badged "Move";
+#   * the TARGET is a hole/socket/empty cell INSIDE the main composition,
+#     and it is the odd region out: the one gap in an otherwise regular
+#     layout.
+# So: score every detection on "how much does this look like a loose
+# piece" vs "how much does this look like a hole", then pair the best of
+# each. That is deterministic, explainable, and needs no extra model.
+
+_PIECE_WORDS = ("piece", "icon", "shape", "block", "tile", "puzzle", "move",
+                "draggable", "loose", "item", "object", "fragment", "part")
+_HOLE_WORDS = ("hole", "slot", "socket", "gap", "empty", "space", "target",
+               "place", "outline", "silhouette", "missing", "cell", "blank",
+               "dashed", "shadow", "well", "receptacle")
+
+
+def _label_bias(label: str) -> float:
+    """+1 -> looks like the loose piece, -1 -> looks like the hole."""
+    lab = str(label or "").lower()
+    score = 0.0
+    if any(w in lab for w in _PIECE_WORDS):
+        score += 1.0
+    if any(w in lab for w in _HOLE_WORDS):
+        score -= 1.0
+    return score
+
+
+def score_drag_roles(points):
+    """Rank detections as (piece_score, hole_score) per detection.
+
+    Pure geometry + label heuristics on the normalised
+    ``(x, y, w, h, conf, label)`` tuples ``predictions_to_points`` yields.
+    Returns ``[(idx, piece_score, hole_score), ...]``.
+    """
+    pts = list(points or [])
+    if not pts:
+        return []
+    areas = [max(p[2] * p[3], 1e-6) for p in pts]
+    median_area = sorted(areas)[len(areas) // 2]
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+
+    out = []
+    for i, p in enumerate(pts):
+        x, y, w, h, conf, label = p
+        area = areas[i]
+        # Distance from the crowd: a loose piece is set apart, a hole is
+        # embedded in the composition.
+        dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+        # Edge proximity: draggables live in rails and margins.
+        edge = min(x, 1.0 - x, y, 1.0 - y)
+        small = median_area / (area + 1e-6)      # >1 when smaller than most
+        bias = _label_bias(label)
+
+        piece = (1.6 * dist + 1.2 * max(0.0, 0.25 - edge) * 4.0
+                 + 0.6 * min(small, 3.0) + 0.8 * conf + 1.5 * bias)
+        hole = (1.4 * (1.0 - min(dist * 2.0, 1.0))
+                + 1.0 * min(edge * 4.0, 1.0)
+                + 0.5 * conf - 1.5 * bias)
+        out.append((i, piece, hole))
+    return out
+
+
+def pair_drag(points):
+    """Choose (source, destination) centres for a drag round.
+
+    Picks the detection that scores highest as a loose piece, then the
+    best remaining hole candidate — never the same box twice. Returns
+    ``((sx, sy), (dx, dy))`` or ``None``.
+    """
+    pts = list(points or [])
+    if len(pts) < 2:
+        return None
+    scored = score_drag_roles(pts)
+    src_i = max(scored, key=lambda t: t[1])[0]
+    dst_i = max((t for t in scored if t[0] != src_i),
+                key=lambda t: t[2])[0]
+    src, dst = pts[src_i], pts[dst_i]
+    return (src[0], src[1]), (dst[0], dst[1])
+
+
 # ── question rewriting ───────────────────────────────────────────────────
 # hCaptcha speaks to humans ("Please click on all the dogs"). A detector
 # needs to be spoken to in boxes ("Box and coordinate every dog"). These
@@ -364,16 +454,17 @@ _SHAPE_INSTRUCTION = {
                "fractions of the image, origin top-left."),
     "bbox": ("Report ONE tight bounding box around the single best match, "
              "with its centre coordinate, normalised 0.0-1.0."),
-    "drag": ("Box and coordinate TWO things: the loose draggable piece "
-             "(source) and the empty slot or gap where it fits "
-             "(destination). Give the centre of each, normalised 0.0-1.0."),
-    "pattern": ("Box and coordinate TWO things: the candidate icon that "
-                "completes the pattern (source) and the empty cell it "
-                "belongs in (destination). Centres normalised 0.0-1.0."),
-    "tower": ("Box and coordinate TWO things: the loose block segment "
-              "(source, often carrying a Move badge) and the incomplete "
-              "tower it must be dropped on (destination) — the stack that "
-              "is shorter or has a gap. Centres normalised 0.0-1.0."),
+    "drag": ("This is a DRAG puzzle with exactly two answers. FIRST, box "
+             "the loose draggable piece: it is the small icon or shape "
+             "sitting APART from the main picture, usually in a side rail, "
+             "a corner or a tray, sometimes marked Move. SECOND, box the "
+             "place it belongs: the hole, socket, dashed outline, shadow "
+             "or empty cell INSIDE the main picture whose shape MATCHES "
+             "that piece. Do not box the finished/filled shapes. Label the "
+             "first 'piece' and the second 'hole', and give the centre of "
+             "each as normalised 0.0-1.0 coordinates."),
+    "pattern": ("This is a PATTERN-COMPLETION puzzle. Box the candidate icon that completes the sequence (label it 'piece'), and box the EMPTY cell in the grid where it belongs (label it 'hole'). The empty cell is the one cell with no symbol in it. Centres normalised 0.0-1.0."),
+    "tower": ("This is a BLOCK-STACK puzzle. Box the loose block segment that is not part of any tower (label it 'piece' — it usually sits to one side and may carry a Move badge), and box the INCOMPLETE tower it must be dropped on (label it 'hole' — the stack that is shorter than the others or has a visible gap). Centres normalised 0.0-1.0."),
     "stack": ("Box and coordinate every loose block and every stack top it "
               "must go to, as {\"drags\": [[sx, sy, tx, ty], ...]} in 0-100 "
               "percent coordinates."),
@@ -1435,13 +1526,13 @@ class RoboflowVisionClient:
                 "x1": max(0.0, x - w / 2), "y1": max(0.0, y - h / 2),
                 "x2": min(1.0, x + w / 2), "y2": min(1.0, y + h / 2)}}
         if shape in ("drag", "pattern", "tower"):
-            if len(pts) < 2:
+            # Confidence order says nothing about WHICH box is the loose
+            # piece and which is the hole — score the roles geometrically.
+            pair = pair_drag(pts)
+            if pair is None:
                 return None
-            # Highest-confidence detection is the piece; the next one is
-            # the destination slot / stack.
-            src, dst = pts[0], pts[1]
-            return {"type": "drag", "from": (src[0], src[1]),
-                    "to": (dst[0], dst[1])}
+            src, dst = pair
+            return {"type": "drag", "from": src, "to": dst}
         if shape == "count":
             return {"type": "count", "count": len(pts)}
         if shape == "tiles":
