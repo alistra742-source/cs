@@ -55,7 +55,7 @@ from typing import Callable, List, Optional
 
 from browser_engine import async_playwright, ENGINE
 from captcha_solver import extract_hcaptcha_sitekey, read_hcaptcha_token
-from vision_solver import RoboflowVisionClient
+from vision_solver import RoboflowVisionClient, RTDETR_TIMEOUT
 
 # ── tiny logger ─────────────────────────────────────────────────────────
 
@@ -775,18 +775,99 @@ async def solve_hcaptcha(page, vision: Optional[RoboflowVisionClient] = None,
 
 # ── CLI ─────────────────────────────────────────────────────────────────
 
+def _demo_image() -> bytes:
+    """A small synthetic scene, so --check exercises a real inference."""
+    try:
+        import io
+        from PIL import Image, ImageDraw
+    except Exception:
+        return b""
+    im = Image.new("RGB", (320, 320), (135, 180, 225))
+    d = ImageDraw.Draw(im)
+    d.rectangle((0, 220, 320, 320), fill=(90, 140, 90))      # ground
+    d.ellipse((110, 120, 210, 220), fill=(160, 110, 60))     # body
+    d.ellipse((90, 95, 150, 155), fill=(160, 110, 60))       # head
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
 async def _cli_check() -> int:
-    client = RoboflowVisionClient(log=lambda m, level="info": print(m, flush=True))
-    ok, _models = await client.check()
-    print(f"Roboflow workflow: {'REACHABLE' if ok else 'UNREACHABLE'} "
-          f"({client.endpoint})")
-    if not ok:
-        print("Fix: export API_KEY=<your Roboflow key> (from "
-              "app.roboflow.com/settings/api), and set ROBOFLOW_WORKSPACE / "
-              "ROBOFLOW_WORKFLOW if they differ from the defaults.")
-        return 1
-    print(f"Model {client.model}: AVAILABLE ✓")
-    return 0
+    """Probe every tier in order and report which ones can answer."""
+    log = lambda m, level="info": print(f"  {m}", flush=True)
+    client = RoboflowVisionClient(log=log)
+    img = _demo_image()
+    question = "Please click on all the dogs"
+    results = {}
+
+    print("=" * 62)
+    print("TIER 1 — Roboflow Gemini workflow")
+    print("=" * 62)
+    print(f"  endpoint: {client.endpoint}")
+    if not client._api_key:
+        print("  API_KEY: NOT SET ✗")
+    else:
+        print(f"  API_KEY: set ({len(client._api_key)} chars)")
+    ok, models = await client.check()
+    results["tier1"] = ok
+    print(f"  -> {'REACHABLE ✓' if ok else 'UNREACHABLE ✗'}"
+          f"{'  using ' + client.workflow if ok else ''}")
+
+    print()
+    print("=" * 62)
+    print(f"TIER 2 — RT-DETR ({client.rtdetr_model_id})")
+    print("=" * 62)
+    print(f"  endpoint: {client.rtdetr_endpoint}")
+    t2 = await client.check_rtdetr()
+    results["tier2"] = t2
+    print(f"  -> {'REACHABLE ✓' if t2 else 'UNREACHABLE ✗'}")
+    if t2 and img:
+        pts = await client._rtdetr_infer(img, RTDETR_TIMEOUT)
+        labels = sorted({p[5] for p in (pts or [])})
+        print(f"  live inference: {len(pts or [])} detection(s) "
+              f"{labels[:6] if labels else ''}")
+
+    print()
+    print("=" * 62)
+    print(f"TIER 3 — Gemma ({client.gemma_model})")
+    print("=" * 62)
+    if not client.gemma_base:
+        print("  GEMMA_BASE not set — tier 3 DISABLED (this is fine)")
+        results["tier3"] = None
+    else:
+        print(f"  endpoint: {client.gemma_base}")
+        t3 = await client.check_gemma()
+        results["tier3"] = t3
+        print(f"  -> {'REACHABLE ✓' if t3 else 'UNREACHABLE ✗'}")
+        if t3 and img:
+            txt = await client._gemma_chat(
+                "Answer with yes or no only.",
+                "Is there an animal in this image?", [img], 60,
+                want_json=False)
+            print(f"  live inference: {str(txt)[:60]!r}")
+
+    print()
+    print("=" * 62)
+    print("QUESTION REWRITING (no network needed)")
+    print("=" * 62)
+    for q, shape in ((question, "tiles"),
+                     ("Drag the shape to where it fits", "drag")):
+        print(f"  hCaptcha: {q}")
+        print(f"  model:    {client.shape_question(q, shape)[:96]}...")
+
+    print()
+    print("=" * 62)
+    usable = [k for k, v in results.items() if v]
+    if usable:
+        print(f"RESULT: {len(usable)} tier(s) can answer -> "
+              f"{', '.join(usable)}")
+        print("The solver will work.")
+        return 0
+    print("RESULT: NO tier can answer — captchas will fail. ✗")
+    print("  tier 1: check API_KEY, ROBOFLOW_WORKSPACE, ROBOFLOW_WORKFLOW")
+    print("  tier 2: check API_KEY (rfdetr-small needs no other setup)")
+    print("  tier 3: set GEMMA_BASE=http://ollama.railway.internal:11434")
+    return 1
 
 
 async def _cli_solve(url: str, headless: bool, timeout: float,
