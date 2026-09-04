@@ -290,7 +290,10 @@ def _b64(data: bytes) -> str:
 #
 # Ollama cannot run inside the app container, so point GEMMA_BASE at
 # wherever `ollama serve` actually lives:
-#   GEMMA_BASE=http://<host-or-service>:11434
+#   GEMMA_BASE=http://ollama.railway.internal:11434   (Railway)
+#   GEMMA_BASE=http://<host>:11434                    (self-hosted)
+# On Railway the ollama service MUST set OLLAMA_HOST=[::]:11434 — the
+# private network is IPv6-only and Ollama otherwise binds IPv4 loopback.
 # Empty GEMMA_BASE disables the tier entirely.
 GEMMA_BASE = (os.environ.get("GEMMA_BASE", "").strip().rstrip("/")
               or os.environ.get("OLLAMA_BASE", "").strip().rstrip("/"))
@@ -1255,8 +1258,14 @@ class RoboflowVisionClient:
                 return False
             return True
         except Exception as e:
+            hint = ""
+            if ".railway.internal" in self.gemma_base:
+                # Railway's private network is IPv6-only; Ollama defaults
+                # to 127.0.0.1 and never appears on it.
+                hint = (" — set OLLAMA_HOST=[::]:11434 on the ollama "
+                        "service (Railway private networking is IPv6-only)")
             self._log(f"[Gemma] unreachable at {self.gemma_base}: "
-                      f"{type(e).__name__}", level="warn")
+                      f"{type(e).__name__}{hint}", level="warn")
             return False
 
     async def _gemma_chat(self, system: str, question: str,

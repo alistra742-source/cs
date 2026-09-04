@@ -326,20 +326,58 @@ model, so it reads the prompt and can answer the reasoning rounds COCO
 has no class for ("odd one out", most trees/tools/terrain).
 
 **Ollama cannot run inside the app container** — that container only has
-Python, Chrome and Tor. Run Ollama somewhere reachable and point the app
-at it:
+Python, Chrome and Tor. Run it as a SECOND service and point the app at
+it over the private network.
+
+#### Railway (recommended)
+
+1. In the same Railway project: **New → Docker Image → `ollama/ollama`**.
+2. Name the service `ollama`.
+3. **Variables** on that service:
+
+   ```
+   OLLAMA_HOST = [::]:11434
+   ```
+
+   Railway's private network is **IPv6-only**. Ollama binds `127.0.0.1`
+   by default, and even `0.0.0.0` only listens on IPv4 — either way the
+   app service cannot reach it. `[::]` is required.
+
+4. **Settings → Volumes**: mount a volume at `/root/.ollama`, or the
+   ~3.3 GB of weights are re-downloaded on every restart.
+5. Pull the model once from that service's shell:
+
+   ```bash
+   ollama pull gemma3:4b
+   ```
+
+6. **Variables** on the APP service:
+
+   ```
+   GEMMA_BASE = http://ollama.railway.internal:11434
+   ```
+
+   Use the private hostname, not a public domain: it stays off the public
+   internet and does not incur egress. Do NOT expose Ollama publicly —
+   an open Ollama endpoint is free compute for anyone who finds it.
+
+Memory: `gemma3:4b` needs ~4-6 GB of RAM. Give the Ollama service its own
+plan headroom; it must NOT share the app container, which is already
+tight enough that Chrome is being OOM-killed.
+
+#### Self-hosted alternative
 
 ```bash
-# on the Ollama host
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull gemma3:4b
 OLLAMA_HOST=0.0.0.0:11434 ollama serve
 ```
 
-```bash
-# on the app (Railway variables)
-GEMMA_BASE=http://<ollama-host>:11434
 ```
+GEMMA_BASE=http://<host>:11434
+```
+
+Open port 11434 in the firewall and put an allowlist in front of it.
 
 Leaving `GEMMA_BASE` unset disables the tier cleanly — the solver just
 stops after RT-DETR.
