@@ -1980,7 +1980,7 @@ class DiscordAutomation:
             # exception path records the same diagnostics in that case.
             pass
 
-    def _on_page_request(self, request) -> None:
+    async def _on_page_request(self, request) -> None:
         try:
             url = (request.url or "").lower()
             if "hcaptcha" not in url:
@@ -2013,6 +2013,18 @@ class DiscordAutomation:
                         body = getattr(request, "post_data", None)
                     except Exception:
                         body = None
+                # Chrome can omit the body from the event entirely. The
+                # engine can still fetch it over CDP while the request is
+                # in flight — this is the path that finally yields the
+                # enterprise rqdata for Discord.
+                if not body:
+                    fetch = getattr(request, "fetch_post_data", None)
+                    if callable(fetch):
+                        try:
+                            body = await asyncio.wait_for(fetch(),
+                                                          timeout=5.0)
+                        except Exception:
+                            body = None
                 if body is not None:
                     rqdata = extract_rqdata_from_body(body)
             if rqdata:

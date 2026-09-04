@@ -859,11 +859,39 @@ async def _eval_on(conn, js: Any, arg: Any = None) -> Any:
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response facades for page.on()
 # ─────────────────────────────────────────────────────────────────────────────
+# Chrome omits request bodies from RequestWillBeSent unless a max size
+# is given. hCaptcha's enterprise payload is a few KB.
+_MAX_POST_DATA = 262144
+
+
 class _Request:
-    def __init__(self, event: Any):
+    def __init__(self, event: Any, tab: Any = None):
         self.url = (getattr(getattr(event, "request", None), "url", None)) or ""
         self._post_data = getattr(getattr(event, "request", None), "post_data", None)
         self._post_data_buffer = None
+        self._tab = tab
+        self._request_id = getattr(event, "request_id", None)
+
+    async def fetch_post_data(self):
+        """Pull the POST body over CDP when the event did not carry it.
+
+        Chrome truncates or omits postData depending on
+        Network.enable(maxPostDataSize); Network.getRequestPostData always
+        returns the full body while the request is still in flight.
+        """
+        if self._post_data:
+            return self._post_data
+        if self._tab is None or self._request_id is None or cdp is None:
+            return None
+        try:
+            body, _b64 = await self._tab.send(
+                cdp.network.get_request_post_data(self._request_id))
+            if body:
+                self._post_data = body
+                return body
+        except Exception:
+            pass
+        return None
 
     @property
     def post_data(self):
@@ -1141,15 +1169,20 @@ class _Page:
         if event in ("request", "response"):
             if event == "request":
                 def _req_h(e, _conn=None):
-                    _call_handler(handler, _Request(e))
+                    _call_handler(handler, _Request(e, self._tab))
                 self._tab.handlers[cdp.network.RequestWillBeSent].append(_req_h)
             else:
                 def _resp_h(e, _conn=None):
                     _call_handler(handler, _Response(self._tab, e))
                 self._tab.handlers[cdp.network.ResponseReceived].append(_resp_h)
             try:
+                # max_post_data_size is REQUIRED for RequestWillBeSent to
+                # carry request.postData. Without it Chrome omits the body
+                # entirely, which is why hCaptcha's enterprise rqdata never
+                # showed up in the request hook.
                 asyncio.get_running_loop().create_task(
-                    self._tab.send(cdp.network.enable()))
+                    self._tab.send(cdp.network.enable(
+                        max_post_data_size=_MAX_POST_DATA)))
             except RuntimeError:
                 pass
         elif event == "crash":
@@ -1226,7 +1259,9 @@ class _Context:
             pass
         # nodriver does not auto-enable domains — turn on the ones the bot
         # relies on (DOM queries, page events, frame tree, screenshots).
-        for domain in (cdp.page.enable(), cdp.dom.enable(), cdp.network.enable()):
+        for domain in (cdp.page.enable(), cdp.dom.enable(),
+                       cdp.network.enable(
+                           max_post_data_size=_MAX_POST_DATA)):
             try:
                 await tab.send(domain)
             except Exception:
