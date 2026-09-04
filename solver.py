@@ -15,8 +15,8 @@ Pipeline (same as the bot):
   3. wait for the image challenge to really paint (never a blank shell),
   4. read the challenge instruction ("Please select all images with a
      boat", "Please click on the two elements that are identical", ...),
-  5. screenshot every grid tile and ask the local Ollama vision model
-     which tiles satisfy the instruction (vision_solver.py),
+  5. screenshot every grid tile and ask the Roboflow workflow (Gemini
+     3.6 Flash) which tiles satisfy the instruction (vision_solver.py),
   6. click those tiles (or type the answer for text challenges), click
      Verify, and poll until hCaptcha mints the token.
 
@@ -30,16 +30,17 @@ CLI usage:
     python solver.py <url> [--headless] [--timeout 120]
         # launch a fresh browser, navigate, solve, print JSON result
     python solver.py --check
-        # probe the Ollama backend (reachable? model pulled?)
+        # probe the Roboflow workflow (API_KEY valid? workflow found?)
     python solver.py <url> --output token.txt --screenshot shot.png
 
 Configuration (env vars, same as the bot):
 
-    VISION_API_BASE vision endpoint (default http://localhost:11434)
-    OLLAMA_BASE     legacy alias for VISION_API_BASE
-    OLLAMA_MODEL    vision model (default ahmadwaqar/smolvlm2-256m-video:q8_0)
-    OLLAMA_TIMEOUT  per-solve timeout seconds (default 30)
-    OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
+    API_KEY             Roboflow API key — required
+    ROBOFLOW_WORKSPACE  workspace slug (default text-detectioin)
+    ROBOFLOW_WORKFLOW   workflow id (default gemini-3-6-flash)
+    GOOGLE_API_KEY      optional BYO Google AI Studio key (model_api_key)
+    ROBOFLOW_TIMEOUT    per-solve timeout seconds (default 60)
+    ROBOFLOW_TILE_TIMEOUT  per-tile timeout for grid rounds (default 25)
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ from typing import Callable, List, Optional
 
 from browser_engine import async_playwright, ENGINE
 from captcha_solver import extract_hcaptcha_sitekey, read_hcaptcha_token
-from vision_solver import OllamaVisionClient
+from vision_solver import RoboflowVisionClient
 
 # ── tiny logger ─────────────────────────────────────────────────────────
 
@@ -594,7 +595,7 @@ async def _wait_for_widget_or_challenge(page, timeout: float = 60.0,
     return ""
 
 
-async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
+async def solve_hcaptcha(page, vision: Optional[RoboflowVisionClient] = None,
                          log: Callable = _default_log,
                          timeout: float = 90.0,
                          max_solve_attempts: int = 3) -> dict:
@@ -612,7 +613,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
     sites). ``answer`` is the vision model's structured answer
     ({"type": "tiles", "indices": [...]} or {"type": "text", "text": "..."}).
     """
-    vision = vision or OllamaVisionClient(log=log)
+    vision = vision or RoboflowVisionClient(log=log)
     started = time.time()
     state = await _wait_for_widget_or_challenge(page, timeout=min(timeout, 60.0),
                                                 log=log)
@@ -722,7 +723,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
                 log("[Captcha] No grid tiles captured — retrying round", "warn")
                 await asyncio.sleep(2)
                 continue
-            log(f"[Captcha] Asking Ollama ({vision.model}) which tiles match...")
+            log(f"[Captcha] Asking {vision.model} which tiles match...")
             answer = await vision.solve(prompt, tiles)
             if not answer:
                 log("[Captcha] Vision solver returned no answer — retrying", "warn")
@@ -766,7 +767,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
 
     return {"ok": False,
             "error": "vision solver could not clear the challenge "
-                     "(check OLLAMA_BASE / OLLAMA_MODEL, see --check)",
+                     "(check API_KEY / the workflow, see --check)",
             "token": "", "prompt": "", "answer": None, "tiles": 0,
             "rounds": 0, "sitekey": sitekey,
             "elapsed": round(time.time() - started, 1)}
@@ -775,37 +776,29 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 async def _cli_check() -> int:
-    client = OllamaVisionClient()
-    ok, models = await client.check()
-    print(f"Ollama server: {'REACHABLE' if ok else 'UNREACHABLE'} "
-          f"({client.base})")
-    if ok:
-        print(f"Models pulled: {models or '(none)'}")
-        if client.model in models:
-            print(f"Model {client.model}: PRESENT ✓")
-        else:
-            print(f"Model {client.model}: MISSING — run: ollama pull {client.model}")
-            return 1
-    else:
-        print("Fix: start Ollama (`ollama serve`) and set OLLAMA_BASE if it "
-              "is not on localhost:11434.")
+    client = RoboflowVisionClient(log=lambda m, level="info": print(m, flush=True))
+    ok, _models = await client.check()
+    print(f"Roboflow workflow: {'REACHABLE' if ok else 'UNREACHABLE'} "
+          f"({client.endpoint})")
+    if not ok:
+        print("Fix: export API_KEY=<your Roboflow key> (from "
+              "app.roboflow.com/settings/api), and set ROBOFLOW_WORKSPACE / "
+              "ROBOFLOW_WORKFLOW if they differ from the defaults.")
         return 1
+    print(f"Model {client.model}: AVAILABLE ✓")
     return 0
 
 
 async def _cli_solve(url: str, headless: bool, timeout: float,
                      output: Optional[str], screenshot: Optional[str]) -> int:
     print(f"[solver] Engine: {ENGINE} | URL: {url} | headless={headless}")
-    vision = OllamaVisionClient()
-    ok, models = await vision.check()
+    vision = RoboflowVisionClient()
+    ok, _models = await vision.check()
     if not ok:
-        print("[solver] WARNING: vision server unreachable — the solve will "
-              "fail. Start Ollama and pull a vision model "
-              "(recommended: ahmadwaqar/smolvlm2-256m-video:q8_0), "
-              "or set VISION_API_BASE.", flush=True)
-    elif vision.model not in models:
-        print(f"[solver] WARNING: model {vision.model} not pulled — "
-              f"run: ollama pull {vision.model}", flush=True)
+        print("[solver] WARNING: Roboflow workflow unreachable — the solve "
+              "will fail. Set API_KEY to your Roboflow key (and "
+              "ROBOFLOW_WORKSPACE / ROBOFLOW_WORKFLOW if needed).",
+              flush=True)
 
     pw = await async_playwright().start()
     # `.chromium` is the engine's Playwright-compatible shim — it really
@@ -851,11 +844,11 @@ async def _cli_solve(url: str, headless: bool, timeout: float,
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="solver.py",
-        description="Standalone hCaptcha solver (Ollama vision model + "
+        description="Standalone hCaptcha solver (Roboflow Gemini 3.6 Flash + "
                     "nodriver/Chrome engine). Solves the image challenge on any page.")
     parser.add_argument("url", nargs="?", help="page URL with an hCaptcha widget")
     parser.add_argument("--check", action="store_true",
-                        help="probe the Ollama backend and exit")
+                        help="probe the Roboflow workflow and exit")
     parser.add_argument("--headless", action="store_true", default=True,
                         help="run the browser headless (default)")
     parser.add_argument("--headed", action="store_true",

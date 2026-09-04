@@ -1,45 +1,56 @@
 #!/usr/bin/env python3
-"""vision_solver.py — local/remote vision solver for the hCaptcha image grid.
+"""vision_solver.py — Roboflow (Gemini 3.6 Flash) vision solver for hCaptcha.
 
-Replaces paid token APIs with a vision model you own and run. Instead of minting a token server-side, the bot:
+Every visual answer in this stack comes from a Roboflow Workflow running
+Google Gemini 3.6 Flash. There is no local "brain" checkpoint, no CNN
+weights and no self-hosted model server: the bot
 
-  1. reads the challenge prompt ("Please select all images with a boat") from
-     the hCaptcha challenge frame,
-  2. screenshots every tile of the image grid,
-  3. sends the prompt + tile images to a vision model,
-  4. the model answers with the tile numbers that satisfy the task,
-  5. the bot clicks those tiles + Verify (see server.py's
-     ``_solve_hcaptcha_if_present``), and hCaptcha itself mints the token.
+  1. reads the challenge prompt ("Please select all images with a boat")
+     from the hCaptcha challenge frame,
+  2. screenshots every tile of the image grid (or the whole canvas),
+  3. POSTs each image to the Roboflow workflow together with the
+     challenge question,
+  4. Gemini answers with the tiles / points / drag to perform,
+  5. the bot clicks or drags, and hCaptcha itself mints the token.
+
+Transport — Roboflow Serverless Workflows:
+
+    POST https://serverless.roboflow.com/infer/workflows/<WS>/<WORKFLOW>
+    {
+      "api_key": "<API_KEY>",
+      "inputs": {
+        "image":   {"type": "base64", "value": "<b64 jpeg>"},
+        "classes": ["boat"],          # object-detection workflows
+        "prompt":  "<the question>"   # passed when the workflow takes it
+      }
+    }
+
+The workflow is an **object-detection** workflow: it returns predictions
+with `x`, `y`, `width`, `height`, `class` and `confidence` in PIXELS of
+the submitted image. `_predictions_to_points()` normalises them to 0-1
+so the rest of the solver is unchanged. The literal challenge question
+is ALWAYS sent along with the image (as `prompt`, and mirrored into
+`classes`), so Gemini is answering the captcha's own wording rather than
+a generic label list.
 
 Configuration (env vars):
 
-  VISION_API_BASE  base URL of the vision API endpoint. Overrides
-                   OLLAMA_BASE when set. Points to an Ollama-compatible API
-                   (default: http://localhost:11434 — the fallback when
-                   neither VISION_API_BASE nor OLLAMA_BASE is set).
-  OLLAMA_BASE      legacy alias — used only when VISION_API_BASE is empty.
-  VISION_API_KEY   Bearer token for authenticated vision endpoints
-                   (optional — added as ``Authorization: Bearer <key>``
-                   header to every request when set).
-  OLLAMA_MODEL     vision model to use
-                   (default ahmadwaqar/smolvlm2-256m-video:q8_0)
-  OLLAMA_TIMEOUT   per-request timeout in seconds (default 30 — SmolVLM2
-                   is tiny; a 180s wait expires the challenge)
-  OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
-  OLLAMA_IMAGE_SIDE    max image side in px sent to tiny VLMs (default 256)
-  VISION_CHECK_TIMEOUT  reachability-probe timeout in seconds (default 60 —
-                        hosted endpoints cold-start on first request)
+  API_KEY             Roboflow API key. REQUIRED. Sent as `api_key` in the
+                      request body (ROBOFLOW_API_KEY is accepted too).
+  ROBOFLOW_WORKSPACE  workspace slug (default: text-detectioin)
+  ROBOFLOW_WORKFLOW   workflow id (default: gemini-3-6-flash)
+  ROBOFLOW_API_BASE   serverless base URL
+                      (default https://serverless.roboflow.com)
+  GOOGLE_API_KEY      optional Google AI Studio key; when set it is sent
+                      as `model_api_key` so inference bills your Google
+                      account instead of Roboflow credits.
+  ROBOFLOW_TIMEOUT    per-request timeout in seconds (default 60)
+  ROBOFLOW_TILE_TIMEOUT  per-tile timeout for grid rounds (default 25)
+  ROBOFLOW_IMAGE_SIDE    max image side in px sent up (default 640)
+  ROBOFLOW_MIN_CONF   minimum prediction confidence to keep (default 0.30)
+  ROBOFLOW_CHECK_TIMEOUT  readiness-probe timeout (default 60)
 
-The default is SmolVLM2-256M (the model this stack actually runs). It is
-a 256M SigLIP+SmolLM2 VLM: ~279 MB, ~2k–8k context, good at short visual
-yes/no, bad at 9-image JSON contracts. For that model the client asks
-ONE tile at a time ("yes or no") and never waits 180s. Larger VLMs
-(qwen3-vl:2b, …) still get the multi-image JSON path when OLLAMA_MODEL
-is set to them.
-
-The client talks to Ollama's native HTTP API (POST /api/chat). Tiny
-models skip ``format: json`` (it hangs or empties them) and fall back to
-loose parsing. Only aiohttp is used — no new dependencies.
+Only aiohttp is used — no new dependencies.
 """
 
 from __future__ import annotations
@@ -53,35 +64,37 @@ from typing import Callable, List, Optional
 
 import aiohttp
 
-# ── VISION_API_BASE is the canonical env var.  OLLAMA_BASE is the legacy
-# fallback when only the old name is set.  Neither is required: the default
-# http://localhost:11434 serves the local-Ollama development workflow.
-VISION_API_BASE = os.environ.get("VISION_API_BASE", "").rstrip("/")
-_OLLAMA_BASE_LEGACY = os.environ.get("OLLAMA_BASE", "").rstrip("/")
-OLLAMA_BASE = VISION_API_BASE or _OLLAMA_BASE_LEGACY or "http://localhost:11434"
+# ── Roboflow configuration ───────────────────────────────────────────────
+ROBOFLOW_API_BASE = (os.environ.get("ROBOFLOW_API_BASE", "").strip().rstrip("/")
+                     or "https://serverless.roboflow.com")
 
-VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
-_DEFAULT_MODEL = "ahmadwaqar/smolvlm2-256m-video:q8_0"
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", _DEFAULT_MODEL).strip()
-OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
-# Reachability probe timeout (seconds). Hosted endpoints (Railway etc.)
-# COLD-START on the first request after sleeping — the wake-up itself can
-# take 30-90s, so a 10s probe marks a healthy service permanently down.
-VISION_CHECK_TIMEOUT = float(os.environ.get("VISION_CHECK_TIMEOUT", "60"))
-_SMOL_TILE_TIMEOUT = float(os.environ.get("OLLAMA_TILE_TIMEOUT", "12"))
-_SMOL_MAX_SIDE = int(os.environ.get("OLLAMA_IMAGE_SIDE", "256"))
+# API_KEY is the canonical name (that is what the deploy sets);
+# ROBOFLOW_API_KEY is accepted so Roboflow's own convention also works.
+API_KEY = (os.environ.get("API_KEY", "").strip()
+           or os.environ.get("ROBOFLOW_API_KEY", "").strip())
+
+# Optional BYO provider key: Gemini 3.6 Flash workflows accept a
+# `model_api_key` runtime parameter (Google AI Studio key). Omitted when
+# unset — inference then runs on Roboflow credits.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+
+ROBOFLOW_WORKSPACE = (os.environ.get("ROBOFLOW_WORKSPACE", "").strip()
+                      or "text-detectioin")
+ROBOFLOW_WORKFLOW = (os.environ.get("ROBOFLOW_WORKFLOW", "").strip()
+                     or "gemini-3-6-flash")
+
+ROBOFLOW_TIMEOUT = float(os.environ.get("ROBOFLOW_TIMEOUT", "60"))
+ROBOFLOW_CHECK_TIMEOUT = float(os.environ.get("ROBOFLOW_CHECK_TIMEOUT", "60"))
+_TILE_TIMEOUT = float(os.environ.get("ROBOFLOW_TILE_TIMEOUT", "25"))
+_MAX_SIDE = int(os.environ.get("ROBOFLOW_IMAGE_SIDE", "640"))
+_MIN_CONF = float(os.environ.get("ROBOFLOW_MIN_CONF", "0.30"))
+
+# Model label, for logs only — the workflow decides the real model.
+MODEL_NAME = "gemini-3.6-flash (roboflow)"
 
 
-def is_tiny_vlm(name: str) -> bool:
-    """True for SmolVLM2-class models that cannot do 9-image JSON."""
-    n = (name or "").lower()
-    return any(k in n for k in (
-        "smolvlm", "smol-vlm", "smol_vlm", "256m", "500m-video",
-    ))
-
-
-def shrink_image(data: bytes, max_side: int = _SMOL_MAX_SIDE) -> bytes:
-    """Downscale a PNG/JPEG to a JPEG the 256M projector can chew."""
+def shrink_image(data: bytes, max_side: int = _MAX_SIDE) -> bytes:
+    """Downscale a PNG/JPEG to a JPEG small enough for a fast round trip."""
     if not data:
         return data
     try:
@@ -90,23 +103,79 @@ def shrink_image(data: bytes, max_side: int = _SMOL_MAX_SIDE) -> bytes:
         im = Image.open(io.BytesIO(data)).convert("RGB")
         im.thumbnail((max(32, int(max_side)), max(32, int(max_side))))
         buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=75, optimize=True)
+        im.save(buf, format="JPEG", quality=85, optimize=True)
         out = buf.getvalue()
         return out or data
     except Exception:
         return data
 
 
+def image_size(data: bytes):
+    """(width, height) of an encoded image, or None."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:
+        return None
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def detection_classes(prompt: str) -> List[str]:
+    """Classes to ask the object-detection workflow for.
+
+    The captcha's own wording is always included so Gemini sees the real
+    question; the canonical noun (when hcaptcha_types can extract one) is
+    added as a short, detector-friendly alias.
+    """
+    p = (prompt or "").strip()
+    out: List[str] = []
+    try:
+        import hcaptcha_types as hct
+        target = hct.extract_target(p)
+        if target:
+            out.append(str(target).replace("_", " "))
+    except Exception:
+        pass
+    noun = _prompt_noun(p)
+    if noun and noun not in out:
+        out.append(noun)
+    if p and p not in out:
+        out.append(p[:200])
+    return out or ["object"]
+
+
+_STOPWORDS = {
+    "please", "click", "select", "choose", "pick", "check", "mark", "tap",
+    "all", "each", "every", "the", "a", "an", "of", "with", "that", "which",
+    "image", "images", "picture", "pictures", "photo", "photos", "tile",
+    "tiles", "containing", "contain", "contains", "show", "shows", "showing",
+    "in", "on", "is", "are", "to", "and", "or", "square", "squares", "this",
+}
+
+
+def _prompt_noun(prompt: str) -> str:
+    """Best-effort short noun phrase from the prompt (detector-friendly)."""
+    words = re.findall(r"[a-z]+", (prompt or "").lower())
+    keep = [w for w in words if w not in _STOPWORDS]
+    return " ".join(keep[:3])
+
+
 _YES_WORDS = ("yes", "y", "yeah", "yep", "yup", "true", "match", "matching")
+
 _NO_WORDS = ("no", "n", "nope", "nah", "false", "none")
 
 
 def parse_yesno(text: str):
-    """Map a tiny-VLM reply to True/False/None.
+    """Map a yes/no reply to True/False/None.
 
-    SmolVLM2 often echoes the question (\"… Answer yes or no.\"). Strip
-    that instruction and read the first/last token so an echoed prompt
-    is not scored as a \"no\".
+    Models often echo the question (\"… Answer yes or no.\"). Strip that
+    instruction and read the first/last token so an echoed prompt is not
+    scored as a \"no\".
     """
     t = (text or "").strip().lower()
     if not t:
@@ -139,7 +208,11 @@ def parse_yesno(text: str):
 
 
 def tile_yes_question(prompt: str, has_ref: bool = False) -> str:
-    """One-sentence yes/no the 256M model can actually answer."""
+    """The question sent alongside a single grid tile.
+
+    Phrased so a detection workflow has a concrete thing to find and a
+    VLM step can still answer it with yes/no.
+    """
     p = (prompt or "").strip()
     try:
         import hcaptcha_types as hct
@@ -304,233 +377,296 @@ _SYSTEM_BY_SHAPE = {
     "text": _SYSTEM_PROMPT,
 }
 
-# SmolVLM2 cannot follow the long JSON contracts above. Keep these to
-# one or two sentences; the per-tile path asks yes/no instead.
-_SMOL_SYSTEM = {
-    "tiles": "Look at the photo. Answer the question with yes or no only.",
-    "points": 'Look at the photo. Reply {"points": [[x, y]]} with x,y between 0 and 1.',
-    "bbox": 'Look at the photo. Reply {"bbox": {"x1":a,"y1":b,"x2":c,"y2":d}} 0 to 1.',
-    "drag": 'Look at the photo. Reply {"drag": {"from": [x,y], "to": [x,y]}} 0 to 1.',
-    "pattern": 'Look at the photo. Reply {"drag": {"from": [x,y], "to": [x,y]}} 0 to 1.',
-    "tower": 'Look at the wooden towers. Reply {"drag": {"from": [x,y], "to": [x,y]}} onto the short stack. 0 to 1.',
-    "stack": 'Reply {"drags": [[sx,sy,tx,ty], ...]} in 0-100 percent.',
-    "choice": 'Reply {"choice": N} with the option number.',
-    "count": 'How many? Reply {"count": N}.',
-    "text": "Read the characters. Reply with only the text.",
-}
-
 _JSON_ARRAY_RE = re.compile(r"\[\s*(?:\d+\s*(?:,\s*\d+\s*)*)?\]")
 _JSON_STRING_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
 
-class OllamaVisionClient:
-    """Async client for a vision model endpoint (Ollama or authenticated gateway).
+class RoboflowVisionClient:
+    """Async client for a Roboflow Workflow running Gemini 3.6 Flash.
 
-    Connects to the endpoint defined by the env vars:
-      - ``VISION_API_BASE`` (canonical) or ``OLLAMA_BASE`` (legacy)
-      - ``VISION_API_KEY`` for Bearer auth when talking to an authenticated gateway
+    One HTTP POST per image:
+
+        POST {base}/infer/workflows/{workspace}/{workflow}
+        {"api_key": ..., "inputs": {"image": {...}, "prompt": ..., ...}}
+
+    The workflow is an object-detection workflow, so the reply carries
+    `predictions` in pixel coordinates. Grid rounds ask ONE TILE AT A TIME
+    (a detection on tile N means tile N matches); single-canvas rounds
+    (points / bbox / drag / tower / pattern / count) map the detections
+    straight onto the answer shape. When the workflow instead returns free
+    text (a VLM/captioning step), the existing JSON parsers handle it.
     """
 
     def __init__(self, log: Optional[Callable] = None,
-                 base: str = OLLAMA_BASE, model: str = OLLAMA_MODEL):
+                 base: str = ROBOFLOW_API_BASE,
+                 workspace: str = ROBOFLOW_WORKSPACE,
+                 workflow: str = ROBOFLOW_WORKFLOW,
+                 api_key: str = "",
+                 google_api_key: str = ""):
         self._log = log or (lambda msg, level="info": None)
-        self.base = base.rstrip("/")
-        self.model = model or _DEFAULT_MODEL
-        self._api_key = VISION_API_KEY
+        self.base = (base or ROBOFLOW_API_BASE).rstrip("/")
+        self.workspace = workspace or ROBOFLOW_WORKSPACE
+        self.workflow = workflow or ROBOFLOW_WORKFLOW
+        self._api_key = api_key or API_KEY
+        self._google_api_key = google_api_key or GOOGLE_API_KEY
+        self.model = MODEL_NAME
         self.stats = {"calls": 0, "ok": 0, "failed": 0}
-        # Machine-readable result of the latest reachability probe.  Keep the
-        # public ``check() -> (ok, models)`` contract for existing callers,
-        # while letting them distinguish a transient connection failure from
-        # deterministic configuration errors such as HTTP 401 or 404.
+        # Machine-readable result of the latest reachability probe. Keeps
+        # the public ``check() -> (ok, models)`` contract, while letting
+        # callers separate a transient connection failure from a
+        # deterministic configuration error such as HTTP 401 or 404.
         self.last_check_error = ""
         self.last_check_http_status: Optional[int] = None
-        # Log which env var supplied the base, so diagnostics are clear.
-        src = "VISION_API_BASE" if os.environ.get("VISION_API_BASE", "").strip() else \
-              ("OLLAMA_BASE" if os.environ.get("OLLAMA_BASE", "").strip() else "default")
-        self._log(f"[Vision] API endpoint: {self.base} (from {src})"
-                  f"{' [authenticated]' if self._api_key else ''}")
+        if not self._api_key:
+            self._log("[Vision] API_KEY is not set — Roboflow will reject "
+                      "every request", level="error")
+        self._log(f"[Vision] Roboflow workflow: {self.workspace}/"
+                  f"{self.workflow} @ {self.base} ({self.model})"
+                  f"{' [BYO google key]' if self._google_api_key else ''}")
+
+    @property
+    def endpoint(self) -> str:
+        """Workflow run URL."""
+        return f"{self.base}/infer/workflows/{self.workspace}/{self.workflow}"
 
     @property
     def configured(self) -> bool:
-        return bool(self.base)
+        return bool(self.base and self.workspace and self.workflow
+                    and self._api_key)
 
-    async def _headers(self) -> dict:
-        """HTTP headers including optional Bearer auth."""
-        h = {"Content-Type": "application/json"}
-        if self._api_key:
-            h["Authorization"] = f"Bearer {self._api_key}"
-        return h
+    def _inputs(self, image: bytes, question: str,
+                classes: Optional[List[str]] = None) -> dict:
+        """Workflow inputs: the image AND the question, every call."""
+        inputs = {
+            "image": {"type": "base64", "value": _b64(image)},
+            # The literal captcha question. Different Gemini workflow
+            # templates name this input differently, so send the common
+            # aliases — a workflow ignores inputs it does not declare.
+            "prompt": question,
+            "query": question,
+            "question": question,
+            "classes": list(classes or detection_classes(question)),
+        }
+        if self._google_api_key:
+            inputs["model_api_key"] = self._google_api_key
+        return inputs
 
     async def check(self) -> tuple:
-        """Probe the Ollama server and list pulled models.
+        """Probe the workflow endpoint.
 
-        Returns ``(ok, models)`` — ``models`` is a list of model names
-        (including tags) or [] when the probe fails.  ``last_check_error``
-        classifies failures so callers do not mistake an HTTP 401 (the server
-        is up, but the credentials differ) for a cold start and retry it.
+        Returns ``(ok, models)`` where ``models`` is ``[self.model]`` when
+        the workflow is reachable (kept for callers written against the old
+        contract). ``last_check_error`` classifies failures so callers do
+        not mistake an HTTP 401 (bad API_KEY) for a cold start.
         """
         self.last_check_error = ""
         self.last_check_http_status = None
+        if not self._api_key:
+            self.last_check_error = "authentication"
+            self._log("[Vision] No API_KEY configured for Roboflow",
+                      level="error")
+            return False, []
+        url = f"{self.base}/infer/workflows/{self.workspace}/{self.workflow}/describe_interface"
+        payload = {"api_key": self._api_key}
         try:
-            timeout = aiohttp.ClientTimeout(total=VISION_CHECK_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(total=ROBOFLOW_CHECK_TIMEOUT)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(f"{self.base}/api/tags",
-                                 headers=await self._headers()) as r:
-                    if r.status != 200:
-                        self.last_check_http_status = int(r.status)
-                        if r.status == 401:
-                            self.last_check_error = "authentication"
-                            key_state = ("the configured VISION_API_KEY was rejected"
-                                         if self._api_key else
-                                         "VISION_API_KEY is not configured in this service")
-                            self._log(
-                                f"[Vision] Authentication failed at {self.base} "
-                                f"(HTTP 401): {key_state}", level="error")
-                        elif r.status == 403:
-                            self.last_check_error = "authorization"
-                            self._log(
-                                f"[Vision] Access forbidden at {self.base} (HTTP 403)",
-                                level="error")
-                        elif r.status == 404:
-                            self.last_check_error = "protocol"
-                            self._log(
-                                f"[Vision] {self.base} does not expose the expected "
-                                "Ollama /api/tags endpoint (HTTP 404)", level="error")
-                        elif r.status == 429:
-                            self.last_check_error = "rate_limit"
-                            self._log(f"[Vision] /api/tags rate limited (HTTP 429)",
-                                      level="warn")
-                        elif r.status >= 500:
-                            self.last_check_error = "server"
-                            self._log(f"[Vision] /api/tags server error HTTP {r.status}",
-                                      level="warn")
-                        else:
-                            self.last_check_error = "http"
-                            self._log(f"[Vision] /api/tags HTTP {r.status}", level="warn")
-                        return False, []
+                async with s.post(url, json=payload) as r:
+                    status = int(r.status)
                     try:
-                        data = await r.json()
-                    except Exception as e:
-                        self.last_check_error = "protocol"
-                        self._log(
-                            f"[Vision] /api/tags returned invalid JSON: "
-                            f"{type(e).__name__}", level="error")
-                        return False, []
-            if not isinstance(data, dict) or not isinstance(data.get("models", []), list):
-                self.last_check_error = "protocol"
-                self._log("[Vision] /api/tags returned an invalid model-list payload",
+                        body = (await r.text())[:200]
+                    except Exception:
+                        body = ""
+            if status == 200:
+                self._log(f"[Vision] Roboflow OK: {self.workspace}/"
+                          f"{self.workflow}")
+                return True, [self.model]
+            self.last_check_http_status = status
+            if status in (401, 403):
+                self.last_check_error = "authentication"
+                self._log(f"[Vision] Roboflow rejected API_KEY (HTTP {status}) "
+                          "— check the key at app.roboflow.com/settings/api",
                           level="error")
-                return False, []
-            models = [m.get("name") or m.get("model") or ""
-                      for m in data.get("models", []) if isinstance(m, dict)]
-            models = [m for m in models if m]
-            self._log(f"[Ollama] Server OK at {self.base} ({len(models)} models pulled)")
-            return True, models
+            elif status == 404:
+                self.last_check_error = "protocol"
+                self._log(f"[Vision] Workflow {self.workspace}/{self.workflow} "
+                          "not found (HTTP 404) — check ROBOFLOW_WORKSPACE / "
+                          "ROBOFLOW_WORKFLOW", level="error")
+            elif status == 429:
+                self.last_check_error = "rate_limit"
+                self._log("[Vision] Roboflow rate limited (HTTP 429)",
+                          level="warn")
+            elif status >= 500:
+                self.last_check_error = "server"
+                self._log(f"[Vision] Roboflow server error HTTP {status}: "
+                          f"{body}", level="warn")
+            else:
+                self.last_check_error = "http"
+                self._log(f"[Vision] Roboflow HTTP {status}: {body}",
+                          level="warn")
+            return False, []
         except asyncio.TimeoutError:
             self.last_check_error = "timeout"
-            self._log(
-                f"[Vision] Probe timed out after {VISION_CHECK_TIMEOUT:g}s at {self.base}",
-                level="error")
+            self._log(f"[Vision] Probe timed out after "
+                      f"{ROBOFLOW_CHECK_TIMEOUT:g}s at {url}", level="error")
             return False, []
         except aiohttp.ClientError as e:
             self.last_check_error = "connection"
-            self._log(
-                f"[Vision] Connection failed at {self.base}: {type(e).__name__}",
-                level="error")
+            self._log(f"[Vision] Connection failed at {url}: "
+                      f"{type(e).__name__}", level="error")
             return False, []
         except Exception as e:
             self.last_check_error = "connection"
-            self._log(f"[Vision] Not reachable at {self.base}: {type(e).__name__}: {e}",
-                      level="error")
+            self._log(f"[Vision] Not reachable at {url}: "
+                      f"{type(e).__name__}: {e}", level="error")
             return False, []
 
-    async def _chat(self, system: str, content: str, images: List[bytes],
-                    timeout: float, *, want_json: bool,
-                    num_predict: int) -> Optional[str]:
-        """One /api/chat turn. Returns the raw message content or None."""
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": content,
-                    "images": [base64.b64encode(b).decode("ascii")
-                               for b in images if b],
-                },
-            ],
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "num_predict": int(num_predict),
-            },
-            "keep_alive": "10m",
-        }
-        if want_json:
-            payload["format"] = "json"
+    async def _run(self, image: bytes, question: str, timeout: float,
+                   classes: Optional[List[str]] = None) -> Optional[dict]:
+        """One workflow run. Returns the parsed JSON body or None."""
+        payload = {"api_key": self._api_key,
+                   "inputs": self._inputs(image, question, classes)}
         try:
             timeout_cfg = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(f"{self.base}/api/chat", json=payload,
-                                  headers=await self._headers()) as r:
+                async with s.post(self.endpoint, json=payload) as r:
                     if r.status != 200:
                         body = await r.text()
-                        self._log(
-                            f"[Ollama] Solve rejected (HTTP {r.status}): {body[:200]}",
-                            level="warn")
+                        self._log(f"[Vision] Workflow rejected "
+                                  f"(HTTP {r.status}): {body[:200]}",
+                                  level="warn")
                         return None
-                    data = await r.json()
-            return ((data or {}).get("message") or {}).get("content") or ""
+                    return await r.json()
         except Exception as e:
-            self._log(f"[Ollama] Solve error: {e}", level="error")
+            self._log(f"[Vision] Workflow error: {e}", level="error")
             return None
 
-    async def _solve_tiles_smol(self, prompt: str, images: List[bytes],
-                                examples: List[bytes],
-                                timeout: float) -> Optional[dict]:
-        """Ask SmolVLM2 yes/no on each tile. 9-at-once JSON 504s this model."""
-        ref = shrink_image(examples[0]) if examples else None
-        q = tile_yes_question(prompt, has_ref=bool(ref))
-        system = _SMOL_SYSTEM["tiles"]
-        per = min(_SMOL_TILE_TIMEOUT, max(6.0, timeout))
-        hits = []
+    # ── response readers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _walk(node, out_pred: list, out_text: list) -> None:
+        """Collect every predictions[] list and every string leaf."""
+        if isinstance(node, dict):
+            preds = node.get("predictions")
+            if isinstance(preds, list):
+                out_pred.extend(p for p in preds if isinstance(p, dict))
+            elif isinstance(preds, dict) and isinstance(
+                    preds.get("predictions"), list):
+                out_pred.extend(p for p in preds["predictions"]
+                                if isinstance(p, dict))
+            for k, v in node.items():
+                if k == "predictions":
+                    continue
+                if isinstance(v, str):
+                    if len(v) <= 4000 and k not in ("type", "format",
+                                                    "parent_id", "image_id"):
+                        out_text.append(v)
+                else:
+                    RoboflowVisionClient._walk(v, out_pred, out_text)
+        elif isinstance(node, list):
+            for v in node:
+                RoboflowVisionClient._walk(v, out_pred, out_text)
+
+    @classmethod
+    def read_response(cls, data) -> tuple:
+        """(predictions, texts) from any Roboflow workflow response shape."""
+        preds: list = []
+        texts: list = []
+        cls._walk(data, preds, texts)
+        return preds, texts
+
+    @staticmethod
+    def predictions_to_points(preds: list, size, min_conf: float = _MIN_CONF):
+        """Pixel detections -> [(x, y, w, h, conf, label)] normalised 0-1.
+
+        Roboflow gives `x`/`y` as the box CENTRE in pixels. Boxes already
+        expressed in 0-1 (some VLM blocks do) are passed through.
+        """
+        w = float((size or (0, 0))[0]) or 0.0
+        h = float((size or (0, 0))[1]) or 0.0
+        out = []
+        for p in preds or []:
+            try:
+                conf = float(p.get("confidence", p.get("score", 1.0)))
+            except (TypeError, ValueError):
+                conf = 1.0
+            if conf < min_conf:
+                continue
+            try:
+                px = float(p.get("x"))
+                py = float(p.get("y"))
+            except (TypeError, ValueError):
+                continue
+            pw = float(p.get("width", 0) or 0)
+            ph = float(p.get("height", 0) or 0)
+            if w > 0 and h > 0 and (px > 1.0 or py > 1.0):
+                px, py, pw, ph = px / w, py / h, pw / w, ph / h
+            if not (0.0 <= px <= 1.0 and 0.0 <= py <= 1.0):
+                continue
+            label = str(p.get("class", p.get("class_name", "")) or "")
+            out.append((px, py, max(0.0, pw), max(0.0, ph), conf, label))
+        out.sort(key=lambda t: -t[4])
+        return out
+
+    # ── per-shape solving ───────────────────────────────────────────────
+
+    async def _detect(self, image: bytes, question: str, timeout: float,
+                      classes: Optional[List[str]] = None):
+        """Run the workflow and return (points, texts, raw)."""
+        img = shrink_image(image)
+        size = image_size(img) or (0, 0)
+        data = await self._run(img, question, timeout, classes)
+        if data is None:
+            return None, None, None
+        preds, texts = self.read_response(data)
+        return self.predictions_to_points(preds, size), texts, data
+
+    async def _solve_tiles(self, prompt: str, images: List[bytes],
+                           examples: List[bytes],
+                           timeout: float) -> Optional[dict]:
+        """Grid rounds: one detection call per tile, in reading order.
+
+        A tile counts as a match when the workflow returns at least one
+        prediction on it (or answers the question with "yes").
+        """
+        question = tile_yes_question(prompt, has_ref=bool(examples))
+        classes = detection_classes(prompt)
+        per = min(_TILE_TIMEOUT, max(8.0, timeout))
+        hits: List[int] = []
         answered = 0
         for i, raw in enumerate(images, 1):
-            tile = shrink_image(raw)
-            bundle = [b for b in ((ref, tile) if ref else (tile,)) if b]
-            content = await self._chat(
-                system, q, bundle, per, want_json=False, num_predict=16)
-            if content is None:
-                self._log(f"[Ollama] tile {i}/{len(images)} -> error",
+            points, texts, data = await self._detect(raw, question, per,
+                                                     classes)
+            if data is None:
+                self._log(f"[Vision] tile {i}/{len(images)} -> error",
                           level="debug")
                 continue
             answered += 1
-            yn = parse_yesno(content)
-            self._log(f"[Ollama] tile {i}/{len(images)} -> "
-                      f"{content[:40]!r} yes={yn}", level="debug")
-            if yn is True:
+            hit = bool(points)
+            if not hit and texts:
+                yn = parse_yesno(" ".join(texts))
+                hit = yn is True
+            self._log(f"[Vision] tile {i}/{len(images)} -> "
+                      f"{len(points or [])} detection(s) hit={hit}",
+                      level="debug")
+            if hit:
                 hits.append(i)
         if answered == 0:
             return None
-        self._log(f"[Ollama] SmolVLM2 per-tile yes: {hits} "
+        self._log(f"[Vision] grid detections: {hits} "
                   f"({answered}/{len(images)} answered)")
         return {"type": "tiles", "indices": hits}
 
     async def solve(self, prompt: str, images: List[bytes],
                     shape: str = "tiles", examples: Optional[List[bytes]] = None,
-                    timeout: float = OLLAMA_TIMEOUT) -> Optional[dict]:
-        """Ask the model to answer an hCaptcha round.
+                    timeout: float = ROBOFLOW_TIMEOUT) -> Optional[dict]:
+        """Ask the Roboflow/Gemini workflow to answer an hCaptcha round.
 
         ``images`` are the answer surfaces as PNG/JPEG bytes. For
         shape="tiles" they are the grid tiles in reading order (tile 1 =
         top-left); for "points"/"bbox"/"drag" it is the ONE big challenge
         canvas; for "choice" the reference image(s). ``examples`` are the
-        prompt-header reference images (the "item shown"): they are
-        PREPENDED to the message and the text explains which is which.
-
-        SmolVLM2 (the default) answers tile grids one image at a time.
-        Larger VLMs still get one multi-image JSON call.
+        prompt-header reference images (the "item shown").
 
         Returns, by shape:
 
@@ -540,83 +676,109 @@ class OllamaVisionClient:
           drag      {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1)
           choice    {"type": "choice", "index": 2}                 (1-based)
           count     {"type": "count",  "count": 3}
-          pattern   {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1;
-                    candidate centre -> empty-cell centre)
+          pattern   {"type": "drag",   "from": (x,y), "to": (x,y)} (0-1)
           stack     {"type": "drags",  "drags": [(sx, sy, tx, ty), ...]}
-                    (0-100 percent coords; Arkose block-stacking plan)
           text      {"type": "text",   "text": "abc123"}
-          None      model unreachable or answer unparseable
+          None      workflow unreachable or answer unusable
         """
         if not self.configured:
-            self._log("[Ollama] No vision API base configured (set VISION_API_BASE or OLLAMA_BASE)", level="error")
+            self._log("[Vision] Roboflow not configured — set API_KEY "
+                      "(and ROBOFLOW_WORKSPACE / ROBOFLOW_WORKFLOW)",
+                      level="error")
             return None
         if not images:
             return None
         import time
-        tiny = is_tiny_vlm(self.model)
         self._log(f"{time.strftime('%b %d %H:%M:%S.000 [info]')} "
-                  f"solving with si vision ({self.model}"
-                  f"{', per-tile' if tiny and shape == 'tiles' else ''})")
+                  f"solving with roboflow {self.model} "
+                  f"({self.workspace}/{self.workflow}, shape={shape})")
         self.stats["calls"] += 1
         examples = list(examples or [])
-        if tiny and shape == "tiles" and len(images) >= 2:
-            got = await self._solve_tiles_smol(prompt, images, examples, timeout)
+
+        if shape == "tiles" and len(images) >= 2:
+            got = await self._solve_tiles(prompt, images, examples, timeout)
             if got is not None:
                 self.stats["ok"] += 1
                 return got
             self.stats["failed"] += 1
             return None
-        if tiny:
-            system = _SMOL_SYSTEM.get(shape, _SMOL_SYSTEM["tiles"])
-            imgs = [shrink_image(b) for b in list(examples) + list(images)]
-            if examples:
-                content = (f"First {len(examples)} image(s) are the example. "
-                           f"Then the answer image. Task: {prompt}")
-            else:
-                content = prompt
-            # format:json hangs or empties 256M models — parse loosely.
-            want_json = False
-            npred = 48
-        else:
-            system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)
-            imgs = list(examples) + list(images)
-            if examples:
-                content = (
-                    f"REFERENCE IMAGES: the first {len(examples)} image(s) come "
-                    "from the challenge header and SHOW WHAT TO LOOK FOR — they "
-                    "are examples, NOT answer choices.\n"
-                    f"ANSWER SURFACES: the remaining {len(images)} image(s) are "
-                    "what you answer on (tiles in reading order, or the big "
-                    "canvas).\n"
-                    f"CHALLENGE TASK: {prompt}\n\n"
-                    "Answer with the JSON object only.")
-            else:
-                content = (f"CHALLENGE TASK: {prompt}\n\n"
-                           f"There are {len(images)} image(s). "
-                           "Answer with the JSON object only.")
-            want_json = True
-            npred = 256
-        content_out = await self._chat(
-            system, content, imgs, timeout,
-            want_json=want_json, num_predict=npred)
-        if content_out is None:
+
+        question = self.shape_question(prompt, shape)
+        points, texts, data = await self._detect(images[0], question, timeout)
+        if data is None:
             self.stats["failed"] += 1
             return None
-        if not content_out:
-            self._log("[Ollama] Empty response from model", level="warn")
-            self.stats["failed"] += 1
-            return None
-        parse_shape = "drag" if shape in ("pattern", "tower") else shape
-        parsed = self._parse_geometry(content_out, parse_shape, len(images))
-        if parsed is None and shape in ("tiles", "text", "count", "stack"):
-            parsed = self._parse_answer(content_out, len(images), shape)
+
+        parsed = self.detections_to_answer(points, shape, len(images))
+        if parsed is None and texts:
+            blob = "\n".join(texts)
+            parse_shape = "drag" if shape in ("pattern", "tower") else shape
+            parsed = self._parse_geometry(blob, parse_shape, len(images))
+            if parsed is None and shape in ("tiles", "text", "count", "stack"):
+                parsed = self._parse_answer(blob, len(images), shape)
         if parsed is None:
-            self._log(f"[Ollama] Unparseable model answer: {content_out[:160]}",
-                      level="warn")
+            self._log(f"[Vision] No usable answer for shape={shape} "
+                      f"({len(points or [])} detections, "
+                      f"{len(texts or [])} text field(s))", level="warn")
             self.stats["failed"] += 1
             return None
         self.stats["ok"] += 1
         return parsed
+
+    @staticmethod
+    def shape_question(prompt: str, shape: str) -> str:
+        """The question sent with the image, tuned per answer shape."""
+        p = (prompt or "").strip()
+        if shape == "count":
+            return (f"{p} Count every matching object and answer with the "
+                    'JSON object {"count": N}.')
+        if shape == "bbox":
+            return (f"{p} Return one tight bounding box around the target.")
+        if shape in ("drag", "pattern"):
+            return (f"{p} Detect the loose draggable piece and the empty "
+                    "slot it belongs in.")
+        if shape == "tower":
+            return (f"{p} Detect the loose block segment with the Move badge "
+                    "and the incomplete tower it must be dropped on.")
+        if shape == "stack":
+            return (f"{p} Detect every loose block and every stack top, and "
+                    'answer with {"drags": [[sx, sy, tx, ty], ...]} in '
+                    "0-100 percent coordinates.")
+        if shape == "choice":
+            return (f"{p} Answer with the JSON object "
+                    '{"choice": N} using the 1-based option number.')
+        if shape == "text":
+            return f"{p} Read the characters and answer with the text only."
+        return p
+
+    @staticmethod
+    def detections_to_answer(points, shape: str, image_count: int = 1):
+        """Map normalised detections onto the answer shape."""
+        pts = list(points or [])
+        if not pts:
+            return None
+        if shape == "points":
+            return {"type": "points", "points": [(p[0], p[1]) for p in pts[:4]]}
+        if shape == "bbox":
+            x, y, w, h = pts[0][0], pts[0][1], pts[0][2], pts[0][3]
+            if w <= 0 or h <= 0:
+                return None
+            return {"type": "bbox", "bbox": {
+                "x1": max(0.0, x - w / 2), "y1": max(0.0, y - h / 2),
+                "x2": min(1.0, x + w / 2), "y2": min(1.0, y + h / 2)}}
+        if shape in ("drag", "pattern", "tower"):
+            if len(pts) < 2:
+                return None
+            # Highest-confidence detection is the piece; the next one is
+            # the destination slot / stack.
+            src, dst = pts[0], pts[1]
+            return {"type": "drag", "from": (src[0], src[1]),
+                    "to": (dst[0], dst[1])}
+        if shape == "count":
+            return {"type": "count", "count": len(pts)}
+        if shape == "tiles":
+            return {"type": "tiles", "indices": [1]} if image_count == 1 else None
+        return None
 
     # ── geometry answer parsing (points / bbox / drag / choice) ──────────
 
@@ -677,13 +839,13 @@ class OllamaVisionClient:
         if isinstance(p, dict):
             for kx, ky in (("x", "y"), ("cx", "cy"), ("left", "top")):
                 if kx in p and ky in p:
-                    a, b = OllamaVisionClient._num(p[kx]), \
-                        OllamaVisionClient._num(p[ky])
+                    a, b = RoboflowVisionClient._num(p[kx]), \
+                        RoboflowVisionClient._num(p[ky])
                     if a is not None and b is not None:
                         return (a, b)
             return None
         if isinstance(p, (list, tuple)) and len(p) >= 2:
-            a, b = OllamaVisionClient._num(p[0]), OllamaVisionClient._num(p[1])
+            a, b = RoboflowVisionClient._num(p[0]), RoboflowVisionClient._num(p[1])
             if a is not None and b is not None:
                 return (a, b)
         return None
@@ -696,17 +858,17 @@ class OllamaVisionClient:
         points/point/clicks/coordinates, bbox/box/bounding_box (dict or
         4-list), drag/drags/path or a bare from/to pair, choice/option/
         answer_index, tiles/indices."""
-        obj = OllamaVisionClient._loads_repaired(content)
+        obj = RoboflowVisionClient._loads_repaired(content)
         if obj is None:
             return None
-        num = OllamaVisionClient._num
-        pt = OllamaVisionClient._point
+        num = RoboflowVisionClient._num
+        pt = RoboflowVisionClient._point
 
         # Stacking plans (FunCAPTCHA/Arkose "make every column equal"): the
         # generic branches below would squash a multi-drag {"drags": [...]}
         # into one drag / a points pair, so parse the FULL plan first.
         if shape == "stack":
-            return OllamaVisionClient._parse_stack_geometry(obj)
+            return RoboflowVisionClient._parse_stack_geometry(obj)
 
         # bare top-level atoms
         if isinstance(obj, (int, float)) and not isinstance(obj, bool):
@@ -833,9 +995,9 @@ class OllamaVisionClient:
                     raw = v
                     break
                 if isinstance(v, dict):
-                    f = OllamaVisionClient._point(
+                    f = RoboflowVisionClient._point(
                         v.get("from") or v.get("start"))
-                    t = OllamaVisionClient._point(
+                    t = RoboflowVisionClient._point(
                         v.get("to") or v.get("end"))
                     if f and t:
                         raw = [list(f) + list(t)]
@@ -847,10 +1009,10 @@ class OllamaVisionClient:
         drags = []
         for item in raw:
             if isinstance(item, dict):
-                f = OllamaVisionClient._point(
+                f = RoboflowVisionClient._point(
                     item.get("from") or item.get("start")
                     or item.get("grab") or item.get("pick"))
-                t = OllamaVisionClient._point(
+                t = RoboflowVisionClient._point(
                     item.get("to") or item.get("end")
                     or item.get("drop") or item.get("target"))
                 if f is None or t is None:
@@ -961,7 +1123,7 @@ class OllamaVisionClient:
         # BEFORE the text fallback — "1 3 5" is a 5-char line with no
         # brackets and used to be misread as a text challenge.
         if shape == "tiles":
-            loose = OllamaVisionClient._parse_loose_tiles(text, tile_count)
+            loose = RoboflowVisionClient._parse_loose_tiles(text, tile_count)
             if loose is not None:
                 return loose
 
@@ -1010,25 +1172,22 @@ class OllamaVisionClient:
 
 
 async def _self_test() -> None:
-    """Quick smoke test against a running Ollama server."""
-    client = OllamaVisionClient()
+    """Quick smoke test against the Roboflow workflow."""
+    client = RoboflowVisionClient(log=lambda m, level="info": print(m, flush=True))
     ok, models = await client.check()
-    print(f"server ok={ok} models={models}")
-    if not ok or client.model not in models:
-        print(f"model {client.model} not pulled — run: ollama pull {client.model}")
+    print(f"workflow ok={ok} model={models}")
+    if not ok:
+        print("Set API_KEY (Roboflow) and, if needed, ROBOFLOW_WORKSPACE / "
+              "ROBOFLOW_WORKFLOW.")
         return
-    # Two solid-color tiles: ask which one is red (image 2 should win).
+
     def _solid(rgb: tuple) -> bytes:
-        from io import BytesIO
-        import struct
-        w = h = 64
-        raw = b"".join(bytes(rgb) * w for _ in range(h))
-        def _chunk(tag: bytes, data: bytes) -> bytes:
-            return tag + struct.pack(">I", len(data)) + data + struct.pack(">I", 0)
-        return (b"\x89PNG\r\n\x1a\n"
-                + _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                + _chunk(b"IDAT", __import__("zlib").compress(raw))
-                + _chunk(b"IEND", b""))
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (96, 96), rgb).save(buf, format="JPEG")
+        return buf.getvalue()
+
     ans = await client.solve(
         "Select all images that are red.",
         [_solid((30, 90, 200)), _solid((200, 30, 30))])

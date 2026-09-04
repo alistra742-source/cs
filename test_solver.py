@@ -22,12 +22,8 @@ NO browser, NO network, NO model server. Covers:
     resolver for "complete the pattern" rounds);
   * pointer trajectories (no teleport hops, never straight line,
     accelerate-then-decelerate);
-  * scoring the trained offline models on HELD-OUT rounds (hybrid
-    real-photo + procedural) and on never-trained REAL photographs
-    (data_real/val); skipped when models/ weights are absent — train with
-    train_models.py.
-
-Expected: 109 collected (101 passed + 8 skipped when the models are not trained yet).
+  * the Roboflow vision client: request shape (image + question), the
+    detection->answer mapping, and the per-tile grid path.
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -42,28 +38,14 @@ import unittest
 import hcaptcha_types as hct
 import human_mouse as hm
 from vision_solver import (
-    OllamaVisionClient,
-    is_tiny_vlm,
+    RoboflowVisionClient,
+    detection_classes,
     parse_yesno,
     shrink_image,
     tile_yes_question,
 )
 
-MODELS_DIR = os.environ.get(
-    "SOLVER_MODELS_DIR", os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), "models"))
-
-try:
-    from tile_classifier import TileClassifier, PointLocator, DragLocator
-    _TC = TileClassifier(MODELS_DIR)
-    _PL = PointLocator(MODELS_DIR)
-    _DL = DragLocator(MODELS_DIR)
-    MODELS_OK = _TC.available and _PL.available and _DL.available
-except Exception:
-    _TC = _PL = _DL = None
-    MODELS_OK = False
-
-GEO = OllamaVisionClient._parse_geometry     # shorthand
+GEO = RoboflowVisionClient._parse_geometry     # shorthand
 
 
 # ── routing: /getcaptcha payload tier ────────────────────────────────────
@@ -536,7 +518,7 @@ class TestParseGeometry(unittest.TestCase):
         self.assertEqual(GEO("3", "count", 1),
                          {"type": "count", "count": 3})
         self.assertEqual(
-            OllamaVisionClient._parse_answer("The answer is 5", 1, "count"),
+            RoboflowVisionClient._parse_answer("The answer is 5", 1, "count"),
             {"type": "count", "count": 5})
         # ...while bare ints stay CHOICE answers when the shape says so
         self.assertEqual(GEO("3", "choice", 1),
@@ -593,7 +575,7 @@ class TestParseGeometry(unittest.TestCase):
                          {"type": "points", "points": [(0.12, 0.88)]})
 
     def test_parse_loose_tile_numbers(self):
-        pa = OllamaVisionClient._parse_answer
+        pa = RoboflowVisionClient._parse_answer
         self.assertEqual(pa("1 3 5", 9, "tiles"),
                          {"type": "tiles", "indices": [1, 3, 5]})
         self.assertEqual(pa("tiles 1, 3 and 5", 9, "tiles"),
@@ -605,18 +587,19 @@ class TestParseGeometry(unittest.TestCase):
                          {"type": "count", "count": 1})
 
 
-# ── SmolVLM2-256M helpers (the model this stack actually runs) ────────────
+# ── Roboflow request/response plumbing ───────────────────────────────────
 
 
-class TestSmolVlmHelpers(unittest.TestCase):
+class TestRoboflowHelpers(unittest.TestCase):
 
-    def test_is_tiny_vlm(self):
-        self.assertTrue(is_tiny_vlm("ahmadwaqar/smolvlm2-256m-video:q8_0"))
-        self.assertTrue(is_tiny_vlm("SmolVLM2-256M"))
-        self.assertTrue(is_tiny_vlm("smol-vlm"))
-        self.assertFalse(is_tiny_vlm("qwen3-vl:2b"))
-        self.assertFalse(is_tiny_vlm("llama3.2-vision:11b"))
-        self.assertFalse(is_tiny_vlm(""))
+    def test_detection_classes_includes_noun_and_question(self):
+        q = "Please click each image containing a boat"
+        got = detection_classes(q)
+        self.assertIn("boat", got)
+        self.assertIn(q, got)
+
+    def test_detection_classes_never_empty(self):
+        self.assertTrue(detection_classes(""))
 
     def test_parse_yesno(self):
         self.assertIs(parse_yesno("yes"), True)
@@ -638,7 +621,6 @@ class TestSmolVlmHelpers(unittest.TestCase):
         q = tile_yes_question(live)
         self.assertIn("nightstand", q.lower())
         self.assertIn("balloon", q.lower())
-        self.assertIn("yes or no", q.lower())
         self.assertNotIn(live.lower(), q.lower())
         qref = tile_yes_question(live, has_ref=True)
         self.assertIn("first image is the item", qref.lower())
@@ -646,7 +628,12 @@ class TestSmolVlmHelpers(unittest.TestCase):
     def test_tile_yes_question_generic(self):
         q = tile_yes_question("Please click each image containing a boat")
         self.assertIn("boat", q.lower())
-        self.assertIn("yes or no", q.lower())
+
+    def test_shape_question_carries_the_prompt(self):
+        sq = RoboflowVisionClient.shape_question
+        self.assertIn("how many cats", sq("How many cats", "count").lower())
+        self.assertIn("count", sq("How many cats", "count").lower())
+        self.assertEqual(sq("click the boat", "points"), "click the boat")
 
     def test_shrink_image_downscales(self):
         self.assertEqual(shrink_image(b""), b"")
@@ -664,67 +651,116 @@ class TestSmolVlmHelpers(unittest.TestCase):
         self.assertLessEqual(max(got.size), 64)
         self.assertEqual(got.format, "JPEG")
 
+    def test_read_response_finds_nested_predictions_and_text(self):
+        body = {"outputs": [{"model_predictions": {
+            "predictions": [{"x": 10, "y": 20, "width": 4, "height": 4,
+                             "confidence": 0.9, "class": "boat"}]},
+            "gemini_output": "yes"}]}
+        preds, texts = RoboflowVisionClient.read_response(body)
+        self.assertEqual(len(preds), 1)
+        self.assertIn("yes", texts)
 
-class TestSmolVlmSolve(unittest.IsolatedAsyncioTestCase):
+    def test_predictions_to_points_normalises_pixels(self):
+        pts = RoboflowVisionClient.predictions_to_points(
+            [{"x": 50, "y": 25, "width": 10, "height": 5,
+              "confidence": 0.8, "class": "boat"}], (100, 50))
+        self.assertEqual(len(pts), 1)
+        self.assertAlmostEqual(pts[0][0], 0.5)
+        self.assertAlmostEqual(pts[0][1], 0.5)
 
-    async def test_tiny_model_asks_one_tile_at_a_time(self):
-        client = OllamaVisionClient(
-            base="http://vision.invalid",
-            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
-        )
-        replies = ["yes", "no", "Yes, a bench.", "nope"]
+    def test_predictions_to_points_drops_low_confidence(self):
+        pts = RoboflowVisionClient.predictions_to_points(
+            [{"x": 5, "y": 5, "confidence": 0.01}], (10, 10))
+        self.assertEqual(pts, [])
+
+    def test_detections_to_answer_shapes(self):
+        d2a = RoboflowVisionClient.detections_to_answer
+        pts = [(0.5, 0.5, 0.2, 0.2, 0.9, "a"), (0.9, 0.1, 0.1, 0.1, 0.7, "b")]
+        self.assertEqual(d2a(pts, "points")["points"][0], (0.5, 0.5))
+        bb = d2a(pts, "bbox")["bbox"]
+        self.assertAlmostEqual(bb["x1"], 0.4)
+        self.assertAlmostEqual(bb["y2"], 0.6)
+        drag = d2a(pts, "drag")
+        self.assertEqual(drag["from"], (0.5, 0.5))
+        self.assertEqual(drag["to"], (0.9, 0.1))
+        self.assertEqual(d2a(pts, "count"), {"type": "count", "count": 2})
+        self.assertIsNone(d2a([], "points"))
+        self.assertIsNone(d2a(pts[:1], "drag"))
+
+
+class TestRoboflowSolve(unittest.IsolatedAsyncioTestCase):
+
+    def _client(self):
+        return RoboflowVisionClient(api_key="rf_test", log=lambda *a, **k: None)
+
+    async def test_grid_asks_one_tile_at_a_time(self):
+        client = self._client()
         calls = []
+        replies = [
+            [(0.5, 0.5, 0.1, 0.1, 0.9, "boat")],   # tile 1 matches
+            [],                                     # tile 2 no
+            [(0.4, 0.4, 0.1, 0.1, 0.8, "boat")],   # tile 3 matches
+            [],
+        ]
 
-        async def fake_chat(system, content, images, timeout, *,
-                            want_json, num_predict):
-            calls.append({
-                "n": len(images), "json": want_json,
-                "npred": num_predict, "q": content,
-            })
-            self.assertFalse(want_json)
-            self.assertLessEqual(len(images), 2)
-            self.assertLessEqual(num_predict, 16)
-            return replies.pop(0)
+        async def fake_detect(image, question, timeout, classes=None):
+            calls.append({"q": question, "classes": classes})
+            return replies.pop(0), [], {"ok": True}
 
-        client._chat = fake_chat
+        client._detect = fake_detect
         png = b"\x89PNG\r\n\x1a\n"
-        got = await client.solve(
-            "Find places safe for setting down the item in the reference",
-            [png, png, png, png], shape="tiles", examples=[png])
+        got = await client.solve("select boats", [png] * 4, shape="tiles")
         self.assertEqual(got, {"type": "tiles", "indices": [1, 3]})
         self.assertEqual(len(calls), 4)
-        self.assertIn("nightstand", calls[0]["q"].lower())
+        # the captcha question rides along with every image
+        self.assertIn("boat", calls[0]["q"].lower())
+        self.assertIn("boat", calls[0]["classes"])
 
-    async def test_tiny_model_all_errors_returns_none(self):
-        client = OllamaVisionClient(
-            base="http://vision.invalid",
-            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
-        )
+    async def test_grid_falls_back_to_yes_no_text(self):
+        client = self._client()
+
+        async def fake_detect(image, question, timeout, classes=None):
+            return [], ["yes"], {"ok": True}
+
+        client._detect = fake_detect
+        got = await client.solve("select boats", [b"a", b"b"], shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [1, 2]})
+
+    async def test_all_errors_returns_none(self):
+        client = self._client()
 
         async def boom(*a, **k):
-            return None
+            return None, None, None
 
-        client._chat = boom
+        client._detect = boom
         got = await client.solve("select boats", [b"a", b"b", b"c"])
         self.assertIsNone(got)
         self.assertEqual(client.stats["failed"], 1)
 
-    async def test_large_vlm_still_batches_tiles(self):
-        client = OllamaVisionClient(
-            base="http://vision.invalid", model="qwen3-vl:2b")
-        calls = []
+    async def test_point_round_uses_detection_centre(self):
+        client = self._client()
 
-        async def fake_chat(system, content, images, timeout, *,
-                            want_json, num_predict):
-            calls.append(images)
-            self.assertTrue(want_json)
-            return '{"tiles": [2, 4]}'
+        async def fake_detect(image, question, timeout, classes=None):
+            return [(0.25, 0.75, 0.1, 0.1, 0.9, "cat")], [], {"ok": True}
 
-        client._chat = fake_chat
-        got = await client.solve("select boats", [b"a", b"b", b"c", b"d"])
-        self.assertEqual(got, {"type": "tiles", "indices": [2, 4]})
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(len(calls[0]), 4)
+        client._detect = fake_detect
+        got = await client.solve("click the cat", [b"canvas"], shape="points")
+        self.assertEqual(got, {"type": "points", "points": [(0.25, 0.75)]})
+
+    async def test_text_answer_falls_back_to_json_parsing(self):
+        client = self._client()
+
+        async def fake_detect(image, question, timeout, classes=None):
+            return [], ['{"count": 4}'], {"ok": True}
+
+        client._detect = fake_detect
+        got = await client.solve("how many cats", [b"canvas"], shape="count")
+        self.assertEqual(got, {"type": "count", "count": 4})
+
+    async def test_unconfigured_client_returns_none(self):
+        client = RoboflowVisionClient(api_key="", log=lambda *a, **k: None)
+        self.assertFalse(client.configured)
+        self.assertIsNone(await client.solve("x", [b"a"]))
 
 
 # ── _denorm mapping ───────────────────────────────────────────────────────
@@ -1090,207 +1126,6 @@ class TestPointer(unittest.TestCase):
                                "no acceleration phase")
             self.assertGreater(mid_avg, end_avg * 1.5,
                                "no deceleration phase")
-
-
-# ── trained models on HELD-OUT rounds (skipped without weights) ──────────
-
-
-def _heldout_point_rounds(kind, n):
-    """n rounds of a given relational flag, seeds disjoint from training."""
-    import make_challenges as mc
-    out = []
-    i = 0
-    while len(out) < n and i < n * 6:
-        rng = random.Random("heldout|point|%d" % i)
-        img, meta = mc.make_point_round(rng, 96)
-        if meta["relational"] == (kind == "rel"):
-            out.append((img, meta))
-        i += 1
-    return out
-
-
-@unittest.skipUnless(MODELS_OK, "offline models not trained "
-                     "(run train_models.py)")
-class TestModels(unittest.TestCase):
-
-    def test_tile_classifier_accuracy(self):
-        import make_dataset as md
-        ims, want = [], []
-        for name in md.CLASSES:
-            for i in range(8):
-                rng = random.Random("heldout|tile|%s|%d" % (name, i))
-                ims.append(md.render(name, 96, rng))
-                want.append(name)
-        got = _TC.classify_many(ims)
-        ok = sum(1 for g, w in zip(got, want) if g[0] == w)
-        acc = ok / len(want)
-        print("\n  tile accuracy: %.3f (%d/%d)" % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.95)
-
-    def test_grid_rounds_end_to_end(self):
-        import make_challenges as mc
-        exact = 0
-        total = 60
-        for i in range(total):
-            rng = random.Random("heldout|grid|%d" % i)
-            grid, meta = mc.make_grid_round(rng, 96)
-            tiles = [grid.crop((x, y, x + w, y + h))
-                     for (x, y, w, h) in meta["tile_boxes"]]
-            labels = [g[0] for g in _TC.classify_many(tiles)]
-            ex_label = None
-            if meta.get("reference_image") is not None:
-                eg = _TC.classify_many([meta["reference_image"]])
-                if eg:
-                    ex_label = eg[0][0]
-            idx = hct.resolve_semantic(meta["prompt"], labels,
-                                       example_label=ex_label)
-            if idx is not None and sorted(idx) == sorted(meta["correct"]):
-                exact += 1
-        print("\n  grid rounds exact: %d/%d" % (exact, total))
-        self.assertGreaterEqual(exact, 45)
-
-    def test_point_named_targets(self):
-        rounds = _heldout_point_rounds("named", 100)
-        hits = 0
-        for img, meta in rounds:
-            got = _PL.locate(img, meta["target"])
-            if not got:
-                continue
-            err = math.hypot(got[0] - meta["x"], got[1] - meta["y"])
-            if err <= 0.10:
-                hits += 1
-        rate = hits / len(rounds)
-        print("\n  named point hit@10%%: %.3f (%d/%d)"
-              % (rate, hits, len(rounds)))
-        self.assertGreaterEqual(rate, 0.65)
-
-    def test_point_relational(self):
-        rounds = _heldout_point_rounds("rel", 100)
-        right_class = 0
-        clicks = 0
-        for img, meta in rounds:
-            got = _PL.locate_relational(img, meta["prompt"], verifier=_TC)
-            if not got:
-                continue
-            if got[2] == meta["target"]:
-                right_class += 1
-            err = math.hypot(got[0] - meta["x"], got[1] - meta["y"])
-            if err <= 0.10:
-                clicks += 1
-        n = len(rounds)
-        print("\n  relational point: right class %d/%d, click %d/%d"
-              % (right_class, n, clicks, n))
-        self.assertGreaterEqual(right_class, 40)
-        self.assertGreaterEqual(clicks, 45)
-
-    def test_drag_both_ends(self):
-        import make_challenges as mc
-        both = 0
-        total = 60
-        for i in range(total):
-            rng = random.Random("heldout|drag|%d" % i)
-            img, meta = mc.make_drag_round(rng, 96)
-            got = _DL.locate(img)
-            if not got:
-                continue
-            ef = math.hypot(got["from"][0] - meta["fx"],
-                            got["from"][1] - meta["fy"])
-            et = math.hypot(got["to"][0] - meta["tx"],
-                            got["to"][1] - meta["ty"])
-            if ef <= 0.10 and et <= 0.10:
-                both += 1
-        print("\n  drag both-ends hit@10%%: %d/%d" % (both, total))
-        self.assertGreaterEqual(both, 55)
-
-    def test_count_rounds_offline(self):
-        import make_challenges as mc
-        exact = gated = total = 0
-        for i in range(60):
-            rng = random.Random("heldout|count|%d" % i)
-            img, meta = mc.make_count_round(rng, 96)
-            got = _PL.count(img, meta["target"])
-            total += 1
-            if got is None:
-                gated += 1
-            elif got == meta["count"]:
-                exact += 1
-        print("\n  offline count exact: %d/%d (%d self-gated to vision)"
-              % (exact, total, gated))
-        self.assertGreaterEqual(exact, 40)
-
-    def test_pattern_rounds_offline(self):
-        """Pattern completion end-to-end without a browser: crop the grid
-        cells and candidates from the generated round, classify them with
-        the tile CNN, and resolve the Latin square — the exact path
-        _solve_pattern_round takes when the DOM probe succeeds."""
-        import make_challenges as mc
-        import numpy as np
-        from PIL import Image as PILImage
-        solved = gated = total = 0
-        for i in range(60):
-            rng = random.Random("heldout|pattern|%d" % i)
-            img, meta = mc.make_pattern_round(rng, 96)
-            W, H = img.size
-            total += 1
-            # hole = brightest cell (same heuristic as the server: the
-            # empty cell is near-white; painted tiles are darker)
-            means = []
-            for b in meta["cell_boxes"]:
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                means.append(float(np.asarray(
-                    img.crop((x0, y0, x1, y1)).convert("L")).mean()))
-            hole = int(np.argmax(means))
-            grid = [None] * 9
-            confs = []
-            for i2, b in enumerate(meta["cell_boxes"]):
-                if i2 == hole:
-                    continue
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
-                grid[i2] = g[0]
-                confs.append(g[1])
-            clab, cconf = [], []
-            for b in meta["candidate_boxes"]:
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
-                clab.append(g[0])
-                cconf.append(g[1])
-            win = hct.resolve_pattern(grid, hole, clab)
-            if win is None:
-                gated += 1
-            elif win == meta["correct"]:
-                solved += 1
-        print("\n  offline pattern solved: %d/%d (%d gated to vision)"
-              % (solved, total, gated))
-        self.assertGreaterEqual(solved, 35)
-
-    def test_real_photo_tiles(self):
-        """Held-out REAL photographs (data_real/val/) the trainer never saw —
-        the honest synthetic->real transfer check. Labels come from the
-        image-search query itself, so label noise is expected; the gate is a
-        regression floor, the printed number is the honest metric (see
-        SOLVER.md for the corpus and the measured transfer)."""
-        import realdata
-        from PIL import Image
-        val = os.path.join(realdata.REAL_DIR, "val")
-        if not os.path.isdir(val):
-            self.skipTest("no real corpus (run: python realdata.py organize)")
-        ims, want = [], []
-        for name in sorted(os.listdir(val)):
-            for f in sorted(glob.glob(os.path.join(val, name, "*.jpg"))):
-                ims.append(Image.open(f).convert("RGB"))
-                want.append(name)
-        if not ims:
-            self.skipTest("empty real val corpus")
-        got = _TC.classify_many(ims)
-        ok = sum(1 for g, w in zip(got, want) if g and g[0] == w)
-        acc = ok / len(want)
-        print("\n  REAL-photo tile accuracy: %.3f (%d/%d)"
-              % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.45)
 
 
 # live browser pointer helpers + trainer ingest
