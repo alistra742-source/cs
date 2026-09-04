@@ -2476,6 +2476,7 @@ class DiscordAutomation:
         max_reloads = 0 if LOW_MEMORY_MODE else 2
         _render_wait_start = time.time()
         self._log(f"[Nav] Waiting for registration form to render (no timeout - reloads<={max_reloads}, reload_after={reload_after:.0f}s)...")
+        last_probe = ""          # last page probe result (see the poll below)
         blank_since = None       # when the page first looked blank
         challenge_since = None   # when a Cloudflare challenge first appeared
         reload_count = 0         # reloads attempted for a blank/hung SPA
@@ -2534,6 +2535,7 @@ class DiscordAutomation:
                 if elapsed >= last_log + 3.0:
                     last_log = elapsed
                     probe = "(no probe)"
+                    last_probe = probe
                     try:
                         probe = await asyncio.wait_for(self._page.evaluate(
                             """() => {
@@ -2549,12 +2551,15 @@ class DiscordAutomation:
                         ), timeout=2.0)
                     except Exception as _pe:
                         probe = f"probe-failed: {type(_pe).__name__}: {_pe}"
+                    last_probe = probe
                     self._log(f"[Nav] Page unreadable ({int(elapsed)}s, {dead_reads}x in a row) - probe: {probe}")
                 # A dead CDP session can never recover on this page object;
                 # is_closed() may still say False, so match the protocol
                 # error directly instead of burning 20 reads on a corpse.
-                if "session with given id not found" in str(probe).lower() \
-                        or "target closed" in str(probe).lower():
+                # NOTE: last_probe persists across iterations — `probe` only
+                # exists inside the throttled logging block above.
+                if "session with given id not found" in str(last_probe).lower() \
+                        or "target closed" in str(last_probe).lower():
                     self._nav_error = ("CDP session dead - rebuilding "
                                        "browser context")
                     self._log("[Nav] CDP session is dead - rebuilding the "
@@ -3510,12 +3515,37 @@ class DiscordAutomation:
         frame = await self._hcaptcha_frame_for(iframe)
         if frame is None:
             return ""
+        # Read only VISIBLE error UI. The old version scanned the whole
+        # body innerText, which on the checkbox iframe includes hCaptcha's
+        # inline hsw script blob (`/* { "version": "1", "hash": ... }`).
+        # A keyword buried in that payload looked like an error banner and
+        # killed a perfectly healthy widget before it could be solved.
         try:
-            text = await frame.evaluate(
-                "() => (document.body ? document.body.innerText : '')")
+            text = await frame.evaluate(r"""() => {
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) return false;
+                    const cs = getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none'
+                        && parseFloat(cs.opacity || '1') > 0.05;
+                };
+                const out = [];
+                for (const el of document.querySelectorAll(
+                        '.error, .error-text, [class*="error" i], '
+                        + '[role="alert"], .display-error, .text-error')) {
+                    if (!vis(el)) continue;
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t && t.length <= 200) out.push(t);
+                }
+                return out.join(' | ');
+            }""")
         except Exception:
             return ""
         low = (text or "").lower()
+        # Script/JSON payloads are never error banners.
+        if "\"hash\"" in low or "/*" in low or len(low) > 300:
+            return ""
         for kw in ("rate limited or network error", "rate limited",
                    "network error", "please retry", "please try again",
                    "automated queries"):
