@@ -96,6 +96,11 @@ class TestWorkflowCheck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_check_error, "rate_limit")
         self.assertEqual(result, (False, []))
 
+    async def test_429_is_rate_limit(self):
+        client, result, _ = await self._check(_FakeResponse(429, "slow down"))
+        self.assertEqual(result, (False, []))
+        self.assertEqual(client.last_check_error, "rate_limit")
+
     async def test_timeout_is_transient(self):
         client = self._client()
 

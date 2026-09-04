@@ -82,8 +82,7 @@ The prompt tier also understands the **select-all** wording variants
 ("select/choose/pick/check/mark all the images/tiles with…"), the
 **attribute/material** wording variants ("select items that are primarily
 metal", "made of wood", "have fur" — resolved offline against METAL /
-WOODEN / FURRY class sets, unknown materials like plastic/glass fall
-through to the vision model), and the **drag-puzzle** wording variants
+WOODEN / FURRY class sets), and the **drag-puzzle** wording variants
 ("complete the puzzle", "missing piece", "matching outline", "empty
 space", "move the piece…"). After every answered round the solver clicks
 the enabled **Next** or **Verify** control and waits for the next
@@ -162,7 +161,7 @@ The helpers below are retained and unit-tested because the routers, the
   tables powering "click the animal who jumps the highest", "largest",
   "slowest", "coldest/hottest place". SIZE now covers **all 60 classes**
   (tools, street furniture and surfaces included — "largest tool" rounds
-  resolve offline too); TEMP carries the animal-by-habitat-warmth ranks.
+  handled here too); TEMP carries the animal-by-habitat-warmth ranks.
   `superlative_table(prompt) → (table, max|min)`.
 * `TOOL_AFFORDANCE` — drill → wood/wall/table/chair/house, hammer →
   nail/wood/wall, saw → wood/tree, wrench → bolt/bicycle/car/truck,
