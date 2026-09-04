@@ -160,13 +160,15 @@ def _similarity(a, b) -> float:
 
 # ── the solver ───────────────────────────────────────────────────────────
 
-def find_candidates(gray, max_boxes: int = 14) -> List[Box]:
+def find_candidates(gray, max_boxes: int = 14,
+                    percentile: float = 96.0,
+                    floor: float = 0.05) -> List[Box]:
     """Boxes around the distinct glyphs on the board."""
     e = _edges(gray)
-    thr = float(np.percentile(e, 96.0))
-    mask = e > max(thr, 0.05)
+    thr = float(np.percentile(e, percentile))
+    mask = e > max(thr, floor)
     h, w = gray.shape
-    boxes = _components(mask, min_px=max(30, (h * w) // 4000))
+    boxes = _components(mask, min_px=max(24, (h * w) // 6000))
     # Glyphs are compact and roughly square; drop rails and long streaks.
     out = []
     for (x0, y0, x1, y1) in boxes:
@@ -184,22 +186,37 @@ def find_candidates(gray, max_boxes: int = 14) -> List[Box]:
 
 
 def solve_shape_drag(image: bytes,
-                     piece_box: Optional[Box] = None) -> Optional[dict]:
+                     piece_box: Optional[Box] = None,
+                     log=None) -> Optional[dict]:
     """Return ``{"type": "drag", "from": (x,y), "to": (x,y)}`` normalised.
 
     ``piece_box`` is the loose piece's pixel box when the caller already
     knows it (e.g. from the Move badge). Otherwise the piece is inferred:
     hCaptcha renders it on a bright panel that sits apart from the board.
     """
+    log = log or (lambda *a, **k: None)
     gray = _to_gray(image)
     if gray is None:
+        log("[ShapeDrag] image could not be decoded")
         return None
     h, w = gray.shape
     if h < 40 or w < 40:
+        log(f"[ShapeDrag] surface too small ({w}x{h})")
         return None
     e = _edges(gray)
-    boxes = find_candidates(gray)
+    # Real hCaptcha glyphs are faint, anti-aliased and sit on a busy
+    # gradient, so one fixed threshold finds either everything or nothing.
+    # Sweep from strict to permissive and keep the first pass that yields a
+    # usable set of candidates.
+    boxes = []
+    for pct, floor in ((96.0, 0.05), (93.0, 0.035), (90.0, 0.025),
+                       (86.0, 0.015), (80.0, 0.008)):
+        boxes = find_candidates(gray, percentile=pct, floor=floor)
+        if len(boxes) >= 3:
+            log(f"[ShapeDrag] {len(boxes)} candidates at p{pct:g}")
+            break
     if len(boxes) < 2:
+        log(f"[ShapeDrag] only {len(boxes)} candidate(s) found — giving up")
         return None
 
     def sig_of(b: Box):
@@ -232,6 +249,7 @@ def solve_shape_drag(image: bytes,
 
     piece_sig = sig_of(piece_box)
     if piece_sig is None:
+        log("[ShapeDrag] piece has no readable signature")
         return None
 
     # 2. Best-matching candidate that is not the piece itself.
@@ -249,7 +267,10 @@ def solve_shape_drag(image: bytes,
         if s > best_s:
             best_b, best_s = b, s
     if best_b is None:
+        log("[ShapeDrag] no candidate matched the piece")
         return None
+    log(f"[ShapeDrag] matched piece -> candidate (score {best_s:.2f}) "
+        f"from {len(boxes)} candidates")
 
     tx = (best_b[0] + best_b[2]) * 0.5 / w
     ty = (best_b[1] + best_b[3]) * 0.5 / h

@@ -67,5 +67,43 @@ class T(unittest.TestCase):
         self.assertIsNone(shape_drag.solve_shape_drag(b""))
         self.assertIsNone(shape_drag.solve_shape_drag(b"notanimage"))
 
+class TestRobustness(unittest.TestCase):
+    """Faint, low-contrast glyphs must still yield candidates."""
+
+    def _faint_scene(self):
+        bg = Image.new("RGB", (400, 300), (128, 150, 160))
+        bg = bg.filter(ImageFilter.GaussianBlur(6))
+        d = ImageDraw.Draw(bg)
+        def g(cx, cy, p, rot, col):
+            pts = []
+            for i in range(p * 2):
+                a = rot + i * math.pi / p
+                rr = 24 if i % 2 == 0 else 10
+                pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+            d.polygon(pts, outline=col, width=2)
+        # deliberately low contrast against the background
+        for (x, y) in ((60, 110), (150, 80), (250, 120), (120, 200)):
+            g(x, y, 5, 0.3, (150, 170, 178))
+        d.rectangle((300, 40, 370, 110), fill=(210, 214, 216))
+        g(335, 75, 5, 0.0, (160, 140, 175))
+        b = io.BytesIO(); bg.save(b, format="PNG")
+        return b.getvalue()
+
+    def test_threshold_sweep_finds_faint_glyphs(self):
+        got = shape_drag.solve_shape_drag(self._faint_scene())
+        self.assertIsNotNone(got, "faint scene produced no pairing")
+        self.assertEqual(got["type"], "drag")
+
+    def test_logger_is_called(self):
+        lines = []
+        shape_drag.solve_shape_drag(self._faint_scene(),
+                                    log=lambda m, **k: lines.append(m))
+        self.assertTrue(lines, "solver must explain what it did")
+
+    def test_never_raises_on_junk(self):
+        for junk in (b"", b"xx", bytes(range(64))):
+            self.assertIsNone(shape_drag.solve_shape_drag(junk))
+
+
 if __name__=="__main__":
     unittest.main(verbosity=2)

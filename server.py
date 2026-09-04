@@ -2550,6 +2550,16 @@ class DiscordAutomation:
                     except Exception as _pe:
                         probe = f"probe-failed: {type(_pe).__name__}: {_pe}"
                     self._log(f"[Nav] Page unreadable ({int(elapsed)}s, {dead_reads}x in a row) - probe: {probe}")
+                # A dead CDP session can never recover on this page object;
+                # is_closed() may still say False, so match the protocol
+                # error directly instead of burning 20 reads on a corpse.
+                if "session with given id not found" in str(probe).lower() \
+                        or "target closed" in str(probe).lower():
+                    self._nav_error = ("CDP session dead - rebuilding "
+                                       "browser context")
+                    self._log("[Nav] CDP session is dead - rebuilding the "
+                              "browser context", level="warn")
+                    return False
                 if dead_reads >= 20:
                     self._nav_error = "page unreadable 20x in a row (white screen / tab dead) - rotating circuit"
                     self._log("[Nav] Page unreadable 20x in a row - page died, rotating circuit")
@@ -4643,16 +4653,52 @@ class DiscordAutomation:
         answer = None
         try:
             import shape_drag
-            answer = shape_drag.solve_shape_drag(shot)
+            answer = shape_drag.solve_shape_drag(shot, log=self._log)
             if answer:
                 self._log(f"[Captcha] Shape matcher paired the piece "
                           f"(confidence {answer.get('confidence')})")
+            else:
+                self._log("[Captcha] Shape matcher found no pairing",
+                          level="warn")
         except Exception as e:
-            self._log(f"[Captcha] Shape matcher unavailable: {e}",
-                      level="debug")
+            self._log(f"[Captcha] Shape matcher error: {type(e).__name__}: {e}",
+                      level="warn")
         if not answer:
+            # Tier 3 (Gemma) is a ~45s round trip that has timed out on
+            # every drag round so far, and a drag round cannot be answered
+            # by a detector at all. Skip straight to the geometric pairing
+            # rather than stalling the challenge.
             answer = await self._vision.solve(prompt, [shot], shape="drag")
+        if not answer:
+            # LAST RESORT: pair by geometry alone (piece = the glyph set
+            # apart near an edge, target = the odd one out in the cluster).
+            # Guessing a plausible drag beats leaving the round unanswered.
+            try:
+                import shape_drag
+                gray = shape_drag._to_gray(shot)
+                if gray is not None:
+                    boxes = shape_drag.find_candidates(
+                        gray, percentile=88.0, floor=0.02)
+                    pts = []
+                    gh, gw = gray.shape
+                    for (x0, y0, x1, y1) in boxes:
+                        pts.append(((x0 + x1) / 2.0 / gw,
+                                    (y0 + y1) / 2.0 / gh,
+                                    (x1 - x0) / float(gw),
+                                    (y1 - y0) / float(gh), 0.5, "glyph"))
+                    from vision_solver import pair_drag
+                    pair = pair_drag(pts)
+                    if pair:
+                        answer = {"type": "drag", "from": pair[0],
+                                  "to": pair[1]}
+                        self._log("[Captcha] Falling back to geometric "
+                                  "piece/hole pairing")
+            except Exception as e:
+                self._log(f"[Captcha] Geometric fallback failed: "
+                          f"{type(e).__name__}", level="debug")
         if not answer or answer.get("type") != "drag":
+            self._log("[Captcha] No drag answer — skipping this round "
+                      "instead of clicking blindly", level="warn")
             return False
         fx, fy = self._denorm(answer["from"], box)
         tx, ty = self._denorm(answer["to"], box)

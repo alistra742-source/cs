@@ -322,6 +322,8 @@ GEMMA_BASE = _env_url("GEMMA_BASE", "OLLAMA_BASE")
 GEMMA_MODEL = (os.environ.get("GEMMA_MODEL", "").strip() or "gemma3:4b")
 GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "45"))
 GEMMA_TILE_TIMEOUT = float(os.environ.get("GEMMA_TILE_TIMEOUT", "30"))
+# Geometry rounds (drag/points/bbox): a 4B VLM is slow and unreliable here.
+GEMMA_GEOMETRY_TIMEOUT = float(os.environ.get("GEMMA_GEOMETRY_TIMEOUT", "20"))
 GEMMA_ENABLED = (os.environ.get("GEMMA_ENABLED", "1").strip()
                  not in ("0", "false", "no", "off"))
 
@@ -1465,6 +1467,11 @@ class RoboflowVisionClient:
         system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_BY_SHAPE["tiles"])
         question = self.shape_question(prompt, shape)
         bundle = [shrink_image(b) for b in (list(examples or []) + images)]
+        # Geometry shapes are where a 4B model is weakest AND slowest — on
+        # drag rounds it has timed out every time, stalling the challenge
+        # for the full budget. Cap them hard so the round moves on.
+        if shape in ("drag", "pattern", "tower", "bbox", "points"):
+            timeout = min(timeout, GEMMA_GEOMETRY_TIMEOUT)
         text = await self._gemma_chat(system, question, bundle, timeout)
         if not text:
             return None
