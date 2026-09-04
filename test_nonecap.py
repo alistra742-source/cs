@@ -193,5 +193,64 @@ class TestKeyHandling(unittest.TestCase):
         self.assertEqual(nonecap_solver.NONECAP_TRIES, 3)
 
 
+class TestNullCredits(unittest.IsolatedAsyncioTestCase):
+    """credits_charged can be null; that must not crash or print 'None'."""
+
+    async def test_null_credits_logged_cleanly(self):
+        from nonecap_solver import NoneCapSolver
+        lines = []
+        c = NoneCapSolver(key="k", log=lambda m, **kw: lines.append(m))
+
+        async def fake_await(session, solve, deadline):
+            return await NoneCapSolver._await_token(c, session, solve,
+                                                    deadline)
+
+        solve = {"id": "s", "status": "solved", "token": "P1_" + "z" * 30,
+                 "credits_charged": None}
+        tok = await NoneCapSolver._await_token(c, None, solve, 1e18)
+        self.assertTrue(tok.startswith("P1_"))
+        self.assertTrue(any("credits n/a" in l for l in lines), lines)
+        self.assertFalse(any("None credit" in l for l in lines), lines)
+
+    async def test_integer_credits_still_counted(self):
+        from nonecap_solver import NoneCapSolver
+        c = NoneCapSolver(key="k", log=lambda *a, **k: None)
+        solve = {"id": "s", "status": "solved", "token": "P1_" + "z" * 30,
+                 "credits_charged": 3}
+        await NoneCapSolver._await_token(c, None, solve, 1e18)
+        self.assertEqual(c.credits_charged, 3)
+
+
+class TestServerWiring(unittest.TestCase):
+    """Guard the integration points that made the live run fail."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_rqdata_is_read_live_not_just_from_the_hook(self):
+        self.assertIn("_live_rqdata", self.src)
+        self.assertIn("rqdata = await self._live_rqdata()", self.src)
+
+    def test_warns_when_solving_without_rqdata(self):
+        self.assertIn("No enterprise rqdata found", self.src)
+
+    def test_token_injection_uses_the_native_react_setter(self):
+        i = self.src.find("_INJECT_TOKEN_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("getOwnPropertyDescriptor", block)
+        self.assertIn("HTMLTextAreaElement", block)
+
+    def test_token_injection_fires_the_widget_callback(self):
+        i = self.src.find("_INJECT_TOKEN_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("callback", block)
+        self.assertIn("getConfig", block)
+
+    def test_nonecap_runs_before_the_vision_probe(self):
+        a = self.src.index("_solve_with_nonecap()")
+        b = self.src.index('if not getattr(self, "_vision_ready", False)')
+        self.assertLess(a, b)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

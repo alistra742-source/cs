@@ -176,9 +176,11 @@ class NoneCapSolver:
                         solve.get("credits_charged") or 0)
                 except Exception:
                     pass
+                charged = solve.get("credits_charged")
+                charged_txt = (f"{charged} credit(s)"
+                               if charged is not None else "credits n/a")
                 self._log(f"[NoneCap] Token received "
-                          f"({len(token)} chars, "
-                          f"{solve.get('credits_charged', '?')} credit(s))")
+                          f"({len(token)} chars, {charged_txt})")
                 return token
             if status in _TERMINAL_BAD:
                 err = solve.get("error") or {}

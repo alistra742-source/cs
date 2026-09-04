@@ -4572,6 +4572,77 @@ class DiscordAutomation:
         return best;
     }"""
 
+    _RQDATA_JS = r"""() => {
+        // hCaptcha keeps the enterprise config on the widget instance. The
+        // network hook only sees rqdata if /getcaptcha fires while we are
+        // listening, so read it from the live page as well.
+        const seen = [];
+        const push = (v) => {
+            if (typeof v === 'string' && v.length > 8) seen.push(v);
+        };
+        try {
+            for (const el of document.querySelectorAll(
+                    '[data-rqdata], [data-hcaptcha-rqdata]')) {
+                push(el.getAttribute('data-rqdata'));
+                push(el.getAttribute('data-hcaptcha-rqdata'));
+            }
+        } catch (e) {}
+        // hcaptcha.getConfig / internal client registry
+        try {
+            const h = window.hcaptcha;
+            if (h) {
+                for (const k of ['getConfig', 'getWidgetConfig']) {
+                    if (typeof h[k] === 'function') {
+                        const c = h[k]();
+                        if (c) { push(c.rqdata); push(c.rqData); }
+                    }
+                }
+            }
+        } catch (e) {}
+        // Scan inline scripts for an rqdata assignment.
+        try {
+            for (const sc of document.querySelectorAll('script')) {
+                const t = sc.textContent || '';
+                if (t.length > 200000) continue;
+                const m = t.match(
+                    /rqdata["'\s:=]+([A-Za-z0-9+/=._-]{16,})/i);
+                if (m) push(m[1]);
+            }
+        } catch (e) {}
+        return seen.length ? seen[0] : '';
+    }"""
+
+    async def _live_rqdata(self) -> str:
+        """Best-effort read of the enterprise rqdata from the live page."""
+        cached = getattr(self, "_rqdata", "") or ""
+        if cached:
+            return cached
+        # 1) the /getcaptcha payload, if the response hook stored one
+        try:
+            payload = self._read_challenge_payload() or {}
+            for key in ("rqdata", "rqData", "req"):
+                val = payload.get(key)
+                if isinstance(val, str) and len(val) > 8:
+                    self._rqdata = val
+                    self._log(f"[Captcha] rqdata from challenge payload "
+                              f"({len(val)} chars)")
+                    return val
+        except Exception:
+            pass
+        # 2) the live widget config / DOM / inline scripts
+        for target in ([self._page] + list(getattr(self._page, "frames", [])
+                                           or [])):
+            try:
+                val = await target.evaluate(self._RQDATA_JS)
+            except Exception:
+                continue
+            if isinstance(val, str) and len(val) > 8:
+                self._rqdata = val
+                self._log(f"[Captcha] rqdata read from the live page "
+                          f"({len(val)} chars)")
+                return val
+        return ""
+
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
 
@@ -4607,14 +4678,28 @@ class DiscordAutomation:
         except Exception:
             page_url = "https://discord.com/register"
 
-        rqdata = getattr(self, "_rqdata", "") or ""
+        rqdata = await self._live_rqdata()
+        if not rqdata:
+            self._log("[NoneCap] No enterprise rqdata found — solving as "
+                      "plain hCaptcha (Discord binds tokens to rqdata, so "
+                      "this usually gets rejected)", level="warn")
         tries = max(1, nonecap_solver.NONECAP_TRIES)
         for attempt in range(1, tries + 1):
             if self._stopped.is_set():
                 return False
             if await self._past_captcha():
                 return True
-            self._log(f"[NoneCap] Attempt {attempt}/{tries}")
+            if attempt > 1:
+                # The challenge may have advanced; re-read rqdata so the
+                # retry is bound to the CURRENT challenge rather than
+                # repeating an identical, already-rejected request.
+                fresh = await self._live_rqdata()
+                if fresh and fresh != rqdata:
+                    self._log("[NoneCap] rqdata changed — using the fresh "
+                              "blob for this attempt")
+                    rqdata = fresh
+            self._log(f"[NoneCap] Attempt {attempt}/{tries}"
+                      + (" (enterprise)" if rqdata else " (plain)"))
             token = await self._nonecap.solve(sitekey, str(page_url),
                                               rqdata=rqdata)
             if not token:
@@ -4645,57 +4730,124 @@ class DiscordAutomation:
                   "solver", level="warn")
         return False
 
-    async def _apply_hcaptcha_token(self, token: str) -> bool:
-        """Inject a solved token and confirm the page actually advanced."""
-        try:
-            applied = await self._page.evaluate(r"""(tok) => {
-                let hit = 0;
-                // Every response field hCaptcha may have created,
-                // including the ones inside the widget's own iframes'
-                // parent document.
-                for (const sel of ['textarea[name="h-captcha-response"]',
-                                   'textarea[name="g-recaptcha-response"]',
-                                   '[name="h-captcha-response"]']) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        el.value = tok;
-                        el.innerHTML = tok;
-                        el.dispatchEvent(new Event('input',
-                            {bubbles: true}));
-                        el.dispatchEvent(new Event('change',
-                            {bubbles: true}));
-                        hit++;
+    # Setting textarea.value is not enough on a React form: React tracks
+    # the value on its own internal node property, so a plain assignment is
+    # invisible to it and the app never learns the captcha was solved. Use
+    # the native setter, then dispatch, then call hCaptcha's OWN registered
+    # callback — that is what the host page actually listens to.
+    _INJECT_TOKEN_JS = r"""(tok) => {
+        const out = {fields: 0, callbacks: 0, react: false};
+
+        const setNative = (el, value) => {
+            try {
+                const proto = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const d = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (d && d.set) { d.set.call(el, value); out.react = true; }
+                else { el.value = value; }
+            } catch (e) { el.value = value; }
+        };
+
+        const docs = [document];
+        try {
+            for (const f of Array.from(window.frames)) {
+                try { if (f.document) docs.push(f.document); } catch (e) {}
+            }
+        } catch (e) {}
+
+        for (const doc of docs) {
+            for (const sel of ['textarea[name="h-captcha-response"]',
+                               'input[name="h-captcha-response"]',
+                               'textarea[name="g-recaptcha-response"]',
+                               '[name="h-captcha-response"]']) {
+                let els = [];
+                try { els = doc.querySelectorAll(sel); } catch (e) {}
+                for (const el of els) {
+                    setNative(el, tok);
+                    try { el.innerHTML = tok; } catch (e) {}
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    out.fields++;
+                }
+            }
+        }
+
+        // hCaptcha keeps every widget's config (including the page's
+        // success callback) in its client registry. Invoking that callback
+        // is what tells the host app the captcha passed.
+        const tryCall = (fn) => {
+            if (typeof fn !== 'function') return false;
+            try { fn(tok); out.callbacks++; return true; } catch (e) {}
+            return false;
+        };
+        try {
+            const h = window.hcaptcha;
+            if (h) {
+                // Make getResponse() return our token for any later read.
+                try { h.getResponse = () => tok; } catch (e) {}
+                for (const k of ['getConfig', 'getWidgetConfig']) {
+                    if (typeof h[k] === 'function') {
+                        try {
+                            const c = h[k]();
+                            if (c) {
+                                tryCall(c.callback);
+                                tryCall(c['callback']);
+                            }
+                        } catch (e) {}
                     }
                 }
-                // Fire the widget callback so the host page's own handler
-                // runs — many forms only submit from that callback.
-                try {
-                    const cfg = window.hcaptcha && window.hcaptcha.getResponse
-                        ? window.hcaptcha : null;
-                    if (cfg && typeof cfg.getResponse === 'function') {
-                        // best effort: some builds expose the callback here
-                        const w = window.___grecaptcha_cfg
-                            || window.__hcaptcha_config;
-                        void w;
-                    }
-                } catch (e) {}
-                for (const key of ['hcaptchaCallback', 'onHcaptchaSuccess',
-                                   'captchaCallback']) {
+                // Internal registries used by the widget bundle.
+                for (const key of Object.keys(h)) {
                     try {
-                        if (typeof window[key] === 'function') {
-                            window[key](tok);
-                            hit++;
+                        const v = h[key];
+                        if (v && typeof v === 'object') {
+                            for (const kk of Object.keys(v)) {
+                                const w = v[kk];
+                                if (w && typeof w === 'object' && w.callback)
+                                    tryCall(w.callback);
+                            }
                         }
                     } catch (e) {}
                 }
-                return hit;
-            }""", token)
+            }
+        } catch (e) {}
+
+        // Callbacks named in the markup: data-callback="fnName".
+        try {
+            for (const el of document.querySelectorAll('[data-callback]')) {
+                const name = el.getAttribute('data-callback');
+                if (name && typeof window[name] === 'function')
+                    tryCall(window[name]);
+            }
+        } catch (e) {}
+        for (const key of ['hcaptchaCallback', 'onHcaptchaSuccess',
+                           'captchaCallback', 'onCaptchaResponse',
+                           'hcaptchaOnLoad']) {
+            tryCall(window[key]);
+        }
+        return out;
+    }"""
+
+    async def _apply_hcaptcha_token(self, token: str) -> bool:
+        """Inject a solved token and confirm the page actually advanced."""
+        try:
+            applied = await self._page.evaluate(self._INJECT_TOKEN_JS, token)
         except Exception as e:
             self._log(f"[NoneCap] Token injection failed: "
                       f"{type(e).__name__}", level="warn")
             return False
-        if not applied:
-            self._log("[NoneCap] No h-captcha-response field to fill",
-                      level="warn")
+        if isinstance(applied, dict):
+            self._log(f"[NoneCap] Injected: fields={applied.get('fields')} "
+                      f"callbacks={applied.get('callbacks')} "
+                      f"react={applied.get('react')}")
+            hit = int(applied.get("fields") or 0) + \
+                int(applied.get("callbacks") or 0)
+        else:
+            hit = int(applied or 0)
+        if not hit:
+            self._log("[NoneCap] Nothing accepted the token (no response "
+                      "field and no widget callback)", level="warn")
             return False
 
         # Submit and give the page a moment to accept it.
