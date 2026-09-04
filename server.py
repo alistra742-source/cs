@@ -4540,7 +4540,23 @@ class DiscordAutomation:
         shot, box = await self._challenge_surface(frame)
         if not shot or not box:
             return False
-        answer = await self._vision.solve(prompt, [shot], shape="drag")
+        # Shape-match FIRST. "Drag the icon to where it fits" is a
+        # relational geometry question, not an object-detection one: every
+        # candidate is the same kind of outlined glyph, so a detector has
+        # no class that separates them. Template matching on the glyph
+        # signature answers it directly and for free.
+        answer = None
+        try:
+            import shape_drag
+            answer = shape_drag.solve_shape_drag(shot)
+            if answer:
+                self._log(f"[Captcha] Shape matcher paired the piece "
+                          f"(confidence {answer.get('confidence')})")
+        except Exception as e:
+            self._log(f"[Captcha] Shape matcher unavailable: {e}",
+                      level="debug")
+        if not answer:
+            answer = await self._vision.solve(prompt, [shot], shape="drag")
         if not answer or answer.get("type") != "drag":
             return False
         fx, fy = self._denorm(answer["from"], box)
