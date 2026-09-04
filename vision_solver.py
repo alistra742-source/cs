@@ -80,8 +80,31 @@ from typing import Callable, List, Optional
 
 import aiohttp
 
+def _env_url(name: str, *fallbacks: str) -> str:
+    """Read a URL env var, tolerating a pasted ``NAME = value`` line.
+
+    Railway's variable editor makes it easy to paste the whole
+    ``GEMMA_BASE = http://host:11434`` line into the VALUE box, which
+    yields a string aiohttp cannot parse. Strip that prefix, surrounding
+    quotes and trailing slashes so the tier still comes up.
+    """
+    raw = ""
+    for key in (name,) + fallbacks:
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            break
+    if not raw:
+        return ""
+    # "GEMMA_BASE = http://..." / "GEMMA_BASE=http://..."
+    m = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$", raw)
+    if m and "://" in m.group(1):
+        raw = m.group(1).strip()
+    raw = raw.strip("'\"").strip()
+    return raw.rstrip("/")
+
+
 # ── Roboflow configuration ───────────────────────────────────────────────
-ROBOFLOW_API_BASE = (os.environ.get("ROBOFLOW_API_BASE", "").strip().rstrip("/")
+ROBOFLOW_API_BASE = (_env_url("ROBOFLOW_API_BASE")
                      or "https://serverless.roboflow.com")
 
 # API_KEY is the canonical name (that is what the deploy sets);
@@ -295,8 +318,7 @@ def _b64(data: bytes) -> str:
 # On Railway the ollama service MUST set OLLAMA_HOST=[::]:11434 — the
 # private network is IPv6-only and Ollama otherwise binds IPv4 loopback.
 # Empty GEMMA_BASE disables the tier entirely.
-GEMMA_BASE = (os.environ.get("GEMMA_BASE", "").strip().rstrip("/")
-              or os.environ.get("OLLAMA_BASE", "").strip().rstrip("/"))
+GEMMA_BASE = _env_url("GEMMA_BASE", "OLLAMA_BASE")
 GEMMA_MODEL = (os.environ.get("GEMMA_MODEL", "").strip() or "gemma3:4b")
 GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "90"))
 GEMMA_TILE_TIMEOUT = float(os.environ.get("GEMMA_TILE_TIMEOUT", "30"))
@@ -912,14 +934,22 @@ class RoboflowVisionClient:
         a self-hosted inference server also works.
         """
         b64 = _b64(image)
+        mid = self.rtdetr_model_id
         attempts = (
-            ("alias", f"{self.rtdetr_endpoint}?api_key={self._api_key}",
+            # Documented alias form: base64 body, key in the query string.
+            ("alias", f"{self.base}/{mid}?api_key={self._api_key}",
              {"data": b64,
               "headers": {"Content-Type":
                           "application/x-www-form-urlencoded"}}),
+            # Some accounts serve aliases under /infer/<model_id>.
+            ("infer-alias", f"{self.base}/infer/{mid}?api_key={self._api_key}",
+             {"data": b64,
+              "headers": {"Content-Type":
+                          "application/x-www-form-urlencoded"}}),
+            # Self-hosted inference servers take the JSON form.
             ("json", f"{self.base}/infer/object_detection",
              {"json": {"api_key": self._api_key,
-                       "model_id": self.rtdetr_model_id,
+                       "model_id": mid,
                        "image": {"type": "base64", "value": b64}}}),
         )
         last = ""
