@@ -633,7 +633,13 @@ class TestRoboflowHelpers(unittest.TestCase):
         sq = RoboflowVisionClient.shape_question
         self.assertIn("how many cats", sq("How many cats", "count").lower())
         self.assertIn("count", sq("How many cats", "count").lower())
-        self.assertEqual(sq("click the boat", "points"), "click the boat")
+        # The prompt is no longer passed through verbatim: hCaptcha's
+        # human "click" wording is restated as detector wording, with the
+        # target noun preserved.
+        got = sq("click the boat", "points")
+        self.assertIn("boat", got)
+        self.assertIn("Box and coordinate", got)
+        self.assertNotIn("click", got.lower())
 
     def test_shrink_image_downscales(self):
         self.assertEqual(shrink_image(b""), b"")

@@ -8,7 +8,8 @@ import base64
 import unittest
 from unittest import mock
 
-from vision_solver import RoboflowVisionClient, coco_targets
+from vision_solver import (RoboflowVisionClient, coco_targets,
+                           rewrite_question)
 
 
 class _FakeResponse:
@@ -272,6 +273,56 @@ class TestRTDetrBackup(unittest.IsolatedAsyncioTestCase):
         got = await client.solve("click each image with a boat",
                                  [b"a", b"b"], shape="tiles")
         self.assertIsNone(got)
+
+
+class TestQuestionRewriting(unittest.TestCase):
+    """hCaptcha speaks in clicks; the detector must be spoken to in boxes."""
+
+    def test_click_all_becomes_box_every(self):
+        got = rewrite_question("Please click on all the dogs", "tiles")
+        self.assertTrue(got.startswith("Box and coordinate every dog"), got)
+        self.assertNotIn("click", got.lower())
+
+    def test_drag_becomes_two_point_localisation(self):
+        got = rewrite_question("Drag the shape to where it fits", "drag")
+        self.assertTrue(got.startswith("Box and coordinate the shape"), got)
+        self.assertIn("source", got)
+        self.assertIn("destination", got)
+
+    def test_articles_are_not_left_stranded(self):
+        for q in ("Select all images containing a bus",
+                  "Click each image with a motorcycle"):
+            got = rewrite_question(q, "tiles")
+            self.assertNotIn("every a ", got)
+            self.assertNotIn("every the ", got)
+
+    def test_target_noun_survives_the_rewrite(self):
+        self.assertIn("motorcycle",
+                      rewrite_question("Click each image with a motorcycle"))
+        self.assertIn("largest animal",
+                      rewrite_question("Please click on the largest animal",
+                                       "points"))
+
+    def test_unknown_phrasing_still_gets_a_box_instruction(self):
+        got = rewrite_question("How many cats are there?", "count")
+        self.assertIn("Box", got)
+        self.assertIn("cats", got)
+        self.assertIn('"count"', got)
+
+    def test_shape_contract_is_appended(self):
+        self.assertIn("ONE tight bounding box",
+                      rewrite_question("click the boat", "bbox"))
+        self.assertIn("0-100 percent",
+                      rewrite_question("stack the blocks", "stack"))
+
+    def test_empty_prompt_is_empty(self):
+        self.assertEqual(rewrite_question("", "tiles"), "")
+
+    def test_client_uses_the_rewriter(self):
+        self.assertEqual(
+            RoboflowVisionClient.shape_question("Please click on all the dogs",
+                                                "tiles"),
+            rewrite_question("Please click on all the dogs", "tiles"))
 
 
 if __name__ == "__main__":

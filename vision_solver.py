@@ -270,6 +270,109 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+# ── question rewriting ───────────────────────────────────────────────────
+# hCaptcha speaks to humans ("Please click on all the dogs"). A detector
+# needs to be spoken to in boxes ("Box and coordinate every dog"). These
+# rules do that rewrite: they strip the human-interface verb, keep the
+# TARGET NOUN intact, and restate the task as localisation.
+#
+# Order matters — longest/most specific patterns first, so "click and drag"
+# is not eaten by the plain "click" rule.
+_VERB_REWRITES = (
+    # drag / move phrasings -> two-point localisation
+    (r"^\s*(?:please\s+)?(?:click\s+and\s+)?drag\s+(?:the|each|all|every)?\s*",
+     "Box and coordinate the "),
+    (r"^\s*(?:please\s+)?move\s+(?:the|each|all|every)?\s*",
+     "Box and coordinate the "),
+    # click / select / tap / choose / pick -> box every instance
+    (r"^\s*(?:please\s+)?click\s+(?:on\s+)?(?:each|all|every)\s+(?:of\s+the\s+)?"
+     r"(?:image[s]?\s+(?:that\s+)?(?:contain(?:ing|s)?|with|showing)\s+)?",
+     "Box and coordinate every "),
+    (r"^\s*(?:please\s+)?select\s+(?:each|all|every)\s+(?:of\s+the\s+)?"
+     r"(?:image[s]?\s+(?:that\s+)?(?:contain(?:ing|s)?|with|showing)\s+)?",
+     "Box and coordinate every "),
+    (r"^\s*(?:please\s+)?(?:click|tap|touch|press)\s+(?:on\s+)?(?:the\s+)?",
+     "Box and coordinate the "),
+    (r"^\s*(?:please\s+)?(?:select|choose|pick|mark|identify|find|locate)"
+     r"\s+(?:the\s+)?",
+     "Box and coordinate the "),
+)
+
+# Task-shape suffixes: exactly what the model must return, in coordinates.
+_SHAPE_INSTRUCTION = {
+    "tiles": ("Report a bounding box and centre coordinate for every "
+              "matching object you can see. If nothing in this image "
+              "matches, return no detections."),
+    "points": ("Report a tight bounding box and a centre coordinate for "
+               "EACH matching object. Coordinates are normalised 0.0-1.0 "
+               "fractions of the image, origin top-left."),
+    "bbox": ("Report ONE tight bounding box around the single best match, "
+             "with its centre coordinate, normalised 0.0-1.0."),
+    "drag": ("Box and coordinate TWO things: the loose draggable piece "
+             "(source) and the empty slot or gap where it fits "
+             "(destination). Give the centre of each, normalised 0.0-1.0."),
+    "pattern": ("Box and coordinate TWO things: the candidate icon that "
+                "completes the pattern (source) and the empty cell it "
+                "belongs in (destination). Centres normalised 0.0-1.0."),
+    "tower": ("Box and coordinate TWO things: the loose block segment "
+              "(source, often carrying a Move badge) and the incomplete "
+              "tower it must be dropped on (destination) — the stack that "
+              "is shorter or has a gap. Centres normalised 0.0-1.0."),
+    "stack": ("Box and coordinate every loose block and every stack top it "
+              "must go to, as {\"drags\": [[sx, sy, tx, ty], ...]} in 0-100 "
+              "percent coordinates."),
+    "count": ("Box every matching object, then answer with the JSON object "
+              "{\"count\": N} where N is how many you boxed."),
+    "choice": ("Identify the correct option and answer with the JSON object "
+               "{\"choice\": N} using the 1-based option number."),
+    "text": ("Read the characters shown and answer with the text only."),
+}
+
+
+def rewrite_question(prompt: str, shape: str = "tiles") -> str:
+    """Turn a human hCaptcha instruction into a detector instruction.
+
+    hCaptcha writes for a mouse user: *"Please click on all the dogs"*.
+    A detection model answers boxes, so it is asked instead for
+    *"Box and coordinate every dog."* The target noun is never touched —
+    only the interface verb around it — so the knowledge base and the
+    workflow's ``classes`` list still see the real object.
+
+    Examples
+    --------
+    >>> rewrite_question("Please click on all the dogs")
+    'Box and coordinate every dogs. Report a bounding box ...'
+    >>> rewrite_question("Drag the shape to where it fits", "drag")
+    'Box and coordinate the shape to where it fits. Box and coordinate TWO ...'
+    """
+    p = " ".join((prompt or "").split())
+    if not p:
+        return ""
+    body = p
+    for pattern, replacement in _VERB_REWRITES:
+        new_body, n = re.subn(pattern, replacement, body, count=1,
+                              flags=re.I)
+        if n:
+            body = new_body
+            break
+    else:
+        # No known verb: state the task explicitly rather than passing a
+        # bare noun phrase the model might answer in prose.
+        body = f"Box and coordinate the following in this image: {body}"
+
+    # Clean up articles the verb strip leaves stranded: "every the dogs"
+    # -> "every dog", "every a bus" -> "every bus".
+    body = re.sub(r"\b(every|the)\s+(?:the|a|an|all|any)\b", r"\1", body,
+                  flags=re.I)
+    body = re.sub(r"\s{2,}", " ", body)
+    body = body.rstrip(" .")
+    # Re-capitalise and re-punctuate.
+    if body:
+        body = body[0].upper() + body[1:]
+    suffix = _SHAPE_INSTRUCTION.get(shape, _SHAPE_INSTRUCTION["tiles"])
+    return f"{body}. {suffix}"
+
+
 def detection_classes(prompt: str) -> List[str]:
     """Classes to ask the object-detection workflow for.
 
@@ -975,7 +1078,17 @@ class RoboflowVisionClient:
 
     @staticmethod
     def shape_question(prompt: str, shape: str) -> str:
-        """The question sent with the image, tuned per answer shape."""
+        """The question sent with the image, tuned per answer shape.
+
+        Delegates to :func:`rewrite_question`, which restates hCaptcha's
+        human "click on ..." wording as detector wording ("box and
+        coordinate ...") and appends the per-shape output contract.
+        """
+        return rewrite_question(prompt, shape)
+
+    @staticmethod
+    def _legacy_shape_question(prompt: str, shape: str) -> str:
+        """Previous plain-passthrough phrasing, kept for reference."""
         p = (prompt or "").strip()
         if shape == "count":
             return (f"{p} Count every matching object and answer with the "
