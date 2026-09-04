@@ -4144,9 +4144,24 @@ class DiscordAutomation:
                             f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
                             "- check API_KEY / the workflow. Later challenges "
                             "will re-probe automatically.", level="error")
-                    # Do not issue several expensive /api/chat requests after
-                    # the readiness probe already proved they cannot succeed.
-                    return False
+                    # The Gemini workflow is unusable. Before giving up on
+                    # the whole round, see whether the RT-DETR backup
+                    # detector answers — it is a different endpoint on the
+                    # same host, so a broken/misconfigured workflow does
+                    # not imply the backup is down too.
+                    backup_ok = False
+                    try:
+                        backup_ok = await self._vision.check_rtdetr()
+                    except Exception:
+                        backup_ok = False
+                    if backup_ok:
+                        self._log(
+                            "[Captcha] Gemini workflow unavailable — "
+                            "falling back to the RT-DETR backup detector "
+                            f"({self._vision.rtdetr_model_id})", level="warn")
+                        self._vision_ready = True
+                    else:
+                        return False
                 else:
                     self._vision_ready = True
 

@@ -746,6 +746,19 @@ class RoboflowVisionClient:
                 self._log(f"[Vision] Workflow {self.workspace}/{self.workflow} "
                           "not found (HTTP 404) — check ROBOFLOW_WORKSPACE / "
                           "ROBOFLOW_WORKFLOW", level="error")
+            elif status == 405:
+                # The URL exists but does not accept this verb — that is a
+                # probe-shape problem, not a broken workflow. Verify with
+                # the RT-DETR backup before declaring vision dead.
+                self.last_check_error = "method"
+                self._log("[Vision] describe_interface returned HTTP 405 "
+                          "(method not allowed) — probing the backup "
+                          "detector instead", level="warn")
+                if await self.check_rtdetr():
+                    self.last_check_error = ""
+                    self._log("[Vision] RT-DETR backup is reachable — "
+                              "running in BACKUP-ONLY mode")
+                    return True, [self.rtdetr_model_id]
             elif status == 429:
                 self.last_check_error = "rate_limit"
                 self._log("[Vision] Roboflow rate limited (HTTP 429)",
@@ -774,6 +787,35 @@ class RoboflowVisionClient:
             self._log(f"[Vision] Not reachable at {url}: "
                       f"{type(e).__name__}: {e}", level="error")
             return False, []
+
+    async def check_rtdetr(self) -> bool:
+        """Is the rfdetr-small backup reachable with this API_KEY?
+
+        Uses a 1x1 PNG so the probe is cheap. Any 200 means the alias is
+        served and the key is accepted.
+        """
+        if not self._api_key:
+            return False
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+            "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+        payload = {"api_key": self._api_key,
+                   "model_id": self.rtdetr_model_id,
+                   "image": {"type": "base64", "value": _b64(png)}}
+        try:
+            timeout = aiohttp.ClientTimeout(total=RTDETR_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(self.rtdetr_endpoint, json=payload) as r:
+                    ok = r.status == 200
+                    if not ok:
+                        body = (await r.text())[:200]
+                        self._log(f"[RT-DETR] probe HTTP {r.status}: {body}",
+                                  level="warn")
+                    return ok
+        except Exception as e:
+            self._log(f"[RT-DETR] probe failed: {type(e).__name__}",
+                      level="warn")
+            return False
 
     async def _run(self, image: bytes, question: str, timeout: float,
                    classes: Optional[List[str]] = None) -> Optional[dict]:

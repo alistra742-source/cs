@@ -325,5 +325,84 @@ class TestQuestionRewriting(unittest.TestCase):
             rewrite_question("Please click on all the dogs", "tiles"))
 
 
+class TestProbe405Fallback(unittest.IsolatedAsyncioTestCase):
+    """HTTP 405 on describe_interface must not kill vision outright."""
+
+    def _client(self):
+        return RoboflowVisionClient(api_key="rf_test",
+                                    log=lambda *a, **k: None)
+
+    async def test_405_falls_back_to_backup_probe(self):
+        client = self._client()
+
+        class FakeResp:
+            status = 405
+
+            async def text(self):
+                return '{"detail":"Method Not Allowed"}'
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return FakeResp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        async def backup_up():
+            return True
+
+        client.check_rtdetr = backup_up
+        with mock.patch("aiohttp.ClientSession",
+                        return_value=FakeSession()):
+            ok, models = await client.check()
+        self.assertTrue(ok)
+        self.assertEqual(models, ["rfdetr-small"])
+        self.assertEqual(client.last_check_error, "")
+
+    async def test_405_with_backup_down_still_fails(self):
+        client = self._client()
+
+        class FakeResp:
+            status = 405
+
+            async def text(self):
+                return "nope"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class FakeSession:
+            def post(self, *a, **k):
+                return FakeResp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        async def backup_down():
+            return False
+
+        client.check_rtdetr = backup_down
+        with mock.patch("aiohttp.ClientSession",
+                        return_value=FakeSession()):
+            ok, _ = await client.check()
+        self.assertFalse(ok)
+        self.assertEqual(client.last_check_error, "method")
+
+
 if __name__ == "__main__":
     unittest.main()
