@@ -1582,6 +1582,8 @@ class DiscordAutomation:
             self._events = VisionEvents(log=self._log)
         except Exception:
             self._events = None
+        # Hosted hCaptcha solver (NoneCap). Created lazily on first use.
+        self._nonecap = None
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
@@ -4199,6 +4201,13 @@ class DiscordAutomation:
                 return False
             self._log("[Captcha] [READY] Image challenge rendered - reading prompt + tiles")
 
+            # ── NoneCap FIRST ────────────────────────────────────────────
+            # A hosted solver returns a real P1_ token, so there is nothing
+            # to click, drag or match. Try it before the local pipeline;
+            # only fall through to vision if it cannot deliver.
+            if await self._solve_with_nonecap():
+                return True
+
             # Probe the vision endpoint with RETRIES and NO permanent
             # failure cache. Hosted endpoints (Railway etc.) cold-start on
             # the first request after sleeping — one fast probe would mark
@@ -4562,6 +4571,143 @@ class DiscordAutomation:
         }
         return best;
     }"""
+
+    async def _solve_with_nonecap(self) -> bool:
+        """Clear the challenge with the hosted NoneCap solver.
+
+        Returns True only when a token was minted AND the page moved past
+        the captcha. Any failure falls through to the local vision
+        pipeline, so this is strictly additive.
+        """
+        try:
+            import nonecap_solver
+        except Exception:
+            return False
+        if not nonecap_solver.configured():
+            return False
+        if self._nonecap is None:
+            self._nonecap = nonecap_solver.NoneCapSolver(log=self._log)
+
+        # Sitekey: cached from the widget probe, else read it live.
+        sitekey = getattr(self, "_hcaptcha_sitekey", "") or ""
+        if not sitekey:
+            try:
+                sitekey = await extract_hcaptcha_sitekey(self._page) or ""
+                if sitekey:
+                    self._hcaptcha_sitekey = sitekey
+            except Exception:
+                sitekey = ""
+        if not sitekey:
+            self._log("[NoneCap] No sitekey yet — using the local solver",
+                      level="warn")
+            return False
+
+        try:
+            page_url = await self._page.evaluate("() => location.href")
+        except Exception:
+            page_url = "https://discord.com/register"
+
+        rqdata = getattr(self, "_rqdata", "") or ""
+        tries = max(1, nonecap_solver.NONECAP_TRIES)
+        for attempt in range(1, tries + 1):
+            if self._stopped.is_set():
+                return False
+            if await self._past_captcha():
+                return True
+            self._log(f"[NoneCap] Attempt {attempt}/{tries}")
+            token = await self._nonecap.solve(sitekey, str(page_url),
+                                              rqdata=rqdata)
+            if not token:
+                # Failed solves are not charged, so retrying is free.
+                if self._nonecap.last_error in ("authentication",
+                                                "insufficient credits",
+                                                "not configured"):
+                    self._log("[NoneCap] Unrecoverable — falling back to "
+                              "the local solver", level="warn")
+                    return False
+                continue
+            if await self._apply_hcaptcha_token(token):
+                self._log("[Captcha] [OK] NoneCap token accepted — "
+                          "challenge cleared")
+                if self._events is not None:
+                    self._events.report_nowait(
+                        "pass", stage="nonecap", attempt=attempt)
+                await self._nonecap.report(self._nonecap.last_solve_id, True)
+                return True
+            self._log(f"[NoneCap] Token was not accepted "
+                      f"(attempt {attempt}/{tries})", level="warn")
+            await self._nonecap.report(self._nonecap.last_solve_id, False,
+                                       "page did not advance")
+        if self._events is not None:
+            self._events.report_nowait("fail", stage="nonecap",
+                                       attempt=tries)
+        self._log("[NoneCap] Out of attempts — falling back to the local "
+                  "solver", level="warn")
+        return False
+
+    async def _apply_hcaptcha_token(self, token: str) -> bool:
+        """Inject a solved token and confirm the page actually advanced."""
+        try:
+            applied = await self._page.evaluate(r"""(tok) => {
+                let hit = 0;
+                // Every response field hCaptcha may have created,
+                // including the ones inside the widget's own iframes'
+                // parent document.
+                for (const sel of ['textarea[name="h-captcha-response"]',
+                                   'textarea[name="g-recaptcha-response"]',
+                                   '[name="h-captcha-response"]']) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        el.value = tok;
+                        el.innerHTML = tok;
+                        el.dispatchEvent(new Event('input',
+                            {bubbles: true}));
+                        el.dispatchEvent(new Event('change',
+                            {bubbles: true}));
+                        hit++;
+                    }
+                }
+                // Fire the widget callback so the host page's own handler
+                // runs — many forms only submit from that callback.
+                try {
+                    const cfg = window.hcaptcha && window.hcaptcha.getResponse
+                        ? window.hcaptcha : null;
+                    if (cfg && typeof cfg.getResponse === 'function') {
+                        // best effort: some builds expose the callback here
+                        const w = window.___grecaptcha_cfg
+                            || window.__hcaptcha_config;
+                        void w;
+                    }
+                } catch (e) {}
+                for (const key of ['hcaptchaCallback', 'onHcaptchaSuccess',
+                                   'captchaCallback']) {
+                    try {
+                        if (typeof window[key] === 'function') {
+                            window[key](tok);
+                            hit++;
+                        }
+                    } catch (e) {}
+                }
+                return hit;
+            }""", token)
+        except Exception as e:
+            self._log(f"[NoneCap] Token injection failed: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+        if not applied:
+            self._log("[NoneCap] No h-captcha-response field to fill",
+                      level="warn")
+            return False
+
+        # Submit and give the page a moment to accept it.
+        try:
+            await self._click_form_submit()
+        except Exception:
+            pass
+        for _ in range(10):
+            await asyncio.sleep(1.0)
+            if await self._past_captcha():
+                return True
+        return False
 
     async def _challenge_surface(self, frame):
         """(screenshot bytes, page-space box) of the biggest canvas/image in

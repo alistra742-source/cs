@@ -318,6 +318,43 @@ and after.
 | `RTDETR_TIMEOUT` | per-image backup timeout (seconds) | `30` |
 | `RTDETR_MIN_CONF` | minimum backup detection confidence | `0.35` |
 
+## NoneCap (hosted solver) — tried FIRST
+
+NoneCap returns a real hCaptcha token (`P1_…`, the kind that passes
+siteverify) instead of image coordinates, so there is nothing to click,
+drag or shape-match. It runs before the local vision pipeline; anything it
+cannot do falls through to the tiers below.
+
+```
+NONECAP_API = nc_live_...
+```
+
+That is the only required variable. Optional:
+
+| variable | meaning | default |
+|---|---|---|
+| `NONECAP_TRIES` | solve attempts per challenge | `3` |
+| `NONECAP_WAIT` | seconds the API holds the connection (max 90) | `90` |
+| `NONECAP_TIMEOUT` | overall ceiling per attempt, incl. polling | `180` |
+| `NONECAP_ENABLED` | set 0 to disable and use vision only | `1` |
+| `NONECAP_BASE` | API base URL | `https://api.nonecap.com` |
+
+Flow: `POST /v1/solves?wait=90` with `{type, sitekey, url}`. A token that
+lands inside the wait window comes back inline; a slower solve returns
+`202` and is polled on `GET /v1/solves/{id}`. Enterprise sitekeys are
+detected automatically — when the bot has captured an `rqdata` blob the
+request switches to `type: hcaptcha_enterprise` and includes it.
+
+The token is injected into every `h-captcha-response` field, known widget
+callbacks are fired, the form is submitted, and the page is checked for up
+to 10s. **The attempt only counts as a success if the page actually moves
+past the captcha** — a minted-but-rejected token is reported back to
+NoneCap as `rejected` and the next attempt runs. Failed solves are never
+charged.
+
+Falls through to the local solver on: no key, no sitekey, authentication
+failure, or exhausted credits.
+
 ### Drag rounds: OpenCV contour matching
 
 "Drag the icon to the place where it fits" is answered BEFORE the vision
