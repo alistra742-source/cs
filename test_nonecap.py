@@ -252,5 +252,64 @@ class TestServerWiring(unittest.TestCase):
         self.assertLess(a, b)
 
 
+class TestNoStalls(unittest.TestCase):
+    """The captcha step must never hang, whatever the page does."""
+
+    def test_live_rqdata_respects_its_budget(self):
+        """A cross-origin frame can accept evaluate() and never answer."""
+        import asyncio as aio
+        import time as _t
+        import server
+
+        class Hanging:
+            async def evaluate(self, js):
+                await aio.sleep(3600)
+
+        class Bot:
+            _RQDATA_JS = server.DiscordAutomation._RQDATA_JS
+            _rqdata = ""
+            def __init__(self):
+                self._page = Hanging()
+                self._page.frames = [Hanging() for _ in range(5)]
+            def _log(self, *a, **k):
+                pass
+            def _read_challenge_payload(self, data=None):
+                return {}
+
+        t0 = _t.time()
+        out = aio.run(
+            server.DiscordAutomation._live_rqdata(Bot(), budget=3.0))
+        self.assertEqual(out, "")
+        self.assertLess(_t.time() - t0, 9.0, "rqdata search hung")
+
+    def test_every_page_call_in_the_path_is_timed_out(self):
+        src = open("server.py").read()
+        block = src[src.index("async def _solve_with_nonecap"):
+                    src.index("async def _challenge_surface")]
+        # Check the CALL SITES (evaluate/await), not the JS definition.
+        for needle in ("extract_hcaptcha_sitekey(self._page)",
+                       'evaluate("() => location.href")',
+                       "evaluate(self._INJECT_TOKEN_JS, token)",
+                       "self._click_form_submit()"):
+            i = block.find(needle)
+            self.assertNotEqual(i, -1, f"call site missing: {needle}")
+            self.assertIn("wait_for", block[max(0, i - 220):i + 80],
+                          f"{needle} is not time-boxed")
+
+    def test_step_has_a_hard_budget(self):
+        import server
+        self.assertGreater(server.NONECAP_STEP_BUDGET, 0)
+        src = open("server.py").read()
+        self.assertIn("NONECAP_STEP_BUDGET", src)
+        i = src.index("_solve_with_nonecap(), timeout=")
+        self.assertIn("NONECAP_STEP_BUDGET", src[i:i + 80])
+
+    def test_skip_reason_is_logged(self):
+        """Silence is what made it look like NoneCap was never wired in."""
+        src = open("server.py").read()
+        self.assertIn("[NoneCap] Skipped:", src)
+        self.assertIn("[NoneCap] Starting hosted solve", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

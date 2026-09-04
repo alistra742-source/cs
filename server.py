@@ -1219,6 +1219,10 @@ NAV_TIMEOUT_MS = 30000
 # auto-resolve and get unlimited time; everything else rotates to a fresh
 # circuit once the budget is exhausted.
 RENDER_WAIT_BUDGET_S = 75.0
+# Hard ceiling for the whole hosted-solver step (3 solves +
+# injection + verification). Beyond this the local solver runs.
+NONECAP_STEP_BUDGET = float(
+    os.environ.get("NONECAP_STEP_BUDGET", "420"))
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
@@ -4205,7 +4209,19 @@ class DiscordAutomation:
             # A hosted solver returns a real P1_ token, so there is nothing
             # to click, drag or match. Try it before the local pipeline;
             # only fall through to vision if it cannot deliver.
-            if await self._solve_with_nonecap():
+            try:
+                nc_ok = await asyncio.wait_for(
+                    self._solve_with_nonecap(), timeout=NONECAP_STEP_BUDGET)
+            except asyncio.TimeoutError:
+                self._log(f"[NoneCap] Step exceeded "
+                          f"{NONECAP_STEP_BUDGET:.0f}s — falling back to the "
+                          "local solver", level="warn")
+                nc_ok = False
+            except Exception as e:
+                self._log(f"[NoneCap] Step error {type(e).__name__}: {e} — "
+                          "falling back to the local solver", level="warn")
+                nc_ok = False
+            if nc_ok:
                 return True
 
             # Probe the vision endpoint with RETRIES and NO permanent
@@ -4612,8 +4628,14 @@ class DiscordAutomation:
         return seen.length ? seen[0] : '';
     }"""
 
-    async def _live_rqdata(self) -> str:
-        """Best-effort read of the enterprise rqdata from the live page."""
+    async def _live_rqdata(self, budget: float = 8.0) -> str:
+        """Best-effort read of the enterprise rqdata from the live page.
+
+        EVERY evaluate here is individually timed out and the whole search
+        is capped by ``budget``. A cross-origin hCaptcha frame can accept
+        an evaluate and simply never answer, which previously hung the
+        entire captcha step with no log line at all.
+        """
         cached = getattr(self, "_rqdata", "") or ""
         if cached:
             return cached
@@ -4630,10 +4652,20 @@ class DiscordAutomation:
         except Exception:
             pass
         # 2) the live widget config / DOM / inline scripts
-        for target in ([self._page] + list(getattr(self._page, "frames", [])
-                                           or [])):
+        deadline = time.time() + budget
+        targets = [self._page]
+        try:
+            targets += list(getattr(self._page, "frames", []) or [])[:8]
+        except Exception:
+            pass
+        for target in targets:
+            if time.time() >= deadline:
+                self._log("[Captcha] rqdata search hit its time budget",
+                          level="debug")
+                break
             try:
-                val = await target.evaluate(self._RQDATA_JS)
+                val = await asyncio.wait_for(
+                    target.evaluate(self._RQDATA_JS), timeout=2.0)
             except Exception:
                 continue
             if isinstance(val, str) and len(val) > 8:
@@ -4652,10 +4684,20 @@ class DiscordAutomation:
         """
         try:
             import nonecap_solver
-        except Exception:
+        except Exception as e:
+            self._log(f"[NoneCap] module unavailable: {type(e).__name__}",
+                      level="warn")
             return False
         if not nonecap_solver.configured():
+            # Say WHY, once per attempt — silence here is what made the
+            # last run look like NoneCap was never wired in at all.
+            if not getattr(self, "_nonecap_warned", False):
+                self._nonecap_warned = True
+                reason = ("NONECAP_API not set" if not nonecap_solver.api_key()
+                          else "disabled via NONECAP_ENABLED")
+                self._log(f"[NoneCap] Skipped: {reason}", level="warn")
             return False
+        self._log("[NoneCap] Starting hosted solve")
         if self._nonecap is None:
             self._nonecap = nonecap_solver.NoneCapSolver(log=self._log)
 
@@ -4663,10 +4705,13 @@ class DiscordAutomation:
         sitekey = getattr(self, "_hcaptcha_sitekey", "") or ""
         if not sitekey:
             try:
-                sitekey = await extract_hcaptcha_sitekey(self._page) or ""
+                sitekey = await asyncio.wait_for(
+                    extract_hcaptcha_sitekey(self._page), timeout=10.0) or ""
                 if sitekey:
                     self._hcaptcha_sitekey = sitekey
-            except Exception:
+            except Exception as e:
+                self._log(f"[NoneCap] sitekey read failed: "
+                          f"{type(e).__name__}", level="warn")
                 sitekey = ""
         if not sitekey:
             self._log("[NoneCap] No sitekey yet — using the local solver",
@@ -4674,7 +4719,8 @@ class DiscordAutomation:
             return False
 
         try:
-            page_url = await self._page.evaluate("() => location.href")
+            page_url = await asyncio.wait_for(
+                self._page.evaluate("() => location.href"), timeout=5.0)
         except Exception:
             page_url = "https://discord.com/register"
 
@@ -4832,7 +4878,9 @@ class DiscordAutomation:
     async def _apply_hcaptcha_token(self, token: str) -> bool:
         """Inject a solved token and confirm the page actually advanced."""
         try:
-            applied = await self._page.evaluate(self._INJECT_TOKEN_JS, token)
+            applied = await asyncio.wait_for(
+                self._page.evaluate(self._INJECT_TOKEN_JS, token),
+                timeout=10.0)
         except Exception as e:
             self._log(f"[NoneCap] Token injection failed: "
                       f"{type(e).__name__}", level="warn")
@@ -4852,7 +4900,7 @@ class DiscordAutomation:
 
         # Submit and give the page a moment to accept it.
         try:
-            await self._click_form_submit()
+            await asyncio.wait_for(self._click_form_submit(), timeout=15.0)
         except Exception:
             pass
         for _ in range(10):
