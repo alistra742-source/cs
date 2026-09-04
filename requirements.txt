@@ -16,10 +16,7 @@ flask>=3.0.0
 # Email checker (MX record lookups; optional - falls back to plain DNS)
 dnspython>=2.6.0
 
-# Offline captcha solver models (optional; server falls back to the vision
-# model when these are absent). Training/tools: make_dataset.py,
-# make_challenges.py, train_models.py, tile_classifier.py.
+# Image handling for the Hugging Face vision solver (tile screenshots are
+# downscaled before they are sent to the Inference API).
 Pillow>=10.0.0
 numpy>=1.26.0
-# torch (CPU build is plenty): pip install torch --index-url \
-#     https://download.pytorch.org/whl/cpu

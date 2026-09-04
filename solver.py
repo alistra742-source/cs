@@ -15,7 +15,7 @@ Pipeline (same as the bot):
   3. wait for the image challenge to really paint (never a blank shell),
   4. read the challenge instruction ("Please select all images with a
      boat", "Please click on the two elements that are identical", ...),
-  5. screenshot every grid tile and ask the local Ollama vision model
+  5. screenshot every grid tile and ask the Hugging Face vision model
      which tiles satisfy the instruction (vision_solver.py),
   6. click those tiles (or type the answer for text challenges), click
      Verify, and poll until hCaptcha mints the token.
@@ -30,16 +30,16 @@ CLI usage:
     python solver.py <url> [--headless] [--timeout 120]
         # launch a fresh browser, navigate, solve, print JSON result
     python solver.py --check
-        # probe the Ollama backend (reachable? model pulled?)
+        # probe the Hugging Face Inference API (API_KEY valid? model up?)
     python solver.py <url> --output token.txt --screenshot shot.png
 
 Configuration (env vars, same as the bot):
 
-    VISION_API_BASE vision endpoint (default http://localhost:11434)
-    OLLAMA_BASE     legacy alias for VISION_API_BASE
-    OLLAMA_MODEL    vision model (default ahmadwaqar/smolvlm2-256m-video:q8_0)
-    OLLAMA_TIMEOUT  per-solve timeout seconds (default 30)
-    OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
+    API_KEY     Hugging Face access token (hf_...) — required
+    HF_MODEL    vision model repo id (default Qwen/Qwen2.5-VL-7B-Instruct)
+    HF_API_BASE Inference API base URL
+    HF_TIMEOUT  per-solve timeout seconds (default 60)
+    HF_TILE_TIMEOUT  per-tile yes/no timeout for small VLMs (default 20)
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from typing import Callable, List, Optional
 
 from browser_engine import async_playwright, ENGINE
 from captcha_solver import extract_hcaptcha_sitekey, read_hcaptcha_token
-from vision_solver import OllamaVisionClient
+from vision_solver import HFVisionClient
 
 # ── tiny logger ─────────────────────────────────────────────────────────
 
@@ -594,7 +594,7 @@ async def _wait_for_widget_or_challenge(page, timeout: float = 60.0,
     return ""
 
 
-async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
+async def solve_hcaptcha(page, vision: Optional[HFVisionClient] = None,
                          log: Callable = _default_log,
                          timeout: float = 90.0,
                          max_solve_attempts: int = 3) -> dict:
@@ -612,7 +612,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
     sites). ``answer`` is the vision model's structured answer
     ({"type": "tiles", "indices": [...]} or {"type": "text", "text": "..."}).
     """
-    vision = vision or OllamaVisionClient(log=log)
+    vision = vision or HFVisionClient(log=log)
     started = time.time()
     state = await _wait_for_widget_or_challenge(page, timeout=min(timeout, 60.0),
                                                 log=log)
@@ -722,7 +722,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
                 log("[Captcha] No grid tiles captured — retrying round", "warn")
                 await asyncio.sleep(2)
                 continue
-            log(f"[Captcha] Asking Ollama ({vision.model}) which tiles match...")
+            log(f"[Captcha] Asking {vision.model} which tiles match...")
             answer = await vision.solve(prompt, tiles)
             if not answer:
                 log("[Captcha] Vision solver returned no answer — retrying", "warn")
@@ -766,7 +766,7 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
 
     return {"ok": False,
             "error": "vision solver could not clear the challenge "
-                     "(check OLLAMA_BASE / OLLAMA_MODEL, see --check)",
+                     "(check API_KEY / HF_MODEL, see --check)",
             "token": "", "prompt": "", "answer": None, "tiles": 0,
             "rounds": 0, "sitekey": sitekey,
             "elapsed": round(time.time() - started, 1)}
@@ -775,37 +775,27 @@ async def solve_hcaptcha(page, vision: Optional[OllamaVisionClient] = None,
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 async def _cli_check() -> int:
-    client = OllamaVisionClient()
-    ok, models = await client.check()
-    print(f"Ollama server: {'REACHABLE' if ok else 'UNREACHABLE'} "
-          f"({client.base})")
-    if ok:
-        print(f"Models pulled: {models or '(none)'}")
-        if client.model in models:
-            print(f"Model {client.model}: PRESENT ✓")
-        else:
-            print(f"Model {client.model}: MISSING — run: ollama pull {client.model}")
-            return 1
-    else:
-        print("Fix: start Ollama (`ollama serve`) and set OLLAMA_BASE if it "
-              "is not on localhost:11434.")
+    client = HFVisionClient(log=lambda m, level="info": print(m, flush=True))
+    ok, _models = await client.check()
+    print(f"Hugging Face Inference API: {'REACHABLE' if ok else 'UNREACHABLE'} "
+          f"({client.endpoint})")
+    if not ok:
+        print("Fix: export API_KEY=hf_... (a Hugging Face token with "
+              "inference permission) and, if needed, HF_MODEL=<repo id>.")
         return 1
+    print(f"Model {client.model}: AVAILABLE ✓")
     return 0
 
 
 async def _cli_solve(url: str, headless: bool, timeout: float,
                      output: Optional[str], screenshot: Optional[str]) -> int:
     print(f"[solver] Engine: {ENGINE} | URL: {url} | headless={headless}")
-    vision = OllamaVisionClient()
-    ok, models = await vision.check()
+    vision = HFVisionClient()
+    ok, _models = await vision.check()
     if not ok:
-        print("[solver] WARNING: vision server unreachable — the solve will "
-              "fail. Start Ollama and pull a vision model "
-              "(recommended: ahmadwaqar/smolvlm2-256m-video:q8_0), "
-              "or set VISION_API_BASE.", flush=True)
-    elif vision.model not in models:
-        print(f"[solver] WARNING: model {vision.model} not pulled — "
-              f"run: ollama pull {vision.model}", flush=True)
+        print("[solver] WARNING: Hugging Face endpoint unreachable — the "
+              "solve will fail. Set API_KEY to a valid Hugging Face token "
+              "(and HF_MODEL to a vision model repo id).", flush=True)
 
     pw = await async_playwright().start()
     # `.chromium` is the engine's Playwright-compatible shim — it really
@@ -851,11 +841,11 @@ async def _cli_solve(url: str, headless: bool, timeout: float,
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="solver.py",
-        description="Standalone hCaptcha solver (Ollama vision model + "
+        description="Standalone hCaptcha solver (Hugging Face vision model + "
                     "nodriver/Chrome engine). Solves the image challenge on any page.")
     parser.add_argument("url", nargs="?", help="page URL with an hCaptcha widget")
     parser.add_argument("--check", action="store_true",
-                        help="probe the Ollama backend and exit")
+                        help="probe the Hugging Face Inference API and exit")
     parser.add_argument("--headless", action="store_true", default=True,
                         help="run the browser headless (default)")
     parser.add_argument("--headed", action="store_true",

@@ -1,45 +1,41 @@
 #!/usr/bin/env python3
-"""vision_solver.py — local/remote vision solver for the hCaptcha image grid.
+"""vision_solver.py — Hugging Face vision solver for the hCaptcha image grid.
 
-Replaces paid token APIs with a vision model you own and run. Instead of minting a token server-side, the bot:
+Every visual answer in this stack comes from a Hugging Face hosted vision
+model. There is no local "brain" checkpoint, no CNN weights and no
+self-hosted Ollama service any more: the bot
 
-  1. reads the challenge prompt ("Please select all images with a boat") from
-     the hCaptcha challenge frame,
-  2. screenshots every tile of the image grid,
-  3. sends the prompt + tile images to a vision model,
-  4. the model answers with the tile numbers that satisfy the task,
-  5. the bot clicks those tiles + Verify (see server.py's
-     ``_solve_hcaptcha_if_present``), and hCaptcha itself mints the token.
+  1. reads the challenge prompt ("Please select all images with a boat")
+     from the hCaptcha challenge frame,
+  2. screenshots every tile of the image grid (or the whole canvas),
+  3. sends the prompt + images to the Hugging Face Inference API,
+  4. the model answers with the tiles / points / drag to perform,
+  5. the bot clicks or drags, and hCaptcha itself mints the token.
+
+Transport: the classic serverless Inference API,
+
+    POST https://api-inference.huggingface.co/models/<HF_MODEL>/v1/chat/completions
+
+which speaks the OpenAI chat schema with ``image_url`` data-URI parts.
 
 Configuration (env vars):
 
-  VISION_API_BASE  base URL of the vision API endpoint. Overrides
-                   OLLAMA_BASE when set. Points to an Ollama-compatible API
-                   (default: http://localhost:11434 — the fallback when
-                   neither VISION_API_BASE nor OLLAMA_BASE is set).
-  OLLAMA_BASE      legacy alias — used only when VISION_API_BASE is empty.
-  VISION_API_KEY   Bearer token for authenticated vision endpoints
-                   (optional — added as ``Authorization: Bearer <key>``
-                   header to every request when set).
-  OLLAMA_MODEL     vision model to use
-                   (default ahmadwaqar/smolvlm2-256m-video:q8_0)
-  OLLAMA_TIMEOUT   per-request timeout in seconds (default 30 — SmolVLM2
-                   is tiny; a 180s wait expires the challenge)
-  OLLAMA_TILE_TIMEOUT  per-tile yes/no timeout for tiny VLMs (default 12)
-  OLLAMA_IMAGE_SIDE    max image side in px sent to tiny VLMs (default 256)
-  VISION_CHECK_TIMEOUT  reachability-probe timeout in seconds (default 60 —
-                        hosted endpoints cold-start on first request)
+  API_KEY     Hugging Face access token (hf_...). REQUIRED — sent as
+              ``Authorization: Bearer <API_KEY>``. HF_TOKEN / HF_API_KEY
+              are accepted as fallbacks.
+  HF_MODEL    model repo id
+              (default Qwen/Qwen2.5-VL-7B-Instruct)
+  HF_API_BASE base URL of the Inference API
+              (default https://api-inference.huggingface.co/models)
+  HF_TIMEOUT  per-request timeout in seconds (default 60)
+  HF_TILE_TIMEOUT  per-tile yes/no timeout when the model is asked one
+              tile at a time (default 20)
+  HF_IMAGE_SIDE    max image side in px sent to the model (default 512)
+  HF_PER_TILE      set to 1 to force the per-tile yes/no path
+  HF_CHECK_TIMEOUT reachability-probe timeout in seconds (default 60 —
+              serverless models cold-start on the first request)
 
-The default is SmolVLM2-256M (the model this stack actually runs). It is
-a 256M SigLIP+SmolLM2 VLM: ~279 MB, ~2k–8k context, good at short visual
-yes/no, bad at 9-image JSON contracts. For that model the client asks
-ONE tile at a time ("yes or no") and never waits 180s. Larger VLMs
-(qwen3-vl:2b, …) still get the multi-image JSON path when OLLAMA_MODEL
-is set to them.
-
-The client talks to Ollama's native HTTP API (POST /api/chat). Tiny
-models skip ``format: json`` (it hangs or empties them) and fall back to
-loose parsing. Only aiohttp is used — no new dependencies.
+Only aiohttp is used — no new dependencies.
 """
 
 from __future__ import annotations
@@ -53,35 +49,41 @@ from typing import Callable, List, Optional
 
 import aiohttp
 
-# ── VISION_API_BASE is the canonical env var.  OLLAMA_BASE is the legacy
-# fallback when only the old name is set.  Neither is required: the default
-# http://localhost:11434 serves the local-Ollama development workflow.
-VISION_API_BASE = os.environ.get("VISION_API_BASE", "").rstrip("/")
-_OLLAMA_BASE_LEGACY = os.environ.get("OLLAMA_BASE", "").rstrip("/")
-OLLAMA_BASE = VISION_API_BASE or _OLLAMA_BASE_LEGACY or "http://localhost:11434"
+# ── Hugging Face configuration ───────────────────────────────────────────
+HF_API_BASE = (os.environ.get("HF_API_BASE", "").strip().rstrip("/")
+               or "https://api-inference.huggingface.co/models")
 
-VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
-_DEFAULT_MODEL = "ahmadwaqar/smolvlm2-256m-video:q8_0"
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", _DEFAULT_MODEL).strip()
-OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "30"))
-# Reachability probe timeout (seconds). Hosted endpoints (Railway etc.)
-# COLD-START on the first request after sleeping — the wake-up itself can
-# take 30-90s, so a 10s probe marks a healthy service permanently down.
-VISION_CHECK_TIMEOUT = float(os.environ.get("VISION_CHECK_TIMEOUT", "60"))
-_SMOL_TILE_TIMEOUT = float(os.environ.get("OLLAMA_TILE_TIMEOUT", "12"))
-_SMOL_MAX_SIDE = int(os.environ.get("OLLAMA_IMAGE_SIDE", "256"))
+# API_KEY is the canonical name (that is what the deploy sets); HF_TOKEN and
+# HF_API_KEY are accepted so a standard HF environment also works.
+API_KEY = (os.environ.get("API_KEY", "").strip()
+           or os.environ.get("HF_TOKEN", "").strip()
+           or os.environ.get("HF_API_KEY", "").strip())
+
+_DEFAULT_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+HF_MODEL = os.environ.get("HF_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
+HF_TIMEOUT = float(os.environ.get("HF_TIMEOUT", "60"))
+HF_CHECK_TIMEOUT = float(os.environ.get("HF_CHECK_TIMEOUT", "60"))
+_TILE_TIMEOUT = float(os.environ.get("HF_TILE_TIMEOUT", "20"))
+_MAX_SIDE = int(os.environ.get("HF_IMAGE_SIDE", "512"))
+_FORCE_PER_TILE = os.environ.get("HF_PER_TILE", "").strip() in ("1", "true", "yes")
 
 
-def is_tiny_vlm(name: str) -> bool:
-    """True for SmolVLM2-class models that cannot do 9-image JSON."""
+def per_tile_mode(name: str) -> bool:
+    """True when the grid must be asked one tile at a time.
+
+    Small captioning VLMs (SmolVLM, moondream, …) cannot follow a 9-image
+    JSON contract; HF_PER_TILE=1 forces the same path for any model.
+    """
+    if _FORCE_PER_TILE:
+        return True
     n = (name or "").lower()
     return any(k in n for k in (
-        "smolvlm", "smol-vlm", "smol_vlm", "256m", "500m-video",
+        "smolvlm", "smol-vlm", "smol_vlm", "moondream", "256m", "500m",
     ))
 
 
-def shrink_image(data: bytes, max_side: int = _SMOL_MAX_SIDE) -> bytes:
-    """Downscale a PNG/JPEG to a JPEG the 256M projector can chew."""
+def shrink_image(data: bytes, max_side: int = _MAX_SIDE) -> bytes:
+    """Downscale a PNG/JPEG to a JPEG small enough for a fast HF round trip."""
     if not data:
         return data
     try:
@@ -90,11 +92,18 @@ def shrink_image(data: bytes, max_side: int = _SMOL_MAX_SIDE) -> bytes:
         im = Image.open(io.BytesIO(data)).convert("RGB")
         im.thumbnail((max(32, int(max_side)), max(32, int(max_side))))
         buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=75, optimize=True)
+        im.save(buf, format="JPEG", quality=80, optimize=True)
         out = buf.getvalue()
         return out or data
     except Exception:
         return data
+
+
+def _data_uri(data: bytes) -> str:
+    """bytes -> data: URI the HF chat-completions schema accepts."""
+    b64 = base64.b64encode(data).decode("ascii")
+    kind = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpeg"
+    return f"data:image/{kind};base64,{b64}"
 
 
 _YES_WORDS = ("yes", "y", "yeah", "yep", "yup", "true", "match", "matching")
@@ -104,7 +113,7 @@ _NO_WORDS = ("no", "n", "nope", "nah", "false", "none")
 def parse_yesno(text: str):
     """Map a tiny-VLM reply to True/False/None.
 
-    SmolVLM2 often echoes the question (\"… Answer yes or no.\"). Strip
+    Small VLMs often echo the question (\"… Answer yes or no.\"). Strip
     that instruction and read the first/last token so an echoed prompt
     is not scored as a \"no\".
     """
@@ -304,9 +313,9 @@ _SYSTEM_BY_SHAPE = {
     "text": _SYSTEM_PROMPT,
 }
 
-# SmolVLM2 cannot follow the long JSON contracts above. Keep these to
-# one or two sentences; the per-tile path asks yes/no instead.
-_SMOL_SYSTEM = {
+# Small captioning VLMs cannot follow the long JSON contracts above.
+# Keep these to one or two sentences; the per-tile path asks yes/no instead.
+_SMALL_SYSTEM = {
     "tiles": "Look at the photo. Answer the question with yes or no only.",
     "points": 'Look at the photo. Reply {"points": [[x, y]]} with x,y between 0 and 1.',
     "bbox": 'Look at the photo. Reply {"bbox": {"x1":a,"y1":b,"x2":c,"y2":d}} 0 to 1.',
@@ -323,177 +332,181 @@ _JSON_ARRAY_RE = re.compile(r"\[\s*(?:\d+\s*(?:,\s*\d+\s*)*)?\]")
 _JSON_STRING_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
 
-class OllamaVisionClient:
-    """Async client for a vision model endpoint (Ollama or authenticated gateway).
+class HFVisionClient:
+    """Async client for the Hugging Face serverless Inference API.
 
-    Connects to the endpoint defined by the env vars:
-      - ``VISION_API_BASE`` (canonical) or ``OLLAMA_BASE`` (legacy)
-      - ``VISION_API_KEY`` for Bearer auth when talking to an authenticated gateway
+    Configuration comes from the env vars ``API_KEY`` (Hugging Face token),
+    ``HF_MODEL`` (model repo id) and ``HF_API_BASE``.
     """
 
     def __init__(self, log: Optional[Callable] = None,
-                 base: str = OLLAMA_BASE, model: str = OLLAMA_MODEL):
+                 base: str = HF_API_BASE, model: str = HF_MODEL,
+                 api_key: str = ""):
         self._log = log or (lambda msg, level="info": None)
-        self.base = base.rstrip("/")
+        self.base = (base or HF_API_BASE).rstrip("/")
         self.model = model or _DEFAULT_MODEL
-        self._api_key = VISION_API_KEY
+        self._api_key = api_key or API_KEY
         self.stats = {"calls": 0, "ok": 0, "failed": 0}
-        # Machine-readable result of the latest reachability probe.  Keep the
+        # Machine-readable result of the latest reachability probe. Keep the
         # public ``check() -> (ok, models)`` contract for existing callers,
         # while letting them distinguish a transient connection failure from
         # deterministic configuration errors such as HTTP 401 or 404.
         self.last_check_error = ""
         self.last_check_http_status: Optional[int] = None
-        # Log which env var supplied the base, so diagnostics are clear.
-        src = "VISION_API_BASE" if os.environ.get("VISION_API_BASE", "").strip() else \
-              ("OLLAMA_BASE" if os.environ.get("OLLAMA_BASE", "").strip() else "default")
-        self._log(f"[Vision] API endpoint: {self.base} (from {src})"
-                  f"{' [authenticated]' if self._api_key else ''}")
+        if not self._api_key:
+            self._log("[Vision] API_KEY is not set — the Hugging Face "
+                      "Inference API will reject every request", level="error")
+        self._log(f"[Vision] Hugging Face model: {self.model} @ {self.base}"
+                  f"{' [authenticated]' if self._api_key else ' [NO API_KEY]'}")
+
+    @property
+    def endpoint(self) -> str:
+        """Chat-completions URL for the configured model."""
+        return f"{self.base}/{self.model}/v1/chat/completions"
 
     @property
     def configured(self) -> bool:
-        return bool(self.base)
+        return bool(self.base and self.model and self._api_key)
 
     async def _headers(self) -> dict:
-        """HTTP headers including optional Bearer auth."""
         h = {"Content-Type": "application/json"}
         if self._api_key:
             h["Authorization"] = f"Bearer {self._api_key}"
         return h
 
     async def check(self) -> tuple:
-        """Probe the Ollama server and list pulled models.
+        """Probe the Hugging Face model endpoint.
 
-        Returns ``(ok, models)`` — ``models`` is a list of model names
-        (including tags) or [] when the probe fails.  ``last_check_error``
-        classifies failures so callers do not mistake an HTTP 401 (the server
-        is up, but the credentials differ) for a cold start and retry it.
+        Returns ``(ok, models)`` where ``models`` is ``[self.model]`` when the
+        model is reachable (kept for callers written against the old
+        contract). ``last_check_error`` classifies failures so callers do not
+        mistake an HTTP 401 (bad API_KEY) for a cold start and retry it.
         """
         self.last_check_error = ""
         self.last_check_http_status = None
+        if not self._api_key:
+            self.last_check_error = "authentication"
+            self._log("[Vision] No API_KEY configured for Hugging Face",
+                      level="error")
+            return False, []
+        url = f"{self.base}/{self.model}"
         try:
-            timeout = aiohttp.ClientTimeout(total=VISION_CHECK_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(total=HF_CHECK_TIMEOUT)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(f"{self.base}/api/tags",
-                                 headers=await self._headers()) as r:
-                    if r.status != 200:
-                        self.last_check_http_status = int(r.status)
-                        if r.status == 401:
-                            self.last_check_error = "authentication"
-                            key_state = ("the configured VISION_API_KEY was rejected"
-                                         if self._api_key else
-                                         "VISION_API_KEY is not configured in this service")
-                            self._log(
-                                f"[Vision] Authentication failed at {self.base} "
-                                f"(HTTP 401): {key_state}", level="error")
-                        elif r.status == 403:
-                            self.last_check_error = "authorization"
-                            self._log(
-                                f"[Vision] Access forbidden at {self.base} (HTTP 403)",
-                                level="error")
-                        elif r.status == 404:
-                            self.last_check_error = "protocol"
-                            self._log(
-                                f"[Vision] {self.base} does not expose the expected "
-                                "Ollama /api/tags endpoint (HTTP 404)", level="error")
-                        elif r.status == 429:
-                            self.last_check_error = "rate_limit"
-                            self._log(f"[Vision] /api/tags rate limited (HTTP 429)",
-                                      level="warn")
-                        elif r.status >= 500:
-                            self.last_check_error = "server"
-                            self._log(f"[Vision] /api/tags server error HTTP {r.status}",
-                                      level="warn")
-                        else:
-                            self.last_check_error = "http"
-                            self._log(f"[Vision] /api/tags HTTP {r.status}", level="warn")
-                        return False, []
+                async with s.get(url, headers=await self._headers()) as r:
+                    status = int(r.status)
+                    body = ""
                     try:
-                        data = await r.json()
-                    except Exception as e:
-                        self.last_check_error = "protocol"
-                        self._log(
-                            f"[Vision] /api/tags returned invalid JSON: "
-                            f"{type(e).__name__}", level="error")
-                        return False, []
-            if not isinstance(data, dict) or not isinstance(data.get("models", []), list):
-                self.last_check_error = "protocol"
-                self._log("[Vision] /api/tags returned an invalid model-list payload",
+                        body = (await r.text())[:200]
+                    except Exception:
+                        pass
+            # 200 = warm, 503 = cold-starting (still a healthy model), and a
+            # GET on an inference route often answers 405 "use POST".
+            if status in (200, 405, 503):
+                if status == 503:
+                    self._log(f"[Vision] {self.model} is loading on Hugging "
+                              "Face (cold start) — first solve may be slow",
+                              level="warn")
+                else:
+                    self._log(f"[Vision] Hugging Face OK: {self.model}")
+                return True, [self.model]
+            self.last_check_http_status = status
+            if status == 401:
+                self.last_check_error = "authentication"
+                self._log("[Vision] Hugging Face rejected API_KEY (HTTP 401)",
                           level="error")
-                return False, []
-            models = [m.get("name") or m.get("model") or ""
-                      for m in data.get("models", []) if isinstance(m, dict)]
-            models = [m for m in models if m]
-            self._log(f"[Ollama] Server OK at {self.base} ({len(models)} models pulled)")
-            return True, models
+            elif status == 403:
+                self.last_check_error = "authorization"
+                self._log(f"[Vision] Access forbidden for {self.model} "
+                          "(HTTP 403) — accept the model licence or use a "
+                          "token with inference permission", level="error")
+            elif status == 404:
+                self.last_check_error = "protocol"
+                self._log(f"[Vision] Model {self.model} not found on Hugging "
+                          "Face (HTTP 404) — check HF_MODEL", level="error")
+            elif status == 429:
+                self.last_check_error = "rate_limit"
+                self._log("[Vision] Hugging Face rate limited (HTTP 429)",
+                          level="warn")
+            elif status >= 500:
+                self.last_check_error = "server"
+                self._log(f"[Vision] Hugging Face server error HTTP {status}: "
+                          f"{body}", level="warn")
+            else:
+                self.last_check_error = "http"
+                self._log(f"[Vision] Hugging Face HTTP {status}: {body}",
+                          level="warn")
+            return False, []
         except asyncio.TimeoutError:
             self.last_check_error = "timeout"
-            self._log(
-                f"[Vision] Probe timed out after {VISION_CHECK_TIMEOUT:g}s at {self.base}",
-                level="error")
+            self._log(f"[Vision] Probe timed out after {HF_CHECK_TIMEOUT:g}s "
+                      f"at {url}", level="error")
             return False, []
         except aiohttp.ClientError as e:
             self.last_check_error = "connection"
-            self._log(
-                f"[Vision] Connection failed at {self.base}: {type(e).__name__}",
-                level="error")
+            self._log(f"[Vision] Connection failed at {url}: "
+                      f"{type(e).__name__}", level="error")
             return False, []
         except Exception as e:
             self.last_check_error = "connection"
-            self._log(f"[Vision] Not reachable at {self.base}: {type(e).__name__}: {e}",
-                      level="error")
+            self._log(f"[Vision] Not reachable at {url}: "
+                      f"{type(e).__name__}: {e}", level="error")
             return False, []
 
     async def _chat(self, system: str, content: str, images: List[bytes],
                     timeout: float, *, want_json: bool,
                     num_predict: int) -> Optional[str]:
-        """One /api/chat turn. Returns the raw message content or None."""
+        """One chat-completions turn. Returns the raw message content or None."""
+        parts: list = [{"type": "text", "text": content}]
+        for b in images:
+            if b:
+                parts.append({"type": "image_url",
+                              "image_url": {"url": _data_uri(b)}})
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": content,
-                    "images": [base64.b64encode(b).decode("ascii")
-                               for b in images if b],
-                },
+                {"role": "user", "content": parts},
             ],
+            "max_tokens": int(num_predict),
+            "temperature": 0.1,
+            "top_p": 0.9,
             "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "num_predict": int(num_predict),
-            },
-            "keep_alive": "10m",
         }
         if want_json:
-            payload["format"] = "json"
+            payload["response_format"] = {"type": "json_object"}
         try:
             timeout_cfg = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-                async with s.post(f"{self.base}/api/chat", json=payload,
+                async with s.post(self.endpoint, json=payload,
                                   headers=await self._headers()) as r:
                     if r.status != 200:
                         body = await r.text()
-                        self._log(
-                            f"[Ollama] Solve rejected (HTTP {r.status}): {body[:200]}",
-                            level="warn")
+                        self._log(f"[Vision] Solve rejected (HTTP {r.status}): "
+                                  f"{body[:200]}", level="warn")
                         return None
                     data = await r.json()
-            return ((data or {}).get("message") or {}).get("content") or ""
+            choices = (data or {}).get("choices") or []
+            if not choices:
+                return ""
+            msg = (choices[0] or {}).get("message") or {}
+            out = msg.get("content")
+            if isinstance(out, list):      # some servers return content parts
+                out = "".join(p.get("text", "") for p in out
+                              if isinstance(p, dict))
+            return out or ""
         except Exception as e:
-            self._log(f"[Ollama] Solve error: {e}", level="error")
+            self._log(f"[Vision] Solve error: {e}", level="error")
             return None
 
-    async def _solve_tiles_smol(self, prompt: str, images: List[bytes],
-                                examples: List[bytes],
-                                timeout: float) -> Optional[dict]:
-        """Ask SmolVLM2 yes/no on each tile. 9-at-once JSON 504s this model."""
+    async def _solve_tiles_one_by_one(self, prompt: str, images: List[bytes],
+                                      examples: List[bytes],
+                                      timeout: float) -> Optional[dict]:
+        """Ask the model yes/no on each tile (small-VLM path)."""
         ref = shrink_image(examples[0]) if examples else None
         q = tile_yes_question(prompt, has_ref=bool(ref))
-        system = _SMOL_SYSTEM["tiles"]
-        per = min(_SMOL_TILE_TIMEOUT, max(6.0, timeout))
+        system = _SMALL_SYSTEM["tiles"]
+        per = min(_TILE_TIMEOUT, max(6.0, timeout))
         hits = []
         answered = 0
         for i, raw in enumerate(images, 1):
@@ -502,25 +515,25 @@ class OllamaVisionClient:
             content = await self._chat(
                 system, q, bundle, per, want_json=False, num_predict=16)
             if content is None:
-                self._log(f"[Ollama] tile {i}/{len(images)} -> error",
+                self._log(f"[Vision] tile {i}/{len(images)} -> error",
                           level="debug")
                 continue
             answered += 1
             yn = parse_yesno(content)
-            self._log(f"[Ollama] tile {i}/{len(images)} -> "
+            self._log(f"[Vision] tile {i}/{len(images)} -> "
                       f"{content[:40]!r} yes={yn}", level="debug")
             if yn is True:
                 hits.append(i)
         if answered == 0:
             return None
-        self._log(f"[Ollama] SmolVLM2 per-tile yes: {hits} "
+        self._log(f"[Vision] per-tile yes: {hits} "
                   f"({answered}/{len(images)} answered)")
         return {"type": "tiles", "indices": hits}
 
     async def solve(self, prompt: str, images: List[bytes],
                     shape: str = "tiles", examples: Optional[List[bytes]] = None,
-                    timeout: float = OLLAMA_TIMEOUT) -> Optional[dict]:
-        """Ask the model to answer an hCaptcha round.
+                    timeout: float = HF_TIMEOUT) -> Optional[dict]:
+        """Ask the Hugging Face model to answer an hCaptcha round.
 
         ``images`` are the answer surfaces as PNG/JPEG bytes. For
         shape="tiles" they are the grid tiles in reading order (tile 1 =
@@ -528,9 +541,6 @@ class OllamaVisionClient:
         canvas; for "choice" the reference image(s). ``examples`` are the
         prompt-header reference images (the "item shown"): they are
         PREPENDED to the message and the text explains which is which.
-
-        SmolVLM2 (the default) answers tile grids one image at a time.
-        Larger VLMs still get one multi-image JSON call.
 
         Returns, by shape:
 
@@ -548,38 +558,39 @@ class OllamaVisionClient:
           None      model unreachable or answer unparseable
         """
         if not self.configured:
-            self._log("[Ollama] No vision API base configured (set VISION_API_BASE or OLLAMA_BASE)", level="error")
+            self._log("[Vision] Hugging Face not configured — set API_KEY "
+                      "(and optionally HF_MODEL)", level="error")
             return None
         if not images:
             return None
         import time
-        tiny = is_tiny_vlm(self.model)
+        small = per_tile_mode(self.model)
         self._log(f"{time.strftime('%b %d %H:%M:%S.000 [info]')} "
-                  f"solving with si vision ({self.model}"
-                  f"{', per-tile' if tiny and shape == 'tiles' else ''})")
+                  f"solving with hugging face ({self.model}"
+                  f"{', per-tile' if small and shape == 'tiles' else ''})")
         self.stats["calls"] += 1
         examples = list(examples or [])
-        if tiny and shape == "tiles" and len(images) >= 2:
-            got = await self._solve_tiles_smol(prompt, images, examples, timeout)
+        if small and shape == "tiles" and len(images) >= 2:
+            got = await self._solve_tiles_one_by_one(
+                prompt, images, examples, timeout)
             if got is not None:
                 self.stats["ok"] += 1
                 return got
             self.stats["failed"] += 1
             return None
-        if tiny:
-            system = _SMOL_SYSTEM.get(shape, _SMOL_SYSTEM["tiles"])
+        if small:
+            system = _SMALL_SYSTEM.get(shape, _SMALL_SYSTEM["tiles"])
             imgs = [shrink_image(b) for b in list(examples) + list(images)]
             if examples:
                 content = (f"First {len(examples)} image(s) are the example. "
                            f"Then the answer image. Task: {prompt}")
             else:
                 content = prompt
-            # format:json hangs or empties 256M models — parse loosely.
             want_json = False
-            npred = 48
+            npred = 64
         else:
             system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_PROMPT)
-            imgs = list(examples) + list(images)
+            imgs = [shrink_image(b) for b in list(examples) + list(images)]
             if examples:
                 content = (
                     f"REFERENCE IMAGES: the first {len(examples)} image(s) come "
@@ -603,7 +614,7 @@ class OllamaVisionClient:
             self.stats["failed"] += 1
             return None
         if not content_out:
-            self._log("[Ollama] Empty response from model", level="warn")
+            self._log("[Vision] Empty response from model", level="warn")
             self.stats["failed"] += 1
             return None
         parse_shape = "drag" if shape in ("pattern", "tower") else shape
@@ -611,7 +622,7 @@ class OllamaVisionClient:
         if parsed is None and shape in ("tiles", "text", "count", "stack"):
             parsed = self._parse_answer(content_out, len(images), shape)
         if parsed is None:
-            self._log(f"[Ollama] Unparseable model answer: {content_out[:160]}",
+            self._log(f"[Vision] Unparseable model answer: {content_out[:160]}",
                       level="warn")
             self.stats["failed"] += 1
             return None
@@ -677,13 +688,13 @@ class OllamaVisionClient:
         if isinstance(p, dict):
             for kx, ky in (("x", "y"), ("cx", "cy"), ("left", "top")):
                 if kx in p and ky in p:
-                    a, b = OllamaVisionClient._num(p[kx]), \
-                        OllamaVisionClient._num(p[ky])
+                    a, b = HFVisionClient._num(p[kx]), \
+                        HFVisionClient._num(p[ky])
                     if a is not None and b is not None:
                         return (a, b)
             return None
         if isinstance(p, (list, tuple)) and len(p) >= 2:
-            a, b = OllamaVisionClient._num(p[0]), OllamaVisionClient._num(p[1])
+            a, b = HFVisionClient._num(p[0]), HFVisionClient._num(p[1])
             if a is not None and b is not None:
                 return (a, b)
         return None
@@ -696,17 +707,17 @@ class OllamaVisionClient:
         points/point/clicks/coordinates, bbox/box/bounding_box (dict or
         4-list), drag/drags/path or a bare from/to pair, choice/option/
         answer_index, tiles/indices."""
-        obj = OllamaVisionClient._loads_repaired(content)
+        obj = HFVisionClient._loads_repaired(content)
         if obj is None:
             return None
-        num = OllamaVisionClient._num
-        pt = OllamaVisionClient._point
+        num = HFVisionClient._num
+        pt = HFVisionClient._point
 
         # Stacking plans (FunCAPTCHA/Arkose "make every column equal"): the
         # generic branches below would squash a multi-drag {"drags": [...]}
         # into one drag / a points pair, so parse the FULL plan first.
         if shape == "stack":
-            return OllamaVisionClient._parse_stack_geometry(obj)
+            return HFVisionClient._parse_stack_geometry(obj)
 
         # bare top-level atoms
         if isinstance(obj, (int, float)) and not isinstance(obj, bool):
@@ -833,9 +844,9 @@ class OllamaVisionClient:
                     raw = v
                     break
                 if isinstance(v, dict):
-                    f = OllamaVisionClient._point(
+                    f = HFVisionClient._point(
                         v.get("from") or v.get("start"))
-                    t = OllamaVisionClient._point(
+                    t = HFVisionClient._point(
                         v.get("to") or v.get("end"))
                     if f and t:
                         raw = [list(f) + list(t)]
@@ -847,10 +858,10 @@ class OllamaVisionClient:
         drags = []
         for item in raw:
             if isinstance(item, dict):
-                f = OllamaVisionClient._point(
+                f = HFVisionClient._point(
                     item.get("from") or item.get("start")
                     or item.get("grab") or item.get("pick"))
-                t = OllamaVisionClient._point(
+                t = HFVisionClient._point(
                     item.get("to") or item.get("end")
                     or item.get("drop") or item.get("target"))
                 if f is None or t is None:
@@ -961,7 +972,7 @@ class OllamaVisionClient:
         # BEFORE the text fallback — "1 3 5" is a 5-char line with no
         # brackets and used to be misread as a text challenge.
         if shape == "tiles":
-            loose = OllamaVisionClient._parse_loose_tiles(text, tile_count)
+            loose = HFVisionClient._parse_loose_tiles(text, tile_count)
             if loose is not None:
                 return loose
 
@@ -1010,25 +1021,31 @@ class OllamaVisionClient:
 
 
 async def _self_test() -> None:
-    """Quick smoke test against a running Ollama server."""
-    client = OllamaVisionClient()
+    """Quick smoke test against the Hugging Face Inference API."""
+    client = HFVisionClient(log=lambda m, level="info": print(m, flush=True))
     ok, models = await client.check()
-    print(f"server ok={ok} models={models}")
-    if not ok or client.model not in models:
-        print(f"model {client.model} not pulled — run: ollama pull {client.model}")
+    print(f"endpoint ok={ok} model={models}")
+    if not ok:
+        print("Set API_KEY (Hugging Face token) and optionally HF_MODEL.")
         return
+
     # Two solid-color tiles: ask which one is red (image 2 should win).
     def _solid(rgb: tuple) -> bytes:
         from io import BytesIO
         import struct
         w = h = 64
-        raw = b"".join(bytes(rgb) * w for _ in range(h))
+        raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
         def _chunk(tag: bytes, data: bytes) -> bytes:
-            return tag + struct.pack(">I", len(data)) + data + struct.pack(">I", 0)
+            import zlib
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        import zlib
         return (b"\x89PNG\r\n\x1a\n"
                 + _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                + _chunk(b"IDAT", __import__("zlib").compress(raw))
+                + _chunk(b"IDAT", zlib.compress(raw))
                 + _chunk(b"IEND", b""))
+
     ans = await client.solve(
         "Select all images that are red.",
         [_solid((30, 90, 200)), _solid((200, 30, 30))])

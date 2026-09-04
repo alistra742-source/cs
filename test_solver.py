@@ -22,12 +22,8 @@ NO browser, NO network, NO model server. Covers:
     resolver for "complete the pattern" rounds);
   * pointer trajectories (no teleport hops, never straight line,
     accelerate-then-decelerate);
-  * scoring the trained offline models on HELD-OUT rounds (hybrid
-    real-photo + procedural) and on never-trained REAL photographs
-    (data_real/val); skipped when models/ weights are absent — train with
-    train_models.py.
-
-Expected: 109 collected (101 passed + 8 skipped when the models are not trained yet).
+  * the Hugging Face vision client: answer parsing, the per-tile yes/no
+    path for small VLMs, and image downscaling.
 
     python test_solver.py            # quiet dots
     python test_solver.py -v         # one line per test
@@ -42,28 +38,14 @@ import unittest
 import hcaptcha_types as hct
 import human_mouse as hm
 from vision_solver import (
-    OllamaVisionClient,
-    is_tiny_vlm,
+    HFVisionClient,
     parse_yesno,
+    per_tile_mode,
     shrink_image,
     tile_yes_question,
 )
 
-MODELS_DIR = os.environ.get(
-    "SOLVER_MODELS_DIR", os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), "models"))
-
-try:
-    from tile_classifier import TileClassifier, PointLocator, DragLocator
-    _TC = TileClassifier(MODELS_DIR)
-    _PL = PointLocator(MODELS_DIR)
-    _DL = DragLocator(MODELS_DIR)
-    MODELS_OK = _TC.available and _PL.available and _DL.available
-except Exception:
-    _TC = _PL = _DL = None
-    MODELS_OK = False
-
-GEO = OllamaVisionClient._parse_geometry     # shorthand
+GEO = HFVisionClient._parse_geometry     # shorthand
 
 
 # ── routing: /getcaptcha payload tier ────────────────────────────────────
@@ -536,7 +518,7 @@ class TestParseGeometry(unittest.TestCase):
         self.assertEqual(GEO("3", "count", 1),
                          {"type": "count", "count": 3})
         self.assertEqual(
-            OllamaVisionClient._parse_answer("The answer is 5", 1, "count"),
+            HFVisionClient._parse_answer("The answer is 5", 1, "count"),
             {"type": "count", "count": 5})
         # ...while bare ints stay CHOICE answers when the shape says so
         self.assertEqual(GEO("3", "choice", 1),
@@ -593,7 +575,7 @@ class TestParseGeometry(unittest.TestCase):
                          {"type": "points", "points": [(0.12, 0.88)]})
 
     def test_parse_loose_tile_numbers(self):
-        pa = OllamaVisionClient._parse_answer
+        pa = HFVisionClient._parse_answer
         self.assertEqual(pa("1 3 5", 9, "tiles"),
                          {"type": "tiles", "indices": [1, 3, 5]})
         self.assertEqual(pa("tiles 1, 3 and 5", 9, "tiles"),
@@ -605,18 +587,18 @@ class TestParseGeometry(unittest.TestCase):
                          {"type": "count", "count": 1})
 
 
-# ── SmolVLM2-256M helpers (the model this stack actually runs) ────────────
+# ── small-VLM helpers (per-tile yes/no path) ─────────────────────────────
 
 
-class TestSmolVlmHelpers(unittest.TestCase):
+class TestSmallVlmHelpers(unittest.TestCase):
 
-    def test_is_tiny_vlm(self):
-        self.assertTrue(is_tiny_vlm("ahmadwaqar/smolvlm2-256m-video:q8_0"))
-        self.assertTrue(is_tiny_vlm("SmolVLM2-256M"))
-        self.assertTrue(is_tiny_vlm("smol-vlm"))
-        self.assertFalse(is_tiny_vlm("qwen3-vl:2b"))
-        self.assertFalse(is_tiny_vlm("llama3.2-vision:11b"))
-        self.assertFalse(is_tiny_vlm(""))
+    def test_per_tile_mode(self):
+        self.assertTrue(per_tile_mode("HuggingFaceTB/SmolVLM-256M-Instruct"))
+        self.assertTrue(per_tile_mode("SmolVLM2-256M"))
+        self.assertTrue(per_tile_mode("vikhyatk/moondream2"))
+        self.assertFalse(per_tile_mode("Qwen/Qwen2.5-VL-7B-Instruct"))
+        self.assertFalse(per_tile_mode("meta-llama/Llama-3.2-11B-Vision"))
+        self.assertFalse(per_tile_mode(""))
 
     def test_parse_yesno(self):
         self.assertIs(parse_yesno("yes"), True)
@@ -665,12 +647,13 @@ class TestSmolVlmHelpers(unittest.TestCase):
         self.assertEqual(got.format, "JPEG")
 
 
-class TestSmolVlmSolve(unittest.IsolatedAsyncioTestCase):
+class TestSmallVlmSolve(unittest.IsolatedAsyncioTestCase):
 
     async def test_tiny_model_asks_one_tile_at_a_time(self):
-        client = OllamaVisionClient(
+        client = HFVisionClient(
             base="http://vision.invalid",
-            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
+            model="HuggingFaceTB/SmolVLM-256M-Instruct",
+            api_key="hf_test",
         )
         replies = ["yes", "no", "Yes, a bench.", "nope"]
         calls = []
@@ -696,9 +679,10 @@ class TestSmolVlmSolve(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nightstand", calls[0]["q"].lower())
 
     async def test_tiny_model_all_errors_returns_none(self):
-        client = OllamaVisionClient(
+        client = HFVisionClient(
             base="http://vision.invalid",
-            model="ahmadwaqar/smolvlm2-256m-video:q8_0",
+            model="HuggingFaceTB/SmolVLM-256M-Instruct",
+            api_key="hf_test",
         )
 
         async def boom(*a, **k):
@@ -710,8 +694,10 @@ class TestSmolVlmSolve(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.stats["failed"], 1)
 
     async def test_large_vlm_still_batches_tiles(self):
-        client = OllamaVisionClient(
-            base="http://vision.invalid", model="qwen3-vl:2b")
+        client = HFVisionClient(
+            base="http://vision.invalid",
+            model="Qwen/Qwen2.5-VL-7B-Instruct",
+            api_key="hf_test")
         calls = []
 
         async def fake_chat(system, content, images, timeout, *,
@@ -1090,207 +1076,6 @@ class TestPointer(unittest.TestCase):
                                "no acceleration phase")
             self.assertGreater(mid_avg, end_avg * 1.5,
                                "no deceleration phase")
-
-
-# ── trained models on HELD-OUT rounds (skipped without weights) ──────────
-
-
-def _heldout_point_rounds(kind, n):
-    """n rounds of a given relational flag, seeds disjoint from training."""
-    import make_challenges as mc
-    out = []
-    i = 0
-    while len(out) < n and i < n * 6:
-        rng = random.Random("heldout|point|%d" % i)
-        img, meta = mc.make_point_round(rng, 96)
-        if meta["relational"] == (kind == "rel"):
-            out.append((img, meta))
-        i += 1
-    return out
-
-
-@unittest.skipUnless(MODELS_OK, "offline models not trained "
-                     "(run train_models.py)")
-class TestModels(unittest.TestCase):
-
-    def test_tile_classifier_accuracy(self):
-        import make_dataset as md
-        ims, want = [], []
-        for name in md.CLASSES:
-            for i in range(8):
-                rng = random.Random("heldout|tile|%s|%d" % (name, i))
-                ims.append(md.render(name, 96, rng))
-                want.append(name)
-        got = _TC.classify_many(ims)
-        ok = sum(1 for g, w in zip(got, want) if g[0] == w)
-        acc = ok / len(want)
-        print("\n  tile accuracy: %.3f (%d/%d)" % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.95)
-
-    def test_grid_rounds_end_to_end(self):
-        import make_challenges as mc
-        exact = 0
-        total = 60
-        for i in range(total):
-            rng = random.Random("heldout|grid|%d" % i)
-            grid, meta = mc.make_grid_round(rng, 96)
-            tiles = [grid.crop((x, y, x + w, y + h))
-                     for (x, y, w, h) in meta["tile_boxes"]]
-            labels = [g[0] for g in _TC.classify_many(tiles)]
-            ex_label = None
-            if meta.get("reference_image") is not None:
-                eg = _TC.classify_many([meta["reference_image"]])
-                if eg:
-                    ex_label = eg[0][0]
-            idx = hct.resolve_semantic(meta["prompt"], labels,
-                                       example_label=ex_label)
-            if idx is not None and sorted(idx) == sorted(meta["correct"]):
-                exact += 1
-        print("\n  grid rounds exact: %d/%d" % (exact, total))
-        self.assertGreaterEqual(exact, 45)
-
-    def test_point_named_targets(self):
-        rounds = _heldout_point_rounds("named", 100)
-        hits = 0
-        for img, meta in rounds:
-            got = _PL.locate(img, meta["target"])
-            if not got:
-                continue
-            err = math.hypot(got[0] - meta["x"], got[1] - meta["y"])
-            if err <= 0.10:
-                hits += 1
-        rate = hits / len(rounds)
-        print("\n  named point hit@10%%: %.3f (%d/%d)"
-              % (rate, hits, len(rounds)))
-        self.assertGreaterEqual(rate, 0.65)
-
-    def test_point_relational(self):
-        rounds = _heldout_point_rounds("rel", 100)
-        right_class = 0
-        clicks = 0
-        for img, meta in rounds:
-            got = _PL.locate_relational(img, meta["prompt"], verifier=_TC)
-            if not got:
-                continue
-            if got[2] == meta["target"]:
-                right_class += 1
-            err = math.hypot(got[0] - meta["x"], got[1] - meta["y"])
-            if err <= 0.10:
-                clicks += 1
-        n = len(rounds)
-        print("\n  relational point: right class %d/%d, click %d/%d"
-              % (right_class, n, clicks, n))
-        self.assertGreaterEqual(right_class, 40)
-        self.assertGreaterEqual(clicks, 45)
-
-    def test_drag_both_ends(self):
-        import make_challenges as mc
-        both = 0
-        total = 60
-        for i in range(total):
-            rng = random.Random("heldout|drag|%d" % i)
-            img, meta = mc.make_drag_round(rng, 96)
-            got = _DL.locate(img)
-            if not got:
-                continue
-            ef = math.hypot(got["from"][0] - meta["fx"],
-                            got["from"][1] - meta["fy"])
-            et = math.hypot(got["to"][0] - meta["tx"],
-                            got["to"][1] - meta["ty"])
-            if ef <= 0.10 and et <= 0.10:
-                both += 1
-        print("\n  drag both-ends hit@10%%: %d/%d" % (both, total))
-        self.assertGreaterEqual(both, 55)
-
-    def test_count_rounds_offline(self):
-        import make_challenges as mc
-        exact = gated = total = 0
-        for i in range(60):
-            rng = random.Random("heldout|count|%d" % i)
-            img, meta = mc.make_count_round(rng, 96)
-            got = _PL.count(img, meta["target"])
-            total += 1
-            if got is None:
-                gated += 1
-            elif got == meta["count"]:
-                exact += 1
-        print("\n  offline count exact: %d/%d (%d self-gated to vision)"
-              % (exact, total, gated))
-        self.assertGreaterEqual(exact, 40)
-
-    def test_pattern_rounds_offline(self):
-        """Pattern completion end-to-end without a browser: crop the grid
-        cells and candidates from the generated round, classify them with
-        the tile CNN, and resolve the Latin square — the exact path
-        _solve_pattern_round takes when the DOM probe succeeds."""
-        import make_challenges as mc
-        import numpy as np
-        from PIL import Image as PILImage
-        solved = gated = total = 0
-        for i in range(60):
-            rng = random.Random("heldout|pattern|%d" % i)
-            img, meta = mc.make_pattern_round(rng, 96)
-            W, H = img.size
-            total += 1
-            # hole = brightest cell (same heuristic as the server: the
-            # empty cell is near-white; painted tiles are darker)
-            means = []
-            for b in meta["cell_boxes"]:
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                means.append(float(np.asarray(
-                    img.crop((x0, y0, x1, y1)).convert("L")).mean()))
-            hole = int(np.argmax(means))
-            grid = [None] * 9
-            confs = []
-            for i2, b in enumerate(meta["cell_boxes"]):
-                if i2 == hole:
-                    continue
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
-                grid[i2] = g[0]
-                confs.append(g[1])
-            clab, cconf = [], []
-            for b in meta["candidate_boxes"]:
-                x0, y0 = int(b["x"] * W), int(b["y"] * H)
-                x1, y1 = int((b["x"] + b["w"]) * W), int((b["y"] + b["h"]) * H)
-                g = _TC.classify_many([img.crop((x0, y0, x1, y1))])[0]
-                clab.append(g[0])
-                cconf.append(g[1])
-            win = hct.resolve_pattern(grid, hole, clab)
-            if win is None:
-                gated += 1
-            elif win == meta["correct"]:
-                solved += 1
-        print("\n  offline pattern solved: %d/%d (%d gated to vision)"
-              % (solved, total, gated))
-        self.assertGreaterEqual(solved, 35)
-
-    def test_real_photo_tiles(self):
-        """Held-out REAL photographs (data_real/val/) the trainer never saw —
-        the honest synthetic->real transfer check. Labels come from the
-        image-search query itself, so label noise is expected; the gate is a
-        regression floor, the printed number is the honest metric (see
-        SOLVER.md for the corpus and the measured transfer)."""
-        import realdata
-        from PIL import Image
-        val = os.path.join(realdata.REAL_DIR, "val")
-        if not os.path.isdir(val):
-            self.skipTest("no real corpus (run: python realdata.py organize)")
-        ims, want = [], []
-        for name in sorted(os.listdir(val)):
-            for f in sorted(glob.glob(os.path.join(val, name, "*.jpg"))):
-                ims.append(Image.open(f).convert("RGB"))
-                want.append(name)
-        if not ims:
-            self.skipTest("empty real val corpus")
-        got = _TC.classify_many(ims)
-        ok = sum(1 for g, w in zip(got, want) if g and g[0] == w)
-        acc = ok / len(want)
-        print("\n  REAL-photo tile accuracy: %.3f (%d/%d)"
-              % (acc, ok, len(want)))
-        self.assertGreaterEqual(acc, 0.45)
 
 
 # live browser pointer helpers + trainer ingest

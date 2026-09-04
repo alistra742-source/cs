@@ -14,5 +14,5 @@ echo "[TOR] Ready (SOCKS5 :9050)" 2>/dev/null || echo "[TOR] Not available"
 echo ""
 echo "Starting web server..."
 echo "Aug 22 05:58:35.000 [warn] You are running Tor as root. You don't need to, and you probably shouldn't."
-echo "Aug 22 05:58:35.000 [info] solving with si vision"
+echo "Aug 22 05:58:35.000 [info] vision: hugging face inference api"
 exec python -u app.py

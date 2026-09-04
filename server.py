@@ -18,14 +18,10 @@ from captcha_solver import (
     read_hcaptcha_token,
 )
 from duckmail import TempMail
-from vision_solver import OllamaVisionClient
+from vision_solver import HFVisionClient
 from drag_solver import DragSolver
 import hcaptcha_types as hct
 import human_mouse as hm
-
-# Mean per-tile CNN confidence required before the OFFLINE tile classifier
-# is trusted for a grid round (below this gate the vision model answers).
-_CNN_MIN_CONF = float(os.environ.get("SOLVER_CNN_MIN_CONF", "0.62"))
 
 
 # ── Shared JS: robust login-link / back-to-login detection ──────────────
@@ -1541,9 +1537,9 @@ class DiscordAutomation:
         self._username = ""
         self._password = ""
         self._token = ""
-        # Local Ollama vision model solves the hCaptcha image grid itself -
-        # vision model solves the image grid directly (see vision_solver.py).
-        self._vision = OllamaVisionClient(log=self._log)
+        # Hugging Face vision model solves the image grid directly
+        # (see vision_solver.py; configured with API_KEY + HF_MODEL).
+        self._vision = HFVisionClient(log=self._log)
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
@@ -1551,11 +1547,6 @@ class DiscordAutomation:
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
         self._challenge_payload = None
-        # Offline CNN solvers (tile_classifier.py). Lazy: None until first
-        # use, False when torch/weights are absent (vision-model fallback).
-        self._cnn_tile = None
-        self._cnn_point = None
-        self._cnn_drag = None
         # duckmail.sbs client — created once per bot, reused across attempts.
         # (Lost in the cybertemp→duckmail switch, which silently killed every
         # inbox creation with a NoneType crash — see git log efb6f99.)
@@ -4084,11 +4075,9 @@ class DiscordAutomation:
 
             # ---- VISION SOLVER: reads the image grid via vision_solver ----
             # The bot reads the challenge instruction, screenshots every
-            # the challenge instruction, screenshots every tile, asks a
-            # vision model (local Ollama or remote VISION_API_BASE endpoint)
+            # tile, asks the Hugging Face vision model (API_KEY + HF_MODEL)
             # which tiles match, clicks them + Verify, and hCaptcha itself
-            # mints the token. See vision_solver.py for the recommended
-            # model (ahmadwaqar/smolvlm2-256m-video:q8_0).
+            # mints the token. See vision_solver.py.
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -4104,7 +4093,7 @@ class DiscordAutomation:
             # failure cache. Hosted endpoints (Railway etc.) cold-start on
             # the first request after sleeping — one fast probe would mark
             # a healthy service down for the bot's whole lifetime (the
-            # "Ollama server unreachable" that kills every captcha round).
+            # "vision unreachable" that kills every captcha round).
             # _vision_ready is only set on success, so a service that was
             # down and comes back re-probes cleanly on the next challenge.
             if not getattr(self, "_vision_ready", False):
@@ -4133,35 +4122,32 @@ class DiscordAutomation:
                     http_status = getattr(self._vision, "last_check_http_status", None)
                     if check_error == "authentication":
                         self._log(
-                            f"[Captcha] Vision endpoint is UP but rejected authentication "
-                            f"(HTTP {http_status or 401}). This app and the Vision AI "
-                            "service have different or missing VISION_API_KEY values. "
-                            "Configure both Railway services from the same shared variable; "
-                            "do not put the secret in logs.", level="error")
+                            f"[Captcha] Hugging Face rejected authentication "
+                            f"(HTTP {http_status or 401}). The configured "
+                            "API_KEY is missing or invalid for the Hugging Face "
+                            "Inference API. Set API_KEY to a valid hf_... token "
+                            "with inference permission; do not put the secret in "
+                            "logs.", level="error")
                     elif check_error == "authorization":
                         self._log(
                             f"[Captcha] Vision endpoint denied access "
-                            f"(HTTP {http_status or 403}); check the gateway authorization "
-                            "policy.", level="error")
+                            f"(HTTP {http_status or 403}); accept the model licence "
+                            "on huggingface.co or use a token with inference "
+                            "permission.", level="error")
                     elif check_error == "protocol":
                         self._log(
-                            f"[Captcha] Vision endpoint at {self._vision.base} is reachable "
-                            "but is not a compatible Ollama API; expected GET /api/tags.",
+                            f"[Captcha] Hugging Face model {self._vision.model} was "
+                            "not found (HTTP 404) — check the HF_MODEL repo id.",
                             level="error")
                     else:
                         self._log(
                             f"[Captcha] Vision server unavailable after {probes_made} "
                             f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
-                            "- check VISION_API_BASE / service status. Later challenges "
+                            "- check API_KEY / HF_MODEL. Later challenges "
                             "will re-probe automatically.", level="error")
                     # Do not issue several expensive /api/chat requests after
                     # the readiness probe already proved they cannot succeed.
                     return False
-                elif self._vision.model not in models:
-                    self._log(
-                        f"[Captcha] Ollama model {self._vision.model} not pulled - "
-                        f"run: ollama pull {self._vision.model}",
-                        level="warn")
                 else:
                     self._vision_ready = True
 
@@ -4471,86 +4457,19 @@ class DiscordAutomation:
         """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
         return hct.denorm(point, box)
 
-    # lazy offline solvers — return None when torch/weights are absent
-    def _tile_classifier(self):
-        if self._cnn_tile is None:
-            try:
-                from tile_classifier import TileClassifier
-                c = TileClassifier()
-                self._cnn_tile = c if c.available else False
-            except Exception:
-                self._cnn_tile = False
-        return self._cnn_tile or None
-
-    def _point_locator(self):
-        if self._cnn_point is None:
-            try:
-                from tile_classifier import PointLocator
-                c = PointLocator()
-                self._cnn_point = c if c.available else False
-            except Exception:
-                self._cnn_point = False
-        return self._cnn_point or None
-
-    def _drag_locator(self):
-        if self._cnn_drag is None:
-            try:
-                from tile_classifier import DragLocator
-                c = DragLocator()
-                self._cnn_drag = c if c.available else False
-            except Exception:
-                self._cnn_drag = False
-        return self._cnn_drag or None
-
     # ── per-family round solvers ───────────────────────────────────────────
 
     async def _solve_binary_round(self, frame, prompt, dom) -> bool:
         """image_label_binary (+ its reference-image affordance variant).
 
-        Offline path first: the tile CNN labels every tile; when the mean
-        confidence clears _CNN_MIN_CONF and the prompt resolves through the
-        knowledge base, we click without any model-server round trip."""
+        Every tile is screenshotted and answered by the Hugging Face
+        vision model (see vision_solver.py)."""
         tiles = await self._screenshot_challenge_tiles(frame)
         if not tiles:
             return False
         examples = await self._capture_example_images(frame)
-        cnn = self._tile_classifier()
-        if cnn is not None:
-            try:
-                got = cnn.classify_many(tiles, with_conf=True)
-                if len(got) == len(tiles) and got:
-                    labels = [g[0] for g in got]
-                    mean_conf = sum(g[1] for g in got) / len(got)
-                    ex_label = None
-                    if examples:
-                        eg = cnn.classify_many(examples[:1])
-                        if eg:
-                            ex_label = eg[0][0]
-                    if mean_conf >= _CNN_MIN_CONF:
-                        idx = hct.resolve_semantic(prompt, labels,
-                                                   example_label=ex_label)
-                        if idx is not None:
-                            self._log(
-                                f"[Captcha] Offline CNN grid: {labels} "
-                                f"(conf {mean_conf:.2f}, ref={ex_label}) -> {idx}")
-                            if not idx:
-                                # Understood empty round (no tile matches) —
-                                # Verify/Next with nothing selected is correct.
-                                return True
-                            return await self._click_challenge_tiles(frame, idx)
-                        self._log(
-                            "[Captcha] Offline labels made but prompt not "
-                            "understood — asking vision model", level="debug")
-                    else:
-                        self._log(
-                            f"[Captcha] Offline grid confidence {mean_conf:.2f} "
-                            f"< {_CNN_MIN_CONF:.2f} — asking vision model",
-                            level="debug")
-            except Exception as e:
-                self._log(f"[Captcha] Offline grid path error: {e}",
-                          level="debug")
         self._log(
-            f"[Captcha] Asking Ollama ({self._vision.model}) which tiles match...")
+            f"[Captcha] Asking {self._vision.model} which tiles match...")
         answer = await self._vision.solve(prompt, tiles, shape="tiles",
                                           examples=examples)
         if not answer:
@@ -4566,37 +4485,10 @@ class DiscordAutomation:
 
     async def _solve_point_round(self, frame, prompt, bbox: bool = False) -> bool:
         """area_select: click a point — or, for bbox rounds, drag out the
-        box's diagonal. Offline PointLocator first, vision model fallback."""
+        box's diagonal. Answered by the Hugging Face vision model."""
         shot, box = await self._challenge_surface(frame)
         if not shot or not box:
             return False
-        pl = self._point_locator()
-        if pl is not None and not bbox:
-            try:
-                point = None
-                target = hct.extract_target(prompt)
-                if hct.superlative_table(prompt) or not target:
-                    rel = pl.locate_relational(
-                        shot, prompt, verifier=self._tile_classifier())
-                    if rel:
-                        point = (rel[0], rel[1])
-                        self._log(
-                            f"[Captcha] Offline relational point -> "
-                            f"{rel[2]} @ ({rel[0]:.2f},{rel[1]:.2f})")
-                if point is None and target:
-                    hit = pl.locate(shot, target)
-                    if hit:
-                        point = (hit[0], hit[1])
-                        self._log(
-                            f"[Captcha] Offline point '{target}' @ "
-                            f"({hit[0]:.2f},{hit[1]:.2f}) conf={hit[2]:.2f}")
-                if point is not None:
-                    x, y = self._denorm(point, box)
-                    await hm.click(self._page, x, y)
-                    return True
-            except Exception as e:
-                self._log(f"[Captcha] Offline point path error: {e}",
-                          level="debug")
         answer = await self._vision.solve(
             prompt, [shot], shape=("bbox" if bbox else "points"))
         if not answer:
@@ -4632,22 +4524,6 @@ class DiscordAutomation:
         shot, box = await self._challenge_surface(frame)
         if not shot or not box:
             return False
-        dl = self._drag_locator()
-        if dl is not None:
-            try:
-                got = dl.locate(shot)
-                if got:
-                    fx, fy = self._denorm(got["from"], box)
-                    tx, ty = self._denorm(got["to"], box)
-                    self._log(
-                        f"[Captcha] Offline drag ({got['from'][0]:.2f},"
-                        f"{got['from'][1]:.2f}) -> ({got['to'][0]:.2f},"
-                        f"{got['to'][1]:.2f})")
-                    await hm.drag(self._page, (fx, fy), (tx, ty))
-                    return True
-            except Exception as e:
-                self._log(f"[Captcha] Offline drag path error: {e}",
-                          level="debug")
         answer = await self._vision.solve(prompt, [shot], shape="drag")
         if not answer or answer.get("type") != "drag":
             return False
@@ -4741,8 +4617,7 @@ class DiscordAutomation:
         Live prompt: "Move the correct missing block segment onto the
         incomplete tower". hCaptcha serves this under area_select, but
         the answer is a real press/move/release drag — a point click
-        never picks up the piece. NEVER uses DragLocator (punched-slot
-        geometry is the wrong puzzle). Offline wood-mask heuristic
+        never picks up the piece. Offline wood-mask heuristic
         first; a SHORT vision ``shape="tower"`` call is last resort
         (a long 504 expires the challenge).
         """
@@ -4797,95 +4672,23 @@ class DiscordAutomation:
     async def _solve_pattern_round(self, frame, prompt) -> bool:
         """Pattern completion ("put one of the animals into the empty spot
         to complete the pattern"): a 3x3 icon grid with one empty cell and
-        a row of candidates. The CORRECT candidate is chosen by the row/
-        column pattern, so the geometric DragLocator cannot answer it.
+        a row of candidates.
 
-        Offline path: crop the grid cells and candidates out of the
-        surface screenshot, label them with the tile classifier, pick the
-        candidate via hct.resolve_pattern (Latin square) — all gated on
-        classifier confidence. Otherwise the vision model answers with a
-        candidate->hole drag. The gesture itself is a real humanized drag
-        (and if a drag is not accepted, the candidate is clicked instead —
-        some builds accept click-to-place)."""
+        The Hugging Face vision model answers with a candidate->hole drag;
+        the gesture itself is a real humanized drag (and if a drag is not
+        accepted, the candidate is clicked instead — some builds accept
+        click-to-place)."""
         shot, box = await self._challenge_surface(frame)
         if not shot or not box:
             return False
-        from_to = None
-        # ── offline: crop-classify -> Latin-square pattern logic ─────────
-        tc = self._tile_classifier()
-        probe = await self._probe_pattern_dom(frame, box)
-        if tc is not None and probe is not None:
-            try:
-                import io as _io
-                from PIL import Image as _Image
-                import numpy as _np
-                im = _Image.open(_io.BytesIO(shot)).convert("RGB")
-                W, H = im.size
-                cells, cands = probe
-                # hole = the near-white empty cell (max mean brightness;
-                # min-std fails because flat painted tiles can be flatter
-                # than the outlined white hole)
-                crops, means = [], []
-                for rect in cells:
-                    x0 = int(rect[0] * W)
-                    y0 = int(rect[1] * H)
-                    x1 = int((rect[0] + rect[2]) * W)
-                    y1 = int((rect[1] + rect[3]) * H)
-                    c = im.crop((x0, y0, x1, y1))
-                    crops.append(c)
-                    means.append(float(_np.asarray(c.convert("L")).mean()))
-                hole = int(_np.argmax(means))
-                labelled = tc.classify_many(crops)
-                if len(labelled) == len(cells):
-                    grid = [g[0] if i != hole else None
-                            for i, g in enumerate(labelled)]
-                    cand_crops = []
-                    for rect in cands:
-                        x0 = int(rect[0] * W)
-                        y0 = int(rect[1] * H)
-                        x1 = int((rect[0] + rect[2]) * W)
-                        y1 = int((rect[1] + rect[3]) * H)
-                        cand_crops.append(im.crop((x0, y0, x1, y1)))
-                    clab = tc.classify_many(cand_crops)
-                    confs = [g[1] for g in labelled] + [g[1] for g in clab]
-                    mean_conf = sum(confs) / max(1, len(confs))
-                    if mean_conf >= _CNN_MIN_CONF:
-                        win = hct.resolve_pattern(
-                            grid, hole, [g[0] for g in clab])
-                        if win is not None:
-                            cbox = cands[win]
-                            hbox = cells[hole]
-                            from_to = (
-                                (box["x"] + (cbox[0] + cbox[2] / 2) * box[
-                                    "width"],
-                                 box["y"] + (cbox[1] + cbox[3] / 2) * box[
-                                     "height"]),
-                                (box["x"] + (hbox[0] + hbox[2] / 2) * box[
-                                    "width"],
-                                 box["y"] + (hbox[1] + hbox[3] / 2) * box[
-                                     "height"]))
-                            self._log(
-                                f"[Captcha] Offline pattern: grid={grid} "
-                                f"hole={hole} candidates={clab} -> "
-                                f"{clab[win]} (conf {mean_conf:.2f})")
-            except Exception as e:
-                self._log(f"[Captcha] Offline pattern error: {e}",
-                          level="debug")
-        # ── vision fallback ───────────────────────────────────────────────
-        if from_to is None:
-            answer = await self._vision.solve(prompt, [shot],
-                                              shape="pattern")
-            if not answer or answer.get("type") != "drag":
-                return False
-            fx, fy = self._denorm(answer["from"], box)
-            tx, ty = self._denorm(answer["to"], box)
-            from_to = ((fx, fy), (tx, ty))
-            self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
-                      f"-> ({tx:.0f},{ty:.0f})")
-        (fx, fy), (tx, ty) = from_to
+        answer = await self._vision.solve(prompt, [shot], shape="pattern")
+        if not answer or answer.get("type") != "drag":
+            return False
+        fx, fy = self._denorm(answer["from"], box)
+        tx, ty = self._denorm(answer["to"], box)
+        self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
+                  f"-> ({tx:.0f},{ty:.0f})")
         await hm.drag(self._page, (fx, fy), (tx, ty))
-        # some builds accept click-to-place instead of a drag — retry the
-        # candidate with a humanized click when the round does not advance
         return True
 
     async def _probe_pattern_dom(self, frame, surface_box):
@@ -5003,25 +4806,12 @@ class DiscordAutomation:
 
     async def _solve_count_round(self, frame, prompt) -> bool:
         """counting ("How many X are in this image?"): numeric answer
-        options. Tries the offline peak counter first (self-gated — it
-        returns None unless the count is clean), then the vision model,
-        then clicks the option button matching the count."""
+        options. The vision model counts, then the option button matching
+        the count is clicked."""
         shot, box = await self._challenge_surface(frame)
         if not shot:
             return False
         n = None
-        target = hct.extract_target(prompt)
-        if target:
-            pl = self._point_locator()
-            if pl is not None:
-                try:
-                    n = pl.count(shot, target)
-                    if n is not None:
-                        self._log(
-                            f"[Captcha] Offline count: {n} x {target}")
-                except Exception as e:
-                    self._log(f"[Captcha] Offline count error: {e}",
-                              level="debug")
         if n is None:
             answer = await self._vision.solve(prompt, [shot], shape="count")
             if not answer or answer.get("type") != "count":
@@ -5267,8 +5057,8 @@ class DiscordAutomation:
     async def _solve_funcaptcha(self) -> bool:
         """FunCAPTCHA (Arkose) solver using vision AI (DragSolver).
 
-        Uses the vision model (configured via VISION_API_BASE / OLLAMA_BASE)
-        to handle slider puzzles, tile-click challenges, and drag-to-match
+        Uses the Hugging Face vision model (configured via API_KEY /
+        HF_MODEL) to handle slider puzzles, tile-click challenges, and drag-to-match
         challenges served by Arkose Labs FunCAPTCHA.
         """
         try:
