@@ -37,8 +37,8 @@ Configuration (env vars):
 
   API_KEY             Roboflow API key. REQUIRED. Sent as `api_key` in the
                       request body (ROBOFLOW_API_KEY is accepted too).
-  ROBOFLOW_WORKSPACE  workspace slug (default: text-detectioin)
-  ROBOFLOW_WORKFLOW   workflow id (default: gemini-3-6-flash)
+  ROBOFLOW_WORKSPACE  workspace slug (default: alistra742-gmail-com)
+  ROBOFLOW_WORKFLOW   workflow id (default: gemini-3-6-flash-object-detection)
   ROBOFLOW_API_BASE   serverless base URL
                       (default https://serverless.roboflow.com)
   GOOGLE_API_KEY      optional Google AI Studio key; when set it is sent
@@ -95,9 +95,9 @@ API_KEY = (os.environ.get("API_KEY", "").strip()
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
 
 ROBOFLOW_WORKSPACE = (os.environ.get("ROBOFLOW_WORKSPACE", "").strip()
-                      or "text-detectioin")
+                      or "alistra742-gmail-com")
 ROBOFLOW_WORKFLOW = (os.environ.get("ROBOFLOW_WORKFLOW", "").strip()
-                     or "gemini-3-6-flash")
+                     or "gemini-3-6-flash-object-detection")
 
 ROBOFLOW_TIMEOUT = float(os.environ.get("ROBOFLOW_TIMEOUT", "60"))
 ROBOFLOW_CHECK_TIMEOUT = float(os.environ.get("ROBOFLOW_CHECK_TIMEOUT", "60"))
