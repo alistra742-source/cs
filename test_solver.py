@@ -41,7 +41,6 @@ from vision_solver import (
     RoboflowVisionClient,
     detection_classes,
     parse_yesno,
-    per_tile_mode,
     shrink_image,
     tile_yes_question,
 )
