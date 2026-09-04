@@ -282,6 +282,25 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+# ── Tier 3: Gemma vision fallback (Ollama-compatible) ────────────────────
+# Last resort, used only when BOTH the Gemini workflow and rfdetr-small
+# fail. Unlike RT-DETR this is a real VLM: it reads the prompt, so it can
+# answer the reasoning rounds COCO has no class for ("odd one out", most
+# trees/tools). Slower than either, hence last.
+#
+# Ollama cannot run inside the app container, so point GEMMA_BASE at
+# wherever `ollama serve` actually lives:
+#   GEMMA_BASE=http://<host-or-service>:11434
+# Empty GEMMA_BASE disables the tier entirely.
+GEMMA_BASE = (os.environ.get("GEMMA_BASE", "").strip().rstrip("/")
+              or os.environ.get("OLLAMA_BASE", "").strip().rstrip("/"))
+GEMMA_MODEL = (os.environ.get("GEMMA_MODEL", "").strip() or "gemma3:4b")
+GEMMA_TIMEOUT = float(os.environ.get("GEMMA_TIMEOUT", "90"))
+GEMMA_TILE_TIMEOUT = float(os.environ.get("GEMMA_TILE_TIMEOUT", "30"))
+GEMMA_ENABLED = (os.environ.get("GEMMA_ENABLED", "1").strip()
+                 not in ("0", "false", "no", "off"))
+
+
 # ── question rewriting ───────────────────────────────────────────────────
 # hCaptcha speaks to humans ("Please click on all the dogs"). A detector
 # needs to be spoken to in boxes ("Box and coordinate every dog"). These
@@ -664,7 +683,9 @@ class RoboflowVisionClient:
                  api_key: str = "",
                  google_api_key: str = "",
                  rtdetr_model_id: str = "",
-                 rtdetr_enabled: Optional[bool] = None):
+                 rtdetr_enabled: Optional[bool] = None,
+                 gemma_base: Optional[str] = None,
+                 gemma_model: str = ""):
         self._log = log or (lambda msg, level="info": None)
         self.base = (base or ROBOFLOW_API_BASE).rstrip("/")
         self.workspace = workspace or ROBOFLOW_WORKSPACE
@@ -687,7 +708,13 @@ class RoboflowVisionClient:
         self.rtdetr_model_id = rtdetr_model_id or RTDETR_MODEL_ID
         self.rtdetr_enabled = (RTDETR_ENABLED if rtdetr_enabled is None
                                else bool(rtdetr_enabled))
-        self.stats = {"calls": 0, "ok": 0, "failed": 0, "rtdetr": 0}
+        # Tier 3: Gemma VLM, only reachable when GEMMA_BASE is configured.
+        self.gemma_base = (gemma_base if gemma_base is not None
+                           else GEMMA_BASE).rstrip("/")
+        self.gemma_model = gemma_model or GEMMA_MODEL
+        self.gemma_enabled = bool(GEMMA_ENABLED and self.gemma_base)
+        self.stats = {"calls": 0, "ok": 0, "failed": 0, "rtdetr": 0,
+                      "gemma": 0}
         # Machine-readable result of the latest reachability probe. Keeps
         # the public ``check() -> (ok, models)`` contract, while letting
         # callers separate a transient connection failure from a
@@ -768,6 +795,11 @@ class RoboflowVisionClient:
                       level="warn")
             self.last_check_error = ""
             return True, [self.rtdetr_model_id]
+        if await self.check_gemma():
+            self._log(f"[Vision] Roboflow fully unavailable — running on "
+                      f"the Gemma tier ({self.gemma_model})", level="warn")
+            self.last_check_error = ""
+            return True, [self.gemma_model]
         return False, []
 
     async def _check_one(self) -> tuple:
@@ -1186,13 +1218,131 @@ class RoboflowVisionClient:
 
     async def _fallback(self, prompt: str, images: List[bytes],
                         shape: str) -> Optional[dict]:
-        """Gemini could not answer — try the RT-DETR backup detector."""
-        if not self.rtdetr_enabled:
+        """Gemini failed. Try tier 2 (RT-DETR), then tier 3 (Gemma)."""
+        if self.rtdetr_enabled:
+            got = await self.solve_rtdetr(prompt, images, shape)
+            if got is not None:
+                self._log(f"[Vision] RT-DETR backup answered: {got}")
+                return got
+        if self.gemma_enabled:
+            got = await self.solve_gemma(prompt, images, shape)
+            if got is not None:
+                self._log(f"[Vision] Gemma tier-3 answered: {got}")
+                return got
+        return None
+
+    # ── Tier 3: Gemma VLM fallback ──────────────────────────────────────
+
+    async def check_gemma(self) -> bool:
+        """Is the Gemma host up and does it have the model pulled?"""
+        if not self.gemma_enabled:
+            return False
+        try:
+            cfg = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=cfg) as s:
+                async with s.get(f"{self.gemma_base}/api/tags") as r:
+                    if r.status != 200:
+                        self._log(f"[Gemma] host HTTP {r.status}",
+                                  level="warn")
+                        return False
+                    data = await r.json()
+            names = [m.get("name", "") for m in (data or {}).get("models", [])]
+            base = self.gemma_model.split(":")[0]
+            if names and not any(n.split(":")[0] == base for n in names):
+                self._log(f"[Gemma] {self.gemma_model} not pulled on "
+                          f"{self.gemma_base} (have: {names[:4]}) — run "
+                          f"`ollama pull {self.gemma_model}`", level="warn")
+                return False
+            return True
+        except Exception as e:
+            self._log(f"[Gemma] unreachable at {self.gemma_base}: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+
+    async def _gemma_chat(self, system: str, question: str,
+                          images: List[bytes], timeout: float,
+                          want_json: bool = True) -> Optional[str]:
+        """One Ollama /api/chat turn. Returns the message text or None."""
+        payload = {
+            "model": self.gemma_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": question,
+                 "images": [_b64(b) for b in images if b]},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "top_p": 0.9,
+                        "num_predict": 256},
+            "keep_alive": "10m",
+        }
+        if want_json:
+            payload["format"] = "json"
+        try:
+            cfg = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=cfg) as s:
+                async with s.post(f"{self.gemma_base}/api/chat",
+                                  json=payload) as r:
+                    if r.status != 200:
+                        body = (await r.text())[:200]
+                        self._log(f"[Gemma] HTTP {r.status}: {body}",
+                                  level="warn")
+                        return None
+                    data = await r.json()
+            return ((data or {}).get("message") or {}).get("content") or ""
+        except Exception as e:
+            self._log(f"[Gemma] error: {type(e).__name__}", level="warn")
             return None
-        got = await self.solve_rtdetr(prompt, images, shape)
-        if got is not None:
-            self._log(f"[Vision] RT-DETR backup answered: {got}")
-        return got
+
+    async def solve_gemma(self, prompt: str, images: List[bytes],
+                          shape: str = "tiles",
+                          examples: Optional[List[bytes]] = None,
+                          timeout: float = GEMMA_TIMEOUT) -> Optional[dict]:
+        """Last-resort solve with the Gemma VLM.
+
+        Gemma reads the prompt, so unlike rfdetr-small it can answer the
+        rounds that have no COCO class at all. Grid rounds ask one tile at
+        a time (yes/no); every other shape uses the JSON contracts the
+        parsers already understand.
+        """
+        if not self.gemma_enabled or not images:
+            return None
+        self._log(f"[Gemma] tier-3 solve with {self.gemma_model} "
+                  f"@ {self.gemma_base} (shape={shape})")
+        self.stats["gemma"] += 1
+
+        if shape == "tiles" and len(images) >= 2:
+            ref = shrink_image(examples[0]) if examples else None
+            q = tile_yes_question(prompt, has_ref=bool(ref))
+            per = min(GEMMA_TILE_TIMEOUT, max(8.0, timeout))
+            hits, answered = [], 0
+            for i, raw in enumerate(images, 1):
+                tile = shrink_image(raw)
+                bundle = [b for b in ((ref, tile) if ref else (tile,)) if b]
+                text = await self._gemma_chat(
+                    "Look at the image and answer the question with yes "
+                    "or no only.", q, bundle, per, want_json=False)
+                if text is None:
+                    continue
+                answered += 1
+                if parse_yesno(text) is True:
+                    hits.append(i)
+            if answered == 0:
+                return None
+            self._log(f"[Gemma] grid hits: {hits} "
+                      f"({answered}/{len(images)} answered)")
+            return {"type": "tiles", "indices": hits}
+
+        system = _SYSTEM_BY_SHAPE.get(shape, _SYSTEM_BY_SHAPE["tiles"])
+        question = self.shape_question(prompt, shape)
+        bundle = [shrink_image(b) for b in (list(examples or []) + images)]
+        text = await self._gemma_chat(system, question, bundle, timeout)
+        if not text:
+            return None
+        parse_shape = shape if shape != "text" else "tiles"
+        parsed = self._parse_geometry(text, parse_shape, len(images))
+        if parsed is None:
+            parsed = self._parse_answer(text, len(images), shape)
+        return parsed
 
     @staticmethod
     def shape_question(prompt: str, shape: str) -> str:

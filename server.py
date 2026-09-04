@@ -4152,6 +4152,8 @@ class DiscordAutomation:
                     backup_ok = False
                     try:
                         backup_ok = await self._vision.check_rtdetr()
+                        if not backup_ok:
+                            backup_ok = await self._vision.check_gemma()
                     except Exception:
                         backup_ok = False
                     if backup_ok:

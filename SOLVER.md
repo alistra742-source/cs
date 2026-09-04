@@ -318,6 +318,40 @@ and after.
 | `RTDETR_TIMEOUT` | per-image backup timeout (seconds) | `30` |
 | `RTDETR_MIN_CONF` | minimum backup detection confidence | `0.35` |
 
+### Tier 3: Gemma VLM (`gemma3:4b`)
+
+Last resort, tried only after BOTH the Gemini workflow and `rfdetr-small`
+have failed or abstained. Unlike RT-DETR it is a real vision-language
+model, so it reads the prompt and can answer the reasoning rounds COCO
+has no class for ("odd one out", most trees/tools/terrain).
+
+**Ollama cannot run inside the app container** — that container only has
+Python, Chrome and Tor. Run Ollama somewhere reachable and point the app
+at it:
+
+```bash
+# on the Ollama host
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull gemma3:4b
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+```
+
+```bash
+# on the app (Railway variables)
+GEMMA_BASE=http://<ollama-host>:11434
+```
+
+Leaving `GEMMA_BASE` unset disables the tier cleanly — the solver just
+stops after RT-DETR.
+
+| variable | meaning | default |
+|---|---|---|
+| `GEMMA_BASE` | Ollama base URL; empty disables tier 3 | — |
+| `GEMMA_MODEL` | model tag | `gemma3:4b` |
+| `GEMMA_TIMEOUT` | per-solve timeout (s) | `90` |
+| `GEMMA_TILE_TIMEOUT` | per-tile timeout for grids (s) | `30` |
+| `GEMMA_ENABLED` | set 0 to disable | `1` |
+
 ### Backup detector: RT-DETR small
 
 The Gemini workflow is primary. When it fails — host unreachable, 429, out

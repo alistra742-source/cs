@@ -485,5 +485,105 @@ class TestWorkflowCandidateSearch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.workflow_candidates, ("only-this",))
 
 
+class TestGemmaTier3(unittest.IsolatedAsyncioTestCase):
+    """Gemma is tier 3: only after Gemini AND rfdetr-small have failed."""
+
+    def _client(self, base="http://gemma.internal:11434"):
+        return RoboflowVisionClient(api_key="rf_test", gemma_base=base,
+                                    log=lambda *a, **k: None)
+
+    def test_disabled_without_a_host(self):
+        c = RoboflowVisionClient(api_key="k", gemma_base="",
+                                 log=lambda *a, **k: None)
+        self.assertFalse(c.gemma_enabled)
+
+    def test_enabled_with_a_host(self):
+        c = self._client()
+        self.assertTrue(c.gemma_enabled)
+        self.assertEqual(c.gemma_model, "gemma3:4b")
+
+    async def test_disabled_gemma_never_calls_out(self):
+        c = RoboflowVisionClient(api_key="k", gemma_base="",
+                                 log=lambda *a, **k: None)
+
+        async def boom(*a, **k):
+            raise AssertionError("must not call a disabled tier")
+
+        c._gemma_chat = boom
+        self.assertIsNone(await c.solve_gemma("click the dogs", [b"a"]))
+
+    async def test_gemma_grid_uses_yes_no_per_tile(self):
+        c = self._client()
+        replies = ["yes", "no", "yes"]
+
+        async def fake_chat(system, question, images, timeout,
+                            want_json=True):
+            return replies.pop(0)
+
+        c._gemma_chat = fake_chat
+        got = await c.solve_gemma("click each image with a dog",
+                                  [b"a", b"b", b"c"], shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [1, 3]})
+
+    async def test_gemma_answers_geometry_json(self):
+        c = self._client()
+
+        async def fake_chat(*a, **k):
+            return '{"points": [[0.25, 0.75]]}'
+
+        c._gemma_chat = fake_chat
+        got = await c.solve_gemma("click the odd one out", [b"img"],
+                                  shape="points")
+        self.assertIsNotNone(got)
+
+    async def test_tier_order_gemini_then_rtdetr_then_gemma(self):
+        """Gemma runs only when RT-DETR abstains."""
+        c = self._client()
+        called = []
+
+        async def dead_detect(*a, **k):
+            called.append("gemini")
+            return None, None, None
+
+        async def rtdetr_abstains(*a, **k):
+            called.append("rtdetr")
+            return None
+
+        async def gemma_answers(*a, **k):
+            called.append("gemma")
+            return {"type": "tiles", "indices": [2]}
+
+        c._detect = dead_detect
+        c.solve_rtdetr = rtdetr_abstains
+        c.solve_gemma = gemma_answers
+        got = await c.solve("click the odd one out", [b"a", b"b"],
+                            shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [2]})
+        # Gemini is asked once PER TILE, then the tiers run in order.
+        self.assertEqual(called[-2:], ["rtdetr", "gemma"])
+        self.assertEqual(set(called), {"gemini", "rtdetr", "gemma"})
+
+    async def test_gemma_skipped_when_rtdetr_answers(self):
+        c = self._client()
+        called = []
+
+        async def dead_detect(*a, **k):
+            return None, None, None
+
+        async def rtdetr_answers(*a, **k):
+            called.append("rtdetr")
+            return {"type": "tiles", "indices": [1]}
+
+        async def gemma_boom(*a, **k):
+            raise AssertionError("tier 3 must not run when tier 2 answered")
+
+        c._detect = dead_detect
+        c.solve_rtdetr = rtdetr_answers
+        c.solve_gemma = gemma_boom
+        got = await c.solve("click the boats", [b"a", b"b"], shape="tiles")
+        self.assertEqual(got, {"type": "tiles", "indices": [1]})
+        self.assertEqual(called, ["rtdetr"])
+
+
 if __name__ == "__main__":
     unittest.main()
