@@ -4645,8 +4645,65 @@ class DiscordAutomation:
         tx, ty = self._denorm(answer["to"], box)
         self._log(f"[Captcha] Dragging piece ({fx:.0f},{fy:.0f}) -> "
                   f"({tx:.0f},{ty:.0f})")
-        await hm.drag(self._page, (fx, fy), (tx, ty))
-        return True
+        return await self._drag_verified(frame, (fx, fy), (tx, ty))
+
+    async def _piece_signature(self, frame):
+        """Cheap fingerprint of the challenge surface, used to tell whether
+        a drag actually moved anything (vs the piece springing back)."""
+        try:
+            shot, _ = await self._challenge_surface(frame)
+        except Exception:
+            return None
+        if not shot:
+            return None
+        try:
+            import hashlib
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(shot)).convert("L").resize((64, 64))
+            return hashlib.md5(im.tobytes()).hexdigest()
+        except Exception:
+            return None
+
+    async def _drag_verified(self, frame, src, dst) -> bool:
+        """Drag, CHECK it stuck, and escalate the gesture if it snapped back.
+
+        hCaptcha drag widgets are built three different ways (raw pointer
+        tracking, HTML5 drag-and-drop, pointer-capture) and the wrong
+        channel leaves the piece exactly where it started. Rather than
+        guess, try each and verify against a before/after fingerprint of
+        the surface — the piece landing somewhere new changes the pixels.
+        """
+        strategies = (
+            ("pointer", hm.drag),
+            ("slow-pointer", hm.drag_slow),
+            ("html5-dnd", hm.drag_html5),
+            ("pointer-events", hm.drag_pointer_events),
+        )
+        for name, fn in strategies:
+            before = await self._piece_signature(frame)
+            try:
+                res = await fn(self._page, src, dst)
+            except Exception as e:
+                self._log(f"[Captcha] Drag via {name} errored: "
+                          f"{type(e).__name__}", level="warn")
+                continue
+            if isinstance(res, str) and res not in ("ok", None):
+                self._log(f"[Captcha] Drag via {name}: {res}", level="debug")
+            await asyncio.sleep(0.6)
+            after = await self._piece_signature(frame)
+            if before is None or after is None:
+                # Cannot verify — assume the gesture landed.
+                self._log(f"[Captcha] Drag via {name} (unverified)")
+                return True
+            if before != after:
+                self._log(f"[Captcha] Drag via {name} STUCK "
+                          f"(surface changed)")
+                return True
+            self._log(f"[Captcha] Drag via {name} snapped back — "
+                      f"trying the next gesture", level="warn")
+        self._log("[Captcha] All drag gestures snapped back", level="warn")
+        return False
 
     _TOWER_PIECE_JS = r"""() => {
         const vis = (el) => !!(el) &&

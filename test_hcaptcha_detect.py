@@ -107,5 +107,39 @@ class TestDomClassificationRegression(unittest.TestCase):
             h.BINARY)
 
 
+class TestPayloadDragRegression(unittest.TestCase):
+    """hCaptcha ships drag rounds labelled image_label_area_select."""
+
+    PAYLOAD = {"request_type": "image_label_area_select",
+               "requester_question":
+                   {"en": "Please drag the icon to the place where it fits"}}
+
+    def test_payload_label_does_not_beat_drag_wording(self):
+        import hcaptcha_types as h
+        self.assertEqual(h.classify_from_payload(self.PAYLOAD), h.DRAG_DROP)
+
+    def test_genuine_area_select_still_points(self):
+        import hcaptcha_types as h
+        p = {"request_type": "image_label_area_select",
+             "requester_question": {"en": "Please click on the largest animal"}}
+        self.assertEqual(h.classify_from_payload(p), h.AREA_POINT)
+
+    def test_end_to_end_classify_is_drag(self):
+        import hcaptcha_types as h
+        facts = {"tiles": 1, "canvases": 1, "images": 1, "draggables": 0,
+                 "move_badge": False, "choices": 0, "inputs": 0}
+        self.assertEqual(
+            h.classify(self.PAYLOAD, facts,
+                       "Please drag the icon to the place where it fits"),
+            h.DRAG_DROP)
+
+
+class TestDragStrategiesExist(unittest.TestCase):
+    def test_all_four_gestures_are_available(self):
+        import human_mouse as hm
+        for name in ("drag", "drag_slow", "drag_html5", "drag_pointer_events"):
+            self.assertTrue(callable(getattr(hm, name, None)), name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

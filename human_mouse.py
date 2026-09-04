@@ -201,3 +201,125 @@ async def drag(page, start, end, rng: random.Random = None):
     # Let the drop animation commit before the caller screenshots or
     # re-reads the DOM.
     await asyncio.sleep(rng.uniform(0.25, 0.45))
+
+
+async def drag_html5(page, start, end, rng: random.Random = None):
+    """Drag via synthesized HTML5 drag-and-drop events.
+
+    Some hCaptcha drag widgets are built on the native HTML5 DnD API
+    rather than raw pointer tracking. Those listen for dragstart/dragover/
+    drop; a pure mouse gesture leaves them untouched and the piece springs
+    home. This fires the event sequence directly on the elements under the
+    two points.
+    """
+    rng = rng or random
+    js = """(coords) => {
+        const [sx, sy, ex, ey] = coords;
+        const src = document.elementFromPoint(sx, sy);
+        const dst = document.elementFromPoint(ex, ey);
+        if (!src || !dst) return 'no-element';
+        let dt;
+        try { dt = new DataTransfer(); } catch (e) { dt = null; }
+        const mk = (type, x, y) => {
+            const ev = new DragEvent(type, {
+                bubbles: true, cancelable: true, composed: true,
+                clientX: x, clientY: y, dataTransfer: dt
+            });
+            return ev;
+        };
+        try {
+            src.dispatchEvent(mk('dragstart', sx, sy));
+            dst.dispatchEvent(mk('dragenter', ex, ey));
+            dst.dispatchEvent(mk('dragover', ex, ey));
+            dst.dispatchEvent(mk('drop', ex, ey));
+            src.dispatchEvent(mk('dragend', ex, ey));
+            return 'ok';
+        } catch (e) { return 'err: ' + (e && e.message || e); }
+    }"""
+    try:
+        return await page.evaluate(js, [float(start[0]), float(start[1]),
+                                        float(end[0]), float(end[1])])
+    except Exception as e:
+        return f"failed: {type(e).__name__}"
+
+
+async def drag_pointer_events(page, start, end, rng: random.Random = None):
+    """Drag by dispatching a full pointer/mouse event stream in the page.
+
+    A third strategy for widgets that listen to pointerdown/pointermove/
+    pointerup (with setPointerCapture) and ignore CDP-injected input.
+    """
+    rng = rng or random
+    js = """(coords) => {
+        const [sx, sy, ex, ey] = coords;
+        const src = document.elementFromPoint(sx, sy);
+        if (!src) return 'no-element';
+        const fire = (el, type, x, y, extra) => {
+            const base = {
+                bubbles: true, cancelable: true, composed: true,
+                clientX: x, clientY: y, screenX: x, screenY: y,
+                pointerId: 1, pointerType: 'mouse', isPrimary: true,
+                button: 0, buttons: (extra && extra.buttons) || 0
+            };
+            let ev;
+            try { ev = new PointerEvent(type, base); }
+            catch (e) { ev = new MouseEvent(type, base); }
+            el.dispatchEvent(ev);
+        };
+        try {
+            fire(src, 'pointerdown', sx, sy, {buttons: 1});
+            fire(src, 'mousedown', sx, sy, {buttons: 1});
+            const steps = 24;
+            for (let i = 1; i <= steps; i++) {
+                const x = sx + (ex - sx) * (i / steps);
+                const y = sy + (ey - sy) * (i / steps);
+                const el = document.elementFromPoint(x, y) || src;
+                fire(el, 'pointermove', x, y, {buttons: 1});
+                fire(el, 'mousemove', x, y, {buttons: 1});
+            }
+            const dst = document.elementFromPoint(ex, ey) || src;
+            fire(dst, 'pointerup', ex, ey, {buttons: 0});
+            fire(dst, 'mouseup', ex, ey, {buttons: 0});
+            return 'ok';
+        } catch (e) { return 'err: ' + (e && e.message || e); }
+    }"""
+    try:
+        return await page.evaluate(js, [float(start[0]), float(start[1]),
+                                        float(end[0]), float(end[1])])
+    except Exception as e:
+        return f"failed: {type(e).__name__}"
+
+
+async def drag_slow(page, start, end, rng: random.Random = None):
+    """A deliberately slow, high-sample pointer drag.
+
+    Same channel as ``drag`` but with a long grip, ~120 move samples and a
+    1s dwell on the target. Widgets that debounce or require a minimum
+    hold time accept this when the quick gesture is discarded.
+    """
+    rng = rng or random
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    await move(page, sx, sy, rng)
+    await asyncio.sleep(0.35)
+    await page.mouse.down()
+    await asyncio.sleep(0.45)
+    for i in range(6):
+        await page.mouse.move(sx + rng.uniform(-3, 3), sy + rng.uniform(-3, 3))
+        await asyncio.sleep(0.05)
+    steps = 120
+    for i in range(1, steps + 1):
+        t = i / steps
+        # ease-in-out so the motion looks deliberate
+        te = t * t * (3 - 2 * t)
+        await page.mouse.move(sx + (ex - sx) * te, sy + (ey - sy) * te)
+        await asyncio.sleep(0.012)
+    _set_pos(page, (ex, ey))
+    for _ in range(4):
+        await page.mouse.move(ex + rng.uniform(-2, 2), ey + rng.uniform(-2, 2))
+        await asyncio.sleep(0.08)
+    await page.mouse.move(ex, ey)
+    await asyncio.sleep(1.0)
+    await page.mouse.up()
+    _set_pos(page, (ex, ey))
+    await asyncio.sleep(0.4)
