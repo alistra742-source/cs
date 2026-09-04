@@ -1593,6 +1593,9 @@ class DiscordAutomation:
         self._rqdata = ""
         # Discord pairs rqdata with an rqtoken in the same challenge body.
         self._rqtoken = ""
+        # Set when Discord's /auth/register returns 2xx — the only
+        # unambiguous proof the captcha token was accepted.
+        self._register_accepted = False
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
@@ -2063,6 +2066,14 @@ class DiscordAutomation:
                         self._read_challenge_payload(data)
                 except Exception:
                     pass
+                return
+
+            # ── 2a. Did a register call SUCCEED? ──
+            if ("discord.com/api" in url and "/auth/register" in url
+                    and status in (200, 201)):
+                self._register_accepted = True
+                self._log("[Captcha] Discord accepted the registration "
+                          "(captcha cleared)")
                 return
 
             # ── 2. Discord's captcha challenge response ──
@@ -2973,6 +2984,9 @@ class DiscordAutomation:
         # rqdata is single-use and per-challenge: never carry a stale blob
         # from a previous page load into this attempt's solve.
         self._rqdata = ""
+        self._rqtoken = ""
+        # A previous attempt's success must never satisfy this attempt.
+        self._register_accepted = False
 
         # app.py closes + nulls self._mail between attempts (prevents aiohttp
         # connector leaks) while REUSING this bot object for the next attempt —
@@ -3334,7 +3348,15 @@ class DiscordAutomation:
             return False
 
     async def _past_captcha(self) -> bool:
-        """True when the page has moved past the captcha into Discord."""
+        """True when the page has moved past the captcha into Discord.
+
+        The URL is not the only signal: Discord's SPA can accept the
+        registration and mint a session without navigating anywhere the
+        keyword list would match. A 2xx on /auth/register is definitive,
+        so trust that first.
+        """
+        if getattr(self, "_register_accepted", False):
+            return True
         try:
             cur_url = self._page.url
             return any(k in cur_url for k in PAST_CAPTCHA_KEYWORDS)
@@ -4945,6 +4967,84 @@ class DiscordAutomation:
         return out;
     }"""
 
+    # Patch fetch/XHR so Discord's OWN register call carries our token.
+    # The React app does not read textarea[name=h-captcha-response]; it
+    # sends {captcha_key, captcha_rqtoken} in the /auth/register body. Any
+    # token we inject into the DOM is simply never looked at.
+    _CAPTCHA_HOOK_JS = r"""() => {
+        if (window.__ncHookInstalled) return 'already';
+        window.__ncHookInstalled = true;
+        window.__ncToken = window.__ncToken || '';
+        window.__ncRqToken = window.__ncRqToken || '';
+        window.__ncInjections = 0;
+
+        const isAuth = (u) => {
+            try {
+                const s = String(u || '');
+                return s.indexOf('/api/') !== -1 &&
+                    (s.indexOf('/auth/register') !== -1 ||
+                     s.indexOf('/auth/login') !== -1);
+            } catch (e) { return false; }
+        };
+
+        const addCaptcha = (bodyText) => {
+            if (!window.__ncToken) return bodyText;
+            let obj;
+            try { obj = JSON.parse(bodyText || '{}'); }
+            catch (e) { return bodyText; }
+            if (!obj || typeof obj !== 'object') return bodyText;
+            obj.captcha_key = window.__ncToken;
+            if (window.__ncRqToken) obj.captcha_rqtoken = window.__ncRqToken;
+            window.__ncInjections++;
+            return JSON.stringify(obj);
+        };
+
+        // fetch
+        const of = window.fetch;
+        window.fetch = function (input, init) {
+            try {
+                const url = (typeof input === 'string')
+                    ? input : (input && input.url);
+                if (isAuth(url) && init && init.body &&
+                        typeof init.body === 'string') {
+                    init = Object.assign({}, init,
+                                         {body: addCaptcha(init.body)});
+                }
+            } catch (e) {}
+            return of.apply(this, arguments);
+        };
+
+        // XMLHttpRequest
+        const oo = XMLHttpRequest.prototype.open;
+        const os = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) {
+            this.__ncUrl = u;
+            return oo.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function (body) {
+            try {
+                if (isAuth(this.__ncUrl) && typeof body === 'string') {
+                    arguments[0] = addCaptcha(body);
+                }
+            } catch (e) {}
+            return os.apply(this, arguments);
+        };
+        return 'installed';
+    }"""
+
+    async def _install_captcha_hook(self) -> bool:
+        """Install the fetch/XHR patch (idempotent)."""
+        try:
+            res = await asyncio.wait_for(
+                self._page.evaluate(self._CAPTCHA_HOOK_JS), timeout=8.0)
+            if res == "installed":
+                self._log("[Captcha] Register-request hook installed")
+            return bool(res)
+        except Exception as e:
+            self._log(f"[Captcha] Could not install the register hook: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+
     async def _apply_hcaptcha_token(self, token: str) -> bool:
         """Inject a solved token and confirm the page actually advanced."""
         try:
@@ -4967,6 +5067,24 @@ class DiscordAutomation:
             self._log("[NoneCap] Nothing accepted the token (no response "
                       "field and no widget callback)", level="warn")
             return False
+
+        # THE important step: hand the token to the request hook so
+        # Discord's own /auth/register call carries captcha_key.
+        await self._install_captcha_hook()
+        try:
+            pub = await asyncio.wait_for(self._page.evaluate(
+                """(a) => {
+                    window.__ncToken = a[0] || '';
+                    window.__ncRqToken = a[1] || '';
+                    return {tok: !!window.__ncToken,
+                            rq: !!window.__ncRqToken};
+                }""", [token, getattr(self, "_rqtoken", "") or ""]),
+                timeout=8.0)
+            self._log(f"[NoneCap] Token published to the request hook "
+                      f"({pub})")
+        except Exception as e:
+            self._log(f"[NoneCap] Could not publish the token: "
+                      f"{type(e).__name__}", level="warn")
 
         # Submit and give the page a moment to accept it.
         try:
