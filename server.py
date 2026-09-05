@@ -20,6 +20,7 @@ from captcha_solver import (
 from duckmail import TempMail
 import hcaptcha_types as hct
 import human_mouse as hm
+import nav_policy
 
 
 # ── Shared JS: robust login-link / back-to-login detection ──────────────
@@ -367,6 +368,26 @@ _NAV_STATE_JS = r"""() => {
             fPass = fPass || doc.querySelector('input[type="password"], input[name="password"]');
         }
     } catch (e) { /* frame walk is best-effort */ }
+    // JS-bundle health. Discord's index.html can COMMIT while its multi-MB
+    // bundles are still downloading on a slow circuit — React cannot boot
+    // until they land, so an empty #app-mount shell is then NORMAL, not a
+    // dead page. A <script src> tag gets a resource-timing entry only once
+    // it FINISHED, so tags-without-entry = still in flight (pre-load) or
+    // FAILED (post-load, e.g. CDN 403/500 through the proxy). The render
+    // wait uses this to tell "be patient" from "reload / rotate".
+    let scriptsTotal = 0, scriptsPending = 0, scriptsFailed = 0;
+    try {
+        const tags = Array.from(document.querySelectorAll("script[src]"));
+        scriptsTotal = tags.length;
+        const finished = new Set();
+        for (const r of performance.getEntriesByType("resource")) {
+            if (r.initiatorType === "script") {
+                finished.add(r.name);
+                if (typeof r.responseStatus === "number" && r.responseStatus >= 400) scriptsFailed++;
+            }
+        }
+        for (const s of tags) { if (!finished.has(s.src)) scriptsPending++; }
+    } catch (e) { /* best-effort */ }
     return JSON.stringify({
         url: location.href,
         title: document.title || "",
@@ -383,6 +404,10 @@ _NAV_STATE_JS = r"""() => {
         buttonCount: document.querySelectorAll("button").length + extraButtons,
         cfClearance: document.cookie.indexOf("cf_clearance=") !== -1,
         challenge: challenge,
+        scriptsTotal: scriptsTotal,
+        scriptsPending: scriptsPending,
+        scriptsFailed: scriptsFailed,
+        loadComplete: document.readyState === "complete",
         textPreview: text.substring(0, 250)
     });
 }"""
@@ -1531,6 +1556,21 @@ async def capture_page_screenshot(page, log=None,
         except Exception:
             return b""
 
+    # The browser's own new-tab / blank tab carries zero information, yet a
+    # frame of it used to become the feed's "last good frame" at startup and
+    # then replay for the whole navigation (the dashboard sat on a Google
+    # new-tab page while the worker was 30s into a Discord goto). Skip the
+    # capture entirely on those pages - cheaper than a CDP round trip, and
+    # the dashboard shows its honest "waiting for the first frame"
+    # placeholder instead of a misleading stale tab.
+    try:
+        _u, _t = await asyncio.wait_for(page.evaluate(
+            "() => [location.href || '', document.title || '']"), timeout=2.0)
+        if nav_policy.is_uninformative_page(str(_u or ""), str(_t or "")):
+            return b""
+    except Exception:
+        pass
+
     live = str(reveal or "safe").strip().lower() == "live"
     reveal_js = _REVEAL_FORM_LIVE_JS if live else _REVEAL_FORM_JS
     try:
@@ -1559,16 +1599,20 @@ async def capture_page_screenshot(page, log=None,
                     level="warn")
 
     # Primary frame: the full viewport (the entire browser window).
-    # Live register retries a couple of times so a truncated/half PNG is
-    # never published as the camera frame.
-    tries = 3 if live else 2
+    # Retries ride a BACKOFF, not a flat 0.12s: while a navigation is
+    # uncommitted the renderer has no surface yet and CDP returns empty
+    # data, so the old flat retries all landed inside the same stall and
+    # the camera logged "empty capture" for the whole 30s goto. Spreading
+    # the retries over ~2s lets a tick catch the commit paint instead.
+    tries = 4 if live else 3
+    backoff = (0.15, 0.5, 1.2)
     for attempt in range(tries):
         timeout = viewport_timeout if attempt == 0 else max(4.0, float(viewport_timeout) * 0.7)
         shot = await _viewport(timeout)
         if _png_viewport_ok(shot):
             return shot
         if attempt + 1 < tries:
-            await asyncio.sleep(0.12)
+            await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
     return b""
 
 
@@ -2730,8 +2774,13 @@ class DiscordAutomation:
         # fatal title, detected above). An unreadable or blank page is still
         # loading — keep waiting; reload it up to max_reloads times to
         # re-fetch dropped JS bundles, then keep waiting.
-        reload_after = 4.0       # standard mode: blank this long -> re-fetch bundles
-        max_reloads = 0 if LOW_MEMORY_MODE else 2
+        reload_after = 4.0       # blank this long AFTER bundles land -> re-fetch
+        # Low-memory mode gets ONE bounded reload instead of none: a bundle
+        # the proxy dropped is never re-fetched by waiting, and burning the
+        # whole render budget + a circuit on it is worse than one reload's
+        # transient allocation (gc.collect() runs first, see the RELOAD
+        # branch). Standard mode keeps two.
+        max_reloads = 1 if LOW_MEMORY_MODE else 2
         _render_wait_start = time.time()
         self._log(f"[Nav] Waiting for registration form to render (no timeout - reloads<={max_reloads}, reload_after={reload_after:.0f}s)...")
         last_probe = ""          # last page probe result (see the poll below)
@@ -2743,6 +2792,8 @@ class DiscordAutomation:
         blank_nav_since = None   # when the tab first sat at about:blank (nav never committed)
         nav_reissues = 0         # re-issued gotos for a never-committed navigation
         dead_reads = 0           # consecutive unreadable polls -> page died (old-build bail)
+        last_bundle_note = 0.0   # throttle for the "bundles in flight" note
+        lowmem_blank_note = False  # one-shot low-memory "no more reloads" note
         crash_recovered = False  # already recovered a crashed tab on this circuit this nav
         last_log = -1.0
         while True:
@@ -2915,7 +2966,14 @@ class DiscordAutomation:
                 # challenges get unlimited time). A page that still has no
                 # form after the budget gets the session rotated to a fresh
                 # circuit instead of polling indefinitely.
-                if elapsed >= RENDER_WAIT_BUDGET_S:
+                # While JS bundles are PROVABLY still in flight the circuit
+                # is alive by definition (resource timing only lists a
+                # script once it finished) - extend the budget instead of
+                # rotating a slow-but-working session.
+                _render_budget = RENDER_WAIT_BUDGET_S
+                if nav_policy.bundles_pending(state):
+                    _render_budget += nav_policy.RENDER_BUNDLE_PATIENCE_S
+                if elapsed >= _render_budget:
                     self._nav_error = (f"Discord form never rendered after {int(elapsed)}s "
                                        "(stub page / dead circuit) - rotating to fresh circuit")
                     self._log(f"[Nav] Form never rendered after {int(elapsed)}s - rotating to fresh circuit", level="warn")
@@ -2945,35 +3003,70 @@ class DiscordAutomation:
                         if blank_since is not None:
                             self._log("[Nav] cf_clearance cookie appeared - Cloudflare challenge passed, waiting for React...")
                         blank_since = None
-                    elif (not LOW_MEMORY_MODE and time.time() - blank_since >= reload_after
-                          and reload_count < max_reloads):
-                        reload_count += 1
-                        self._log(f"[Nav] React still blank after {int(reload_after)}s - reloading page (attempt {reload_count}/{max_reloads}) to re-fetch JS bundles...")
-                        try:
-                            await asyncio.wait_for(self._page.reload(), timeout=15.0)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(1.2)
-                        blank_since = None
-                        challenge_since = None
-                        continue
-                    elif LOW_MEMORY_MODE and time.time() - blank_since >= reload_after:
-                        # Reloading a full SPA creates a short-lived second
-                        # renderer/allocation spike. In a 1 GB container wait
-                        # for the render budget and rotate cleanly if it never
-                        # hydrates instead of risking an OOM renderer kill.
-                        if int(time.time() - blank_since) == int(reload_after):
-                            self._log("[Nav] Low-memory mode: React still blank; skipping reload to protect renderer")
-                    elif not LOW_MEMORY_MODE and reload_count >= max_reloads and _js_required:
-                        # A JS-required stub after reloads is a flagged exit
-                        # IP, not a dropped bundle - reloading will never fix
-                        # it. Rotate NOW instead of burning the full budget.
-                        self._nav_error = "Discord served JS-required stub after reloads - rotating to fresh circuit"
-                        self._log("[Nav] Stub page persists after reloads - rotating to fresh circuit", level="warn")
-                        return False
-                    # max_reloads exhausted (blank, non-stub) - the budget
-                    # check above rotates the session instead of waiting
-                    # forever. A slow circuit still gets its full chance.
+                    else:
+                        _blank_for = time.time() - blank_since
+                        _action = nav_policy.blank_action(
+                            state, _blank_for, reload_count, max_reloads,
+                            reload_after, _js_required, LOW_MEMORY_MODE)
+                        if _action == nav_policy.WAIT_BUNDLES:
+                            # Bundles verifiably still downloading on THIS
+                            # circuit - React cannot boot yet, so reloading
+                            # would only restart a download that is making
+                            # progress. Re-base the blank timer (the reload
+                            # decision only runs once the bundles land or
+                            # fail) and note the progress in ALL LOGS.
+                            blank_since = time.time()
+                            if time.time() - last_bundle_note >= 10.0:
+                                last_bundle_note = time.time()
+                                self._log(
+                                    f"[Nav] JS bundles still in flight "
+                                    f"({state.get('scriptsPending')}/"
+                                    f"{state.get('scriptsTotal')}) on this "
+                                    f"circuit - waiting for first paint "
+                                    f"(no reload, render budget extended)")
+                        elif _action == nav_policy.RELOAD:
+                            reload_count += 1
+                            if LOW_MEMORY_MODE:
+                                # One bounded re-fetch beats burning the
+                                # circuit; reclaim first so the reload's
+                                # transient allocation has headroom.
+                                gc.collect()
+                            self._log(
+                                f"[Nav] React still blank {_blank_for:.0f}s "
+                                f"after the bundles settled "
+                                f"({state.get('scriptsFailed')} failed) - "
+                                f"reloading to re-fetch them "
+                                f"({reload_count}/{max_reloads})...")
+                            try:
+                                await asyncio.wait_for(self._page.reload(), timeout=15.0)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1.2)
+                            blank_since = None
+                            challenge_since = None
+                            continue
+                        elif _action == nav_policy.ROTATE_STUB:
+                            # A JS-required stub after every reload is a
+                            # flagged exit IP, not a dropped bundle -
+                            # reloading will never fix it. Rotate NOW
+                            # instead of burning the full budget.
+                            self._nav_error = "Discord served JS-required stub after reloads - rotating to fresh circuit"
+                            self._log("[Nav] Stub page persists after reloads - rotating to fresh circuit", level="warn")
+                            return False
+                        elif (_action == nav_policy.WAIT_BUDGET
+                                and LOW_MEMORY_MODE and not lowmem_blank_note):
+                            # Reloads exhausted in a 1 GB container: no
+                            # further reloads (each is a second renderer
+                            # allocation spike) - the render budget above
+                            # rotates the circuit when it expires.
+                            lowmem_blank_note = True
+                            self._log("[Nav] Low-memory mode: reloads exhausted with "
+                                      "React still blank - waiting out the render "
+                                      "budget, then rotating (no further reloads)")
+                    # Blank with no bundles in flight and no reloads left:
+                    # the budget check above rotates the session instead of
+                    # waiting forever. A slow circuit still gets its full
+                    # chance (plus the bundle patience on top of it).
                 else:
                     blank_since = None
                 if state.get("isLogin") and not login_clicked and elapsed >= 3.0:
