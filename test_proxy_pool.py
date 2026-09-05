@@ -126,5 +126,84 @@ class TestNoTorInTheSolverPath(unittest.TestCase):
         self.assertIn(entry["host"], egress)
 
 
+class TestWorkerPassesTheProxyToTheBrowser(unittest.TestCase):
+    """The bug: the worker picked a session then built the bot without it.
+
+    DiscordAutomation(headless=..., domain=...) left self.proxy None, so
+    _launch_proxy() returned None and Chrome silently launched on TOR —
+    one second after logging '663 proxy sessions loaded'.
+    """
+
+    def test_worker_constructs_the_bot_with_proxy(self):
+        src = open("app.py").read()
+        i = src.index("bot = DiscordAutomation(\n"
+                      "                headless=cfg.get(\"headless\", True),")
+        block = src[i:i + 260]
+        self.assertIn("proxy=proxy", block,
+                      "worker must hand the session to the browser")
+
+    def test_launch_proxy_is_populated(self):
+        import server
+        entry = proxies.vault_proxies()[0]
+        bot = server.DiscordAutomation(headless=True, domain="x",
+                                       proxy=entry)
+        lp = bot._launch_proxy()
+        self.assertIsNotNone(lp, "None here means TOR")
+        self.assertIn(entry["host"], lp["server"])
+        self.assertEqual(lp["username"], entry["username"])
+
+    def test_without_a_proxy_launch_is_none(self):
+        import server
+        bot = server.DiscordAutomation(headless=True, domain="x")
+        self.assertIsNone(bot._launch_proxy())
+
+
+class TestSolverEgressAcceptsBothShapes(unittest.TestCase):
+    """_solver_proxy_url read only `server` and returned "" for pool
+    entries, silently dropping the solver back to its own IP."""
+
+    def setUp(self):
+        self.entry = proxies.vault_proxies()[0]
+
+    def _url(self, proxy):
+        import server
+
+        class B:
+            pass
+
+        b = B()
+        b.proxy = proxy
+        return server.DiscordAutomation._solver_proxy_url(b)
+
+    def test_pool_entry_shape(self):
+        url = self._url(self.entry)
+        self.assertIn(self.entry["username"], url)
+        self.assertIn(self.entry["host"], url)
+
+    def test_playwright_shape(self):
+        url = self._url({
+            "server": f"http://{self.entry['host']}:{self.entry['port']}",
+            "username": self.entry["username"],
+            "password": self.entry["password"]})
+        self.assertIn(self.entry["username"], url)
+
+    def test_both_shapes_agree(self):
+        a = self._url(self.entry)
+        b = self._url({
+            "server": f"http://{self.entry['host']}:{self.entry['port']}",
+            "username": self.entry["username"],
+            "password": self.entry["password"]})
+        self.assertEqual(a, b)
+
+    def test_browser_and_solver_share_the_session(self):
+        import server
+        bot = server.DiscordAutomation(headless=True, domain="x",
+                                       proxy=self.entry)
+        lp = bot._launch_proxy()
+        eg = server.DiscordAutomation._solver_proxy_url(bot)
+        self.assertIn(lp["username"], eg)
+        self.assertIn(self.entry["host"], eg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -421,6 +421,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
             bot = DiscordAutomation(
                 headless=cfg.get("headless", True),
                 domain=domain,
+                proxy=proxy,
             )
             state["bot"] = bot
             try:

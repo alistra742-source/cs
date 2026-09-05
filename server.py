@@ -4915,17 +4915,29 @@ class DiscordAutomation:
         if override:
             return override
         p = self.proxy
-        if isinstance(p, dict):
-            server = str(p.get("server") or "").strip()
-            user = str(p.get("username") or "").strip()
-            pwd = str(p.get("password") or "").strip()
-            if server:
-                if user and "@" not in server:
-                    scheme, _, hostport = server.partition("://")
-                    if hostport:
-                        return f"{scheme}://{user}:{pwd}@{hostport}"
-                return server
-        return ""
+        if not isinstance(p, dict):
+            return ""
+        user = str(p.get("username") or "").strip()
+        pwd = str(p.get("password") or "").strip()
+        # Pool entries are {proto, host, port, username, password}; the
+        # Playwright form is {server, username, password}. Accept BOTH —
+        # reading only `server` returned "" for real pool sessions and
+        # silently dropped the solver back to its own IP.
+        server_url = str(p.get("server") or "").strip()
+        if not server_url:
+            host = str(p.get("host") or "").strip()
+            port = str(p.get("port") or "").strip()
+            if host:
+                proto = str(p.get("proto") or "http").strip() or "http"
+                server_url = f"{proto}://{host}:{port}" if port \
+                    else f"{proto}://{host}"
+        if not server_url:
+            return ""
+        if user and "@" not in server_url:
+            scheme, _, hostport = server_url.partition("://")
+            if hostport:
+                return f"{scheme}://{user}:{pwd}@{hostport}"
+        return server_url
 
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
