@@ -976,13 +976,17 @@ class _Page:
         subs = [s.lower() for s in (url_substrings or []) if s]
 
         async def _on_paused(event, _conn=None):
+            # EVERY path must end in continue_request: a paused request
+            # that is never continued blocks the page forever.
             rid = getattr(event, "request_id", None)
-            req = getattr(event, "request", None)
-            url = (getattr(req, "url", "") or "")
-            body = getattr(req, "post_data", None)
+            if rid is None:
+                return
             new_body = None
             try:
-                if rid is not None and any(x in url.lower() for x in subs):
+                req = getattr(event, "request", None)
+                url = (getattr(req, "url", "") or "")
+                body = getattr(req, "post_data", None)
+                if any(x in url.lower() for x in subs):
                     new_body = mutate(url, body)
             except Exception:
                 new_body = None
@@ -1025,6 +1029,16 @@ class _Page:
                 for sub in (url_substrings or ["*"])
             ]
             await tab.send(cdp.fetch.enable(patterns=patterns))
+            return True
+        except Exception:
+            return False
+
+    async def disable_request_interception(self) -> bool:
+        """Fetch.disable — stop pausing requests."""
+        if cdp is None:
+            return False
+        try:
+            await self._tab.send(cdp.fetch.disable())
             return True
         except Exception:
             return False

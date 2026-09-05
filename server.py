@@ -5213,6 +5213,23 @@ class DiscordAutomation:
                       "(network-layer token injection)")
         return bool(ok)
 
+    async def _disarm_cdp_captcha_interceptor(self) -> None:
+        """Turn Fetch interception back off.
+
+        A paused-request domain left enabled after we stop listening is a
+        page-wide stall waiting to happen.
+        """
+        if not getattr(self, "_cdp_interceptor_on", False):
+            return
+        self._cdp_interceptor_on = False
+        try:
+            fn = getattr(self._page, "disable_request_interception", None)
+            if callable(fn):
+                await asyncio.wait_for(fn(), timeout=8.0)
+                self._log("[Captcha] CDP request interceptor disarmed")
+        except Exception:
+            pass
+
     async def _install_captcha_hook_early(self) -> None:
         """Install the request hook as soon as the page exists.
 
@@ -5230,10 +5247,11 @@ class DiscordAutomation:
             await self._install_captcha_hook()
         except Exception:
             pass
-        try:
-            await self._install_cdp_captcha_interceptor()
-        except Exception:
-            pass
+        # NB: the CDP Fetch interceptor is deliberately NOT armed here.
+        # Fetch.enable PAUSES every matching request until we continue it,
+        # so leaving it on for the whole session risks stalling the page
+        # (observed: 'Form never rendered after 75s'). It is armed only
+        # once a token exists, and disarmed straight after the submit.
 
     async def _install_captcha_hook(self) -> bool:
         """Install the fetch/XHR patch (idempotent)."""
@@ -5244,8 +5262,11 @@ class DiscordAutomation:
                 self._log("[Captcha] Register-request hook installed")
             return bool(res)
         except Exception as e:
-            self._log(f"[Captcha] Could not install the register hook: "
-                      f"{type(e).__name__}", level="warn")
+            # A dead/naviating page is normal here — the hook is
+            # re-installed when the token arrives, so this is not an error
+            # worth a warning on every attempt.
+            self._log(f"[Captcha] Register hook deferred "
+                      f"({type(e).__name__})", level="debug")
             return False
 
     _DIRECT_REGISTER_JS = r"""(p) => {
@@ -5436,7 +5457,9 @@ class DiscordAutomation:
         # The click did not produce a register request (Discord keeps the
         # challenge open instead of re-POSTing), so send it ourselves with
         # the token attached.
-        if await self._direct_register_with_token(token):
+        ok_direct = await self._direct_register_with_token(token)
+        await self._disarm_cdp_captcha_interceptor()
+        if ok_direct:
             return True
 
         # Did our token actually leave the browser? This separates "the

@@ -151,5 +151,80 @@ class TestSourceInvariants(unittest.TestCase):
         self.assertIn('url_pattern=f"*{sub}*"', block)
 
 
+@unittest.skipUnless(HAS_CDP, "nodriver not installed")
+class TestNeverStallsThePage(unittest.IsolatedAsyncioTestCase):
+    """Fetch.enable pauses requests; a missed continue hangs the page.
+
+    Live regression: arming the interceptor at page creation produced
+    'Form never rendered after 75s' followed by a dead-CDP rebuild loop.
+    """
+
+    async def _fire(self, page, rid="R1"):
+        class Req:
+            url = "https://discord.com/api/v9/auth/register"
+            post_data = '{"e":1}'
+
+        class Ev:
+            request_id = rid
+            request = Req()
+
+        page._tab.handlers[cdp.fetch.RequestPaused][0](Ev())
+        await asyncio.sleep(0.15)
+
+    async def test_continues_when_mutate_raises(self):
+        page = make_page()
+
+        def boom(u, b):
+            raise RuntimeError("boom")
+
+        await page.intercept_request_bodies(["/auth/register"], boom)
+        await self._fire(page)
+        self.assertGreaterEqual(len(page._tab.sent), 2)
+
+    async def test_continues_when_mutate_returns_none(self):
+        page = make_page()
+        await page.intercept_request_bodies(["/auth/register"],
+                                            lambda u, b: None)
+        await self._fire(page)
+        self.assertGreaterEqual(len(page._tab.sent), 2)
+
+    async def test_missing_request_id_is_safe(self):
+        page = make_page()
+        await page.intercept_request_bodies(["/auth/register"],
+                                            lambda u, b: None)
+
+        class Bad:
+            request_id = None
+
+        page._tab.handlers[cdp.fetch.RequestPaused][0](Bad())
+        await asyncio.sleep(0.1)
+
+    async def test_can_be_disabled(self):
+        page = make_page()
+        await page.intercept_request_bodies(["/auth/register"],
+                                            lambda u, b: None)
+        self.assertTrue(await page.disable_request_interception())
+
+
+class TestNotArmedAtPageCreation(unittest.TestCase):
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_early_install_does_not_arm_fetch(self):
+        i = self.src.index("async def _install_captcha_hook_early")
+        block = self.src[i:i + 1400]
+        self.assertNotIn("_install_cdp_captcha_interceptor()", block)
+
+    def test_disarm_exists_and_runs_after_the_submit(self):
+        self.assertIn("_disarm_cdp_captcha_interceptor", self.src)
+        i = self.src.index("_direct_register_with_token(token)")
+        self.assertIn("_disarm_cdp_captcha_interceptor",
+                      self.src[i:i + 400])
+
+    def test_hook_failure_is_not_a_warning(self):
+        i = self.src.index("Register hook deferred")
+        self.assertIn('level="debug"', self.src[i:i + 200])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
