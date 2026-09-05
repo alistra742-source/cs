@@ -552,5 +552,113 @@ class TestRespKey(unittest.TestCase):
         self.assertIn("getRespKey", src)
 
 
+class TestNoDanglingCalls(unittest.TestCase):
+    """Every self.X() must exist. A deleted helper still being called is
+    how '_widget_rqdata' shipped and killed the run on attempt 2."""
+
+    def test_no_dangling_self_calls_in_server(self):
+        import ast
+        src = open("server.py").read()
+        tree = ast.parse(src)
+        defined, assigned, called = set(), set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defined.add(node.name)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx,
+                                                              ast.Store):
+                if isinstance(node.value, ast.Name) \
+                        and node.value.id == "self":
+                    assigned.add(node.attr)
+            if isinstance(node, ast.Call) and isinstance(node.func,
+                                                         ast.Attribute):
+                v = node.func.value
+                if isinstance(v, ast.Name) and v.id == "self":
+                    called.add(node.func.attr)
+        missing = sorted(c for c in called
+                         if c not in defined and c not in assigned)
+        self.assertEqual(missing, [], f"calls with no definition: {missing}")
+
+    def test_no_vision_module_imports_remain(self):
+        src = open("server.py").read()
+        for mod in ("vision_solver", "drag_solver", "shape_drag",
+                    "shape_match_cv", "text_puzzle", "hcaptcha_detect"):
+            self.assertNotIn(f"import {mod}", src)
+
+
+class TestNoneCapPathRuns(unittest.IsolatedAsyncioTestCase):
+    """Execute _solve_with_nonecap for real against stubs."""
+
+    async def test_full_path_executes(self):
+        import os
+
+        import server
+
+        class FakePage:
+            url = "https://discord.com/register"
+            frames = []
+
+            async def evaluate(self, js, arg=None):
+                j = str(js)
+                if "location.href" in j:
+                    return "https://discord.com/register"
+                if "__ncToken" in j:
+                    return {"tok": True, "rq": True, "rk": True}
+                if "auth/register" in j and "fetch" in j:
+                    return {"status": 400, "body": '{"captcha_key":'
+                            '["invalid-response"]}'}
+                if "__ncHookInstalled" in j:
+                    return "installed"
+                return {}
+
+            async def screenshot(self):
+                return b""
+
+        class FakeSolver:
+            enabled = True
+            last_error = ""
+            last_solve_id = "solve_test"
+            last_resp_key = "E1_k"
+            calls = []
+
+            async def solve(self, sitekey, url, rqdata="", proxy="", **kw):
+                FakeSolver.calls.append(rqdata)
+                return "P1_" + "t" * 50
+
+            async def report(self, *a, **k):
+                return True
+
+        FakeSolver.calls = []
+        bot = server.DiscordAutomation.__new__(server.DiscordAutomation)
+        attrs = dict(
+            _page=FakePage(), _stopped=asyncio.Event(), _nonecap=FakeSolver(),
+            _events=None,
+            proxy={"host": "g", "port": 80, "username": "u", "password": "p"},
+            _rqdata="R" * 216, _rqtoken="t", _captcha_session_id="s",
+            _captcha_respkey="", _captcha_invisible=True,
+            _hcaptcha_sitekey="a9b5fb07-92ff-493f-86fe-352a2803b3df",
+            _discord_fingerprint="fp", _dob_iso="1996-07-28",
+            _display_name_used="u", _email="a@b.c", _username="u",
+            _password="p", _nc_direct_inflight=False, _cdp_injections=0,
+            _cdp_inject_note="", _cdp_interceptor_on=False,
+            _last_direct_status=0, _register_accepted=False,
+            _pending_captcha_token="", _challenge_payload=None,
+            _proxy_relay=None)
+        for k, v in attrs.items():
+            setattr(bot, k, v)
+        bot._log = lambda m, level="info": None
+
+        old = os.environ.get("NONECAP_API")
+        os.environ["NONECAP_API"] = "nc_live_test"
+        try:
+            ok = await bot._solve_with_nonecap()
+        finally:
+            if old is None:
+                os.environ.pop("NONECAP_API", None)
+            else:
+                os.environ["NONECAP_API"] = old
+        self.assertFalse(ok)
+        self.assertEqual(len(FakeSolver.calls), 3, "all 3 attempts must run")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

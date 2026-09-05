@@ -4397,8 +4397,13 @@ class DiscordAutomation:
                                 "() => (document.body ? document.body.innerText.substring(0, 500) : '')")
                             low = page_text.lower()
                             if ('captcha' in low or 'security' in low or 'verify' in low):
-                                self._log("[Captcha] No hCaptcha frames — trying FunCAPTCHA solver", level="warn")
-                                return await self._solve_funcaptcha()
+                                # FunCAPTCHA/Arkose needed the vision stack
+                                # that is gone; Discord register serves
+                                # hCaptcha anyway. Rotate instead.
+                                self._log("[Captcha] Non-hCaptcha challenge "
+                                          "detected — rotating session",
+                                          level="warn")
+                                return False
                         except Exception:
                             pass
 
@@ -4444,8 +4449,9 @@ class DiscordAutomation:
                                         or 'security' in page_text.lower()
                                         or 'verify' in page_text.lower())
                     if has_captcha_text:
-                        self._log("[Captcha] FunCAPTCHA detected - pixel tile solver...")
-                        return await self._solve_funcaptcha()
+                        self._log("[Captcha] Non-hCaptcha challenge on the "
+                                  "page — rotating session", level="warn")
+                        return False
                     self._log(f"[Captcha] No captcha indicators on page: {self._page.url[:40]}", level="warn")
                     return False
                 except Exception as e:
@@ -4802,38 +4808,9 @@ class DiscordAutomation:
                 "IP-bound, so this is expected to return invalid-response. "
                 "Set NONECAP_PROXY (or use a residential proxy) to fix it.",
                 level="warn")
+        # Discord's /auth/register 400 is the authoritative source for
+        # rqdata — it is the blob Discord itself will validate against.
         rqdata = await self._live_rqdata()
-        # Cross-check against the widget actually running in the page. A
-        # mismatch means we are solving a DIFFERENT challenge than the one
-        # Discord will validate — the one remaining explanation for a
-        # correct-looking token being refused.
-        try:
-            live = await self._widget_rqdata()
-            live_rq = str(live.get("rqdata") or "")
-            live_sk = str(live.get("sitekey") or "")
-            if live_sk and sitekey and live_sk != sitekey:
-                self._log(f"[NoneCap] SITEKEY MISMATCH: widget={live_sk[:8]}… "
-                          f"vs challenge={sitekey[:8]}… — using the widget's",
-                          level="warn")
-                sitekey = live_sk
-            if live_rq and rqdata and live_rq != rqdata:
-                self._log(f"[NoneCap] RQDATA MISMATCH: the widget is bound to "
-                          f"a different challenge than Discord's 400 "
-                          f"(widget {len(live_rq)} chars vs "
-                          f"{len(rqdata)} chars) — solving the WIDGET's",
-                          level="warn")
-                rqdata = live_rq
-            elif live_rq and not rqdata:
-                rqdata = live_rq
-                self._log(f"[NoneCap] rqdata taken from the live widget "
-                          f"({len(live_rq)} chars)")
-            elif live_rq:
-                self._log("[NoneCap] rqdata matches the live widget")
-            else:
-                self._log("[NoneCap] widget exposes no rqdata to compare",
-                          level="debug")
-        except Exception:
-            pass
         if not rqdata:
             self._log("[NoneCap] No enterprise rqdata found — solving as "
                       "plain hCaptcha (Discord binds tokens to rqdata, so "
@@ -4853,12 +4830,6 @@ class DiscordAutomation:
                 # fall back to the stale /getcaptcha payload — which is why
                 # attempt 2 logged the same rqdata hash as attempt 1.
                 fresh = await self._live_rqdata()
-                widget = await self._widget_rqdata()
-                w_rq = str(widget.get("rqdata") or "")
-                if w_rq and w_rq != fresh:
-                    self._log("[NoneCap] retry: widget rqdata differs from "
-                              "the API's — trusting the widget")
-                    fresh = w_rq
                 if fresh and fresh != rqdata:
                     self._log(f"[NoneCap] retry bound to the FRESH challenge "
                               f"({len(fresh)} chars)")
