@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""Regressions for two bugs that aborted every attempt.
+"""Regressions for bugs that aborted or hung every attempt.
 
 1. NameError: `probe` was read outside the throttled block that defines it,
    so the FIRST unreadable-page iteration crashed the whole attempt.
 2. False-positive hCaptcha "widget error": the detector scanned the entire
    body innerText, which includes hCaptcha's inline hsw script blob, so a
    healthy widget was declared broken and the circuit rotated.
+3. Blank-SPA hang: on a slow circuit Discord's index.html commits while its
+   JS bundles are STILL downloading; the render wait could not tell that
+   from a dropped bundle - standard mode reloaded a download that was
+   making progress, and LOW_MEMORY_MODE (max_reloads=0) never re-fetched a
+   bundle the proxy dropped, burning the budget + a live circuit.
+4. Camera: the startup new-tab page became the feed's "last good frame"
+   and replayed for the whole navigation; empty captures during an
+   uncommitted goto spammed ALL LOGS every tick.
 """
 import ast
 import re
 import unittest
+
+import nav_policy
 
 
 class TestProbeIsAlwaysBound(unittest.TestCase):
@@ -96,6 +106,114 @@ class TestWidgetErrorFalsePositive(unittest.TestCase):
         self.assertIn("querySelectorAll", body)
         self.assertNotIn("document.body ? document.body.innerText : ''",
                          body)
+
+
+class TestBlankSpaBundlePolicy(unittest.TestCase):
+    """The render wait must tell 'bundles downloading' from 'bundles dead'.
+
+    Regression for the hang in the field log: DOM committed in 31s, React
+    never booted, and LOW_MEMORY_MODE (then max_reloads=0) neither waited
+    for the in-flight bundles nor re-fetched the failed ones - the attempt
+    polled to the budget and rotated a circuit that was fine.
+    """
+
+    IN_FLIGHT = {"scriptsTotal": 7, "scriptsPending": 5, "scriptsFailed": 0,
+                 "loadComplete": False}
+    SETTLED = {"scriptsTotal": 7, "scriptsPending": 0, "scriptsFailed": 1,
+               "loadComplete": True}
+
+    def test_bundles_in_flight_are_patient(self):
+        self.assertEqual(
+            nav_policy.blank_action(self.IN_FLIGHT, 30.0, 0, 1, 4.0,
+                                    False, True),
+            nav_policy.WAIT_BUNDLES)
+
+    def test_in_flight_extends_the_render_budget(self):
+        self.assertTrue(nav_policy.bundles_pending(self.IN_FLIGHT))
+        self.assertFalse(nav_policy.bundles_pending(self.SETTLED))
+
+    def test_settled_blank_reloads_even_in_low_memory(self):
+        # The old low-memory dead end: max_reloads=0 meant a dropped bundle
+        # was never re-fetched. One bounded reload must happen in BOTH modes.
+        self.assertEqual(
+            nav_policy.blank_action(self.SETTLED, 5.0, 0, 1, 4.0, False, True),
+            nav_policy.RELOAD)
+        self.assertEqual(
+            nav_policy.blank_action(self.SETTLED, 5.0, 0, 2, 4.0, False, False),
+            nav_policy.RELOAD)
+
+    def test_too_early_to_judge_waits(self):
+        settled_no_fail = {"scriptsTotal": 7, "scriptsPending": 0,
+                           "scriptsFailed": 0, "loadComplete": False}
+        self.assertEqual(
+            nav_policy.blank_action(settled_no_fail, 2.0, 0, 1, 4.0,
+                                    False, True),
+            nav_policy.WAIT)
+
+    def test_reloads_exhausted_waits_for_the_budget(self):
+        self.assertEqual(
+            nav_policy.blank_action(self.SETTLED, 9.0, 1, 1, 4.0, False, True),
+            nav_policy.WAIT_BUDGET)
+
+    def test_stub_after_reloads_rotates_in_both_memory_modes(self):
+        for low_memory in (True, False):
+            self.assertEqual(
+                nav_policy.blank_action(self.SETTLED, 9.0, 2, 2, 4.0,
+                                        True, low_memory),
+                nav_policy.ROTATE_STUB)
+
+    def test_state_without_bundle_fields_is_not_pending(self):
+        for empty in ({}, None, {"scriptsPending": "n/a"}):
+            self.assertFalse(nav_policy.bundles_pending(empty))
+        # ...and a blank old-style probe still gets the reload path.
+        self.assertEqual(nav_policy.blank_action({}, 9.0, 0, 1, 4.0,
+                                                 False, True),
+                         nav_policy.RELOAD)
+
+    def test_server_loop_is_wired_to_the_policy(self):
+        src = open("server.py").read()
+        self.assertIn("nav_policy.blank_action(", src)
+        self.assertIn("nav_policy.bundles_pending(state)", src)
+        self.assertIn("max_reloads = 1 if LOW_MEMORY_MODE else 2", src)
+        # The old dead ends are gone.
+        self.assertNotIn("max_reloads = 0 if LOW_MEMORY_MODE", src)
+        self.assertNotIn("skipping reload to protect renderer", src)
+
+    def test_state_probe_reports_bundle_health(self):
+        src = open("server.py").read()
+        for field in ("scriptsPending:", "scriptsTotal:", "scriptsFailed:",
+                      "loadComplete:"):
+            self.assertIn(field, src)
+        ast.parse(src)
+
+
+class TestCameraNeverStoresBrowserTabs(unittest.TestCase):
+    """The feed must not replay the startup new-tab page as 'last good'."""
+
+    def test_new_tab_and_blank_pages_are_uninformative(self):
+        for url, title in (("chrome://newtab", "New Tab"),
+                           ("about:blank", ""),
+                           ("", "Ny fane"),
+                           ("chrome://newtab-footer", "Neuer Tab")):
+            self.assertTrue(nav_policy.is_uninformative_page(url, title),
+                            f"{url}/{title} should be skipped")
+
+    def test_real_pages_are_informative(self):
+        self.assertFalse(nav_policy.is_uninformative_page(
+            "https://discord.com/register", "Discord"))
+        self.assertFalse(nav_policy.is_uninformative_page(
+            "https://discord.com/register", ""))
+
+    def test_capture_is_gated_on_the_check(self):
+        src = open("server.py").read()
+        self.assertIn("nav_policy.is_uninformative_page(", src)
+
+    def test_capture_retries_ride_a_backoff(self):
+        src = open("server.py").read()
+        i = src.find("async def capture_page_screenshot")
+        body = src[i:i + 6500]
+        self.assertIn("backoff = (0.15, 0.5, 1.2)", body)
+        self.assertNotIn("await asyncio.sleep(0.12)", body)
 
 
 if __name__ == "__main__":
