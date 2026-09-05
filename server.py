@@ -4494,6 +4494,26 @@ class DiscordAutomation:
             if nc_ok:
                 return True
 
+            # Tier 2 — AZcaptcha (another hosted token).
+            try:
+                if await asyncio.wait_for(self._solve_with_azcaptcha(),
+                                          timeout=NONECAP_STEP_BUDGET):
+                    return True
+            except Exception as e:
+                self._log(f"[AZcaptcha] step error {type(e).__name__}: {e}",
+                          level="warn")
+
+            # Tiers 3-4 — vision. These do NOT mint a token: they say where
+            # to click, we click it, and the widget mints its own. For
+            # enterprise rqdata that is the only binding that can match.
+            try:
+                if await asyncio.wait_for(self._solve_with_vision_chain(),
+                                          timeout=NONECAP_STEP_BUDGET):
+                    return True
+            except Exception as e:
+                self._log(f"[Vision] step error {type(e).__name__}: {e}",
+                          level="warn")
+
             # ── NoneCap is the ONLY solver ──────────────────────────
             # The local vision stack is gone: it never cleared a single
             # Discord challenge, and every round it "tried" cost 20-45s
@@ -4752,6 +4772,359 @@ class DiscordAutomation:
 
 
 
+    async def _challenge_surface(self, frame):
+        """(screenshot bytes, page-space box) of the biggest canvas/image in
+        the challenge frame — the click surface for point/bbox/drag rounds."""
+        try:
+            info = await frame.evaluate(self._SURFACE_JS)
+        except Exception:
+            info = None
+        if not info or float(info.get("width", 0)) < 60:
+            return None, None
+        ox, oy = await self._frame_origin(frame)
+        box = {"x": float(info["x"]) + ox, "y": float(info["y"]) + oy,
+               "width": float(info["width"]), "height": float(info["height"])}
+        try:
+            raw = await frame.screenshot()
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(raw)).convert("RGB")
+            x0 = int(info["x"]); y0 = int(info["y"])
+            x1 = x0 + int(info["width"])
+            y1 = y0 + int(info["height"])
+            # The rect comes from getBoundingClientRect INSIDE the frame,
+            # but frame.screenshot() is not always that same coordinate
+            # space (device pixel ratio, or the element sitting in a nested
+            # document). A crop that lands off-image returns solid black —
+            # which is exactly the "0 contours on every round" symptom.
+            iw, ih = im.size
+            # Clamp to a VALID rect. An element scrolled out of view gives
+            # negative or beyond-image coords, and PIL then raises
+            # "Coordinate 'right' is less than 'left'" — which killed every
+            # drag round with "Surface screenshot failed".
+            cx0 = max(0, min(x0, iw - 1))
+            cy0 = max(0, min(y0, ih - 1))
+            cx1 = max(cx0 + 1, min(x1, iw))
+            cy1 = max(cy0 + 1, min(y1, ih))
+            if (cx1 - cx0) < 60 or (cy1 - cy0) < 60:
+                self._log(f"[Captcha] Element rect ({x0},{y0},{x1},{y1}) is "
+                          f"outside the {iw}x{ih} frame — using the whole "
+                          f"frame", level="warn")
+                cx0, cy0, cx1, cy1 = 0, 0, iw, ih
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
+            crop = im.crop((cx0, cy0, cx1, cy1))
+            if not self._surface_is_usable(crop):
+                self._log(f"[Captcha] Cropped surface looks blank "
+                          f"({crop.size[0]}x{crop.size[1]} of {iw}x{ih} at "
+                          f"{x0},{y0}) — using the whole frame instead",
+                          level="warn")
+                crop = im
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
+            buf = _io.BytesIO()
+            crop.save(buf, "JPEG", quality=92)
+            return buf.getvalue(), box
+        except Exception as e:
+            self._log(f"[Captcha] Surface screenshot failed: {e}", level="debug")
+            return None, None
+
+    def _denorm(self, point, box):
+        """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
+        return hct.denorm(point, box)
+
+    async def _click_challenge_tiles(self, frame, indices) -> bool:
+        """Humanized clicks on the given 1-based tile indices (reading order).
+
+        hCaptcha grades pointer telemetry, so a bare element.click() in a
+        tight loop is an automation tell. Each tile gets a Bezier glide to a
+        gaussian landing point inside its box (frame origin applied) with a
+        real down/dwell/up, and a human 0.18-0.55 s pause between tiles.
+        element.click() remains only as a last-resort fallback."""
+        for sel in ('div.task-image, [class*="task-image" i]',
+                    '.task-grid img, [class*="task-grid" i] img, '
+                    '.challenge-content img'):
+            try:
+                n = await frame.locator(sel).count()
+            except Exception:
+                continue
+            if n == 0:
+                continue
+            # tile rects are frame-local (getBoundingClientRect); add the
+            # iframe's own page offset once
+            try:
+                rects = await frame.evaluate("""(sel) => {
+                    const out = [];
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        out.push({ x: r.left, y: r.top,
+                                   width: r.width, height: r.height });
+                    }
+                    return out;
+                }""", sel)
+            except Exception:
+                rects = None
+            ox, oy = await self._frame_origin(frame)
+            clicked = 0
+            for idx in indices:
+                if not (isinstance(idx, int) and 1 <= idx <= n):
+                    continue
+                done = False
+                if rects and len(rects) >= idx:
+                    r = rects[idx - 1]
+                    if r and r.get("width"):
+                        try:
+                            await hm.click_box(self._page, {
+                                "x": r["x"] + ox, "y": r["y"] + oy,
+                                "width": r["width"], "height": r["height"]})
+                            done = True
+                        except Exception:
+                            done = False
+                if not done:
+                    try:
+                        await frame.locator(sel).nth(idx - 1).click(timeout=5000)
+                        done = True
+                    except Exception:
+                        continue
+                clicked += 1
+                await asyncio.sleep(random.uniform(0.18, 0.55))
+            if clicked:
+                return True
+        return False
+
+    async def _type_challenge_answer(self, frame, text: str) -> bool:
+        """Fill the answer input for 'type the characters' challenges."""
+        try:
+            inp = frame.locator('input[type="text"], input:not([type]), textarea').first
+            await inp.click(timeout=4000)
+            await inp.fill(text, timeout=4000)
+            self._log("[Captcha] Typed challenge answer")
+            return True
+        except Exception:
+            return False
+
+    async def _piece_signature(self, frame):
+        """Cheap fingerprint of the challenge surface, used to tell whether
+        a drag actually moved anything (vs the piece springing back)."""
+        try:
+            shot, _ = await self._challenge_surface(frame)
+        except Exception:
+            return None
+        if not shot:
+            return None
+        try:
+            import hashlib
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(shot)).convert("L").resize((64, 64))
+            return hashlib.md5(im.tobytes()).hexdigest()
+        except Exception:
+            return None
+
+    async def _drag_verified(self, frame, src, dst) -> bool:
+        """Drag, CHECK it stuck, and escalate the gesture if it snapped back.
+
+        hCaptcha drag widgets are built three different ways (raw pointer
+        tracking, HTML5 drag-and-drop, pointer-capture) and the wrong
+        channel leaves the piece exactly where it started. Rather than
+        guess, try each and verify against a before/after fingerprint of
+        the surface — the piece landing somewhere new changes the pixels.
+        """
+        strategies = (
+            ("pointer", hm.drag),
+            ("slow-pointer", hm.drag_slow),
+            ("html5-dnd", hm.drag_html5),
+            ("pointer-events", hm.drag_pointer_events),
+        )
+        for name, fn in strategies:
+            before = await self._piece_signature(frame)
+            try:
+                res = await fn(self._page, src, dst)
+            except Exception as e:
+                self._log(f"[Captcha] Drag via {name} errored: "
+                          f"{type(e).__name__}", level="warn")
+                continue
+            if isinstance(res, str) and res not in ("ok", None):
+                self._log(f"[Captcha] Drag via {name}: {res}", level="debug")
+            await asyncio.sleep(0.6)
+            after = await self._piece_signature(frame)
+            if before is None or after is None:
+                # Cannot verify — assume the gesture landed.
+                self._log(f"[Captcha] Drag via {name} (unverified)")
+                return True
+            if before != after:
+                self._log(f"[Captcha] Drag via {name} STUCK "
+                          f"(surface changed)")
+                if self._events is not None:
+                    self._events.report_nowait(
+                        "pass", stage="drag_gesture", gesture=name)
+                return True
+            self._log(f"[Captcha] Drag via {name} snapped back — "
+                      f"trying the next gesture", level="warn")
+        self._log("[Captcha] All drag gestures snapped back", level="warn")
+        if self._events is not None:
+            self._events.report_nowait("fail", stage="drag_gesture",
+                                       gesture="all-failed")
+        return False
+
+    async def _solve_with_vision_chain(self) -> bool:
+        """Tiers 3-4: a VLM says where to click; the WIDGET mints the token.
+
+        This is the important difference from the token tiers. NoneCap and
+        AZcaptcha hand us a token minted elsewhere, which Discord's
+        enterprise sitekey then has to accept. Here we never import a
+        token: the model returns coordinates, our own humanized mouse
+        clicks them, and hCaptcha mints its own token inside the session
+        it has already been scoring. There is no rqdata binding to
+        mismatch, because the widget knows its own challenge.
+        """
+        try:
+            import solver_chain
+        except Exception:
+            return False
+        avail = solver_chain.available()
+        tiers = []
+        if avail.get("openrouter"):
+            tiers.append(("openrouter", 3))
+        if avail.get("google"):
+            tiers.append(("google", 4))
+        if not tiers:
+            return False
+
+        chall = await self._challenge_iframe()
+        if chall is None:
+            return False
+        frame = await self._hcaptcha_frame_for(chall)
+        if frame is None:
+            return False
+        prompt = await self._read_challenge_prompt(frame)
+        if not prompt:
+            self._log("[Vision] No prompt readable yet", level="warn")
+            return False
+
+        dom = await self._probe_challenge_dom(frame)
+        family = hct.classify(self._challenge_payload, dom, prompt)
+        shape = hct.answer_shape(family)
+        self._log(f"[Vision] Challenge [{family}/{shape}]: {prompt[:90]}")
+
+        # Grid rounds send every tile; everything else sends the canvas.
+        images: list = []
+        box = None
+        if shape == "tiles":
+            images = await self._grab_challenge_tiles(frame)
+        if not images:
+            shot, box = await self._challenge_surface(frame)
+            if not shot:
+                self._log("[Vision] No usable surface", level="warn")
+                return False
+            images = [shot]
+
+        for provider, tier in tiers:
+            solver = solver_chain.VisionSolver(provider, log=self._log)
+            if not solver.enabled:
+                continue
+            self._log(f"[Vision] Tier {tier}: {provider} ({solver.model})")
+            answer = await solver.solve(prompt, images, shape=shape)
+            if not answer:
+                continue
+            if await self._apply_vision_answer(frame, answer, box):
+                # Let the widget mint and the page settle.
+                for _ in range(10):
+                    await asyncio.sleep(1.0)
+                    if await self._past_captcha():
+                        self._log("[Vision] [OK] Challenge cleared — the "
+                                  "WIDGET minted the token")
+                        return True
+                    tok = await read_hcaptcha_token(self._page)
+                    if tok:
+                        self._log(f"[Vision] Widget minted a token "
+                                  f"({len(tok)} chars) — submitting")
+                        await self._click_form_submit()
+                        for _ in range(8):
+                            await asyncio.sleep(1.0)
+                            if await self._past_captcha():
+                                return True
+                        break
+                self._log(f"[Vision] Tier {tier} answered but the round did "
+                          f"not clear", level="warn")
+        return False
+
+    async def _grab_challenge_tiles(self, frame) -> list:
+        """Screenshot each tile of a grid round, in reading order."""
+        out: list = []
+        for sel in ('div.task-image, [class*="task-image" i]',
+                    '.task-grid img, [class*="task-grid" i] img'):
+            try:
+                loc = frame.locator(sel)
+                n = await loc.count()
+            except Exception:
+                continue
+            if n < 4:
+                continue
+            for i in range(min(n, 9)):
+                try:
+                    raw = await loc.nth(i).screenshot()
+                    if raw:
+                        out.append(raw)
+                except Exception:
+                    pass
+            if out:
+                break
+        return out
+
+    async def _apply_vision_answer(self, frame, answer: dict,
+                                   box) -> bool:
+        """Execute a vision answer with humanized input."""
+        kind = answer.get("type")
+        try:
+            if kind == "tiles":
+                idx = answer.get("indices") or []
+                if not idx:
+                    self._log("[Vision] No tiles selected", level="warn")
+                    return False
+                ok = await self._click_challenge_tiles(frame, idx)
+                if ok:
+                    await self._click_challenge_verify(frame)
+                return ok
+            if kind == "points" and box:
+                for pt in (answer.get("points") or [])[:4]:
+                    x, y = self._denorm(pt, box)
+                    await hm.click(self._page, x, y)
+                    await asyncio.sleep(random.uniform(0.25, 0.6))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "drag" and box:
+                fx, fy = self._denorm(answer["from"], box)
+                tx, ty = self._denorm(answer["to"], box)
+                self._log(f"[Vision] Dragging ({fx:.0f},{fy:.0f}) -> "
+                          f"({tx:.0f},{ty:.0f})")
+                await self._drag_verified(frame, (fx, fy), (tx, ty))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "bbox" and box:
+                bb = answer["bbox"]
+                x1, y1 = self._denorm((bb["x1"], bb["y1"]), box)
+                x2, y2 = self._denorm((bb["x2"], bb["y2"]), box)
+                await hm.drag(self._page, (x1, y1), (x2, y2))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "text":
+                if await self._type_challenge_answer(frame,
+                                                     answer.get("text", "")):
+                    await self._click_challenge_verify(frame)
+                    return True
+                return False
+            if kind == "count":
+                if await self._type_challenge_answer(
+                        frame, str(answer.get("count", ""))):
+                    await self._click_challenge_verify(frame)
+                    return True
+                return False
+        except Exception as e:
+            self._log(f"[Vision] Could not apply answer: "
+                      f"{type(e).__name__}: {e}", level="warn")
+        return False
+
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
 
@@ -4961,6 +5334,49 @@ class DiscordAutomation:
         self._log(
             "[NoneCap] =========================================",
             level="warn")
+        return False
+
+    async def _solve_with_azcaptcha(self) -> bool:
+        """Tier 2: AZcaptcha token, submitted exactly like NoneCap's."""
+        try:
+            import solver_chain
+        except Exception:
+            return False
+        if not solver_chain.AZCAPTCHA_KEY():
+            return False
+        sitekey = getattr(self, "_hcaptcha_sitekey", "") or ""
+        if not sitekey:
+            try:
+                sitekey = await asyncio.wait_for(
+                    extract_hcaptcha_sitekey(self._page), timeout=10.0) or ""
+            except Exception:
+                sitekey = ""
+        if not sitekey:
+            return False
+        rqdata = await self._live_rqdata()
+        solved_rqtoken = getattr(self, "_rqtoken", "") or ""
+        solved_session = getattr(self, "_captcha_session_id", "") or ""
+        try:
+            page_url = await asyncio.wait_for(
+                self._page.evaluate("() => location.href"), timeout=5.0)
+        except Exception:
+            page_url = "https://discord.com/register"
+
+        az = solver_chain.AZCaptcha(log=self._log)
+        self._log("[AZcaptcha] Tier 2 — hosted token")
+        token = await az.solve(sitekey, str(page_url), rqdata=rqdata,
+                               invisible=bool(getattr(
+                                   self, "_captcha_invisible", True)),
+                               proxy=self._solver_proxy_url())
+        if not token:
+            return False
+        self._captcha_respkey = ""
+        if await self._apply_hcaptcha_token(
+                token, solved_rqtoken=solved_rqtoken,
+                solved_session=solved_session):
+            self._log("[AZcaptcha] [OK] Token accepted")
+            return True
+        self._log("[AZcaptcha] Token rejected", level="warn")
         return False
 
     # Setting textarea.value is not enough on a React form: React tracks

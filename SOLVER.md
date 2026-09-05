@@ -210,3 +210,50 @@ tiles is necessary but not sufficient. The previous local stack
 runs, and NoneCap's purpose-built enterprise tokens are still refused.
 This service is here for a target where solving the visible challenge is
 what actually mints the token.
+
+## Four-tier captcha chain
+
+| tier | env var | what it returns |
+|---|---|---|
+| 1 NoneCap | `NONECAP_API` | hosted enterprise **token** |
+| 2 AZcaptcha | `API_KEY2` | hosted **token** (`in.php`/`res.php`, rqdata via `data`) |
+| 3 OpenRouter | `API_KEY3` | **coordinates** — gemini-2.5-flash |
+| 4 Google AI | `API_KEY4` | **coordinates** — gemini-2.5-flash |
+
+Tried in order; the first that clears the round wins.
+
+### Why tiers 3-4 are different in kind
+
+Tiers 1-2 hand us a token minted **somewhere else**, which Discord's
+enterprise sitekey then has to accept. That is what keeps returning
+`invalid-response`.
+
+Tiers 3-4 never import a token. The model returns coordinates, the bot
+clicks them with its own humanized mouse (`human_mouse.py` — Bezier
+paths, gaussian landing points, real dwell), clicks Verify, and
+**hCaptcha mints its own token** inside the session it has been scoring
+all along. There is no rqdata binding to mismatch, because the widget
+knows its own challenge.
+
+### The vision prompt
+
+The models are told, and re-told, to answer with coordinates and nothing
+else:
+
+```
+You are solving a captcha. Reply with COORDINATES ONLY.
+OUTPUT RULES — follow exactly:
+  * Reply with ONE line of raw JSON and NOTHING else.
+  * No prose. No explanation. No markdown. No code fences.
+  * Coordinates are NORMALISED floats 0.0-1.0, where (0,0) is the
+    TOP-LEFT of the image and (1,1) is the BOTTOM-RIGHT.
+  * Never output pixels. Never output percentages.
+```
+
+Per shape they get one exact output spec — `{"indices":[1,4,7]}`,
+`{"points":[[x,y]]}`, `{"from":[x,y],"to":[x,y]}`, `{"bbox":{...}}`,
+`{"count":3}`, `{"text":"..."}`. Replies are still parsed defensively:
+code fences stripped, JSON dug out of prose, percentages rescaled,
+out-of-range tile indices dropped, coords clamped to 0-1.
+
+Optional: `OPENROUTER_MODEL`, `GOOGLE_MODEL`, `VISION_TIMEOUT` (45s).
