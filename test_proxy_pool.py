@@ -205,5 +205,77 @@ class TestSolverEgressAcceptsBothShapes(unittest.TestCase):
         self.assertIn(self.entry["host"], eg)
 
 
+class TestValidation(unittest.TestCase):
+    """Fresh sessions must be PROVEN before a worker draws one.
+
+    The old deferred sweep waited for an idle renderer that never comes
+    while a worker runs, so a freshly bought pool sat at
+    '0 Discord-reachable' and take() handed out unproven sessions.
+    """
+
+    def setUp(self):
+        import asyncio
+        self.pool = proxies.ProxyPool()
+        asyncio.get_event_loop_policy().new_event_loop()
+        import asyncio as a
+        a.run(self.pool.refresh())
+
+    def test_pool_exposes_validate_until(self):
+        self.assertTrue(hasattr(self.pool, "validate_until"))
+
+    def test_counts_start_unproven(self):
+        st = self.pool.stats()
+        self.assertEqual(st["verified"], 0)
+        self.assertEqual(st["unproven"], st["available"])
+
+    def test_counts_track_probe_results(self):
+        for i, e in enumerate(self.pool._proxies[:20]):
+            if i % 4 == 0:
+                e["_valid"] = True
+            elif i % 4 == 1:
+                e["_probe_failed"] = True
+        st = self.pool.stats()
+        self.assertEqual(st["verified"], 5)
+        self.assertEqual(st["dead"], 5)
+        self.assertEqual(st["unproven"], st["available"] - 10)
+
+    def test_take_prefers_proven_sessions(self):
+        for e in self.pool._proxies[:5]:
+            e["_valid"] = True
+        for _ in range(15):
+            self.assertTrue(self.pool.take().get("_valid"))
+
+    def test_take_avoids_probe_failed_sessions(self):
+        for e in self.pool._proxies:
+            e["_probe_failed"] = True
+        good = self.pool._proxies[7]
+        good.pop("_probe_failed")
+        good["_valid"] = True
+        for _ in range(10):
+            self.assertTrue(self.pool.take().get("_valid"))
+
+
+class TestWarmupWiring(unittest.TestCase):
+    def setUp(self):
+        self.src = open("app.py").read()
+
+    def test_validation_runs_before_workers_start(self):
+        i = self.src.index("await validate_working_set()")
+        j = self.src.index('task = asyncio.create_task(_run_worker(wid, cfg, None), name=f"worker-{wid}")')
+        self.assertLess(i, j, "must validate before workers draw sessions")
+
+    def test_sweep_no_longer_waits_for_an_idle_browser(self):
+        i = self.src.index("async def _deferred_proxy_sweep")
+        block = self.src[i:i + 1500]
+        self.assertNotIn("_browser_busy()", block)
+
+    def test_dashboard_has_a_validate_endpoint(self):
+        self.assertIn("/proxies/validate", self.src)
+
+    def test_dashboard_shows_working_and_dead(self):
+        for token in ("proxyUnproven", "CHECK PROXIES", "applyProxyStats"):
+            self.assertIn(token, self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

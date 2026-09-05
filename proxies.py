@@ -319,10 +319,16 @@ class ProxyPool:
         return {
             "available": self.count,
             "fetched": self.fetched_count,
-            "valid": self.valid_count,
+            "valid": self.working_count,
             "used": self.used_count,
             "working": self.worked_count,
             "failed": self.failed_count,
+            # Live validation picture for the dashboard.
+            "verified": self.working_count,
+            "unproven": self.unproven_count,
+            "dead": sum(1 for p in self._proxies
+                        if p.get("_probe_failed")
+                        or p.get("key") in self._failed),
             "last_refresh": self.last_refresh,
         }
 
@@ -365,9 +371,17 @@ class ProxyPool:
         if not candidates:
             self._failed = set()
             candidates = list(self._proxies)
+        # Never hand out a session that failed its probe while unproven
+        # ones remain — that is what put a dead proxy in front of a worker.
+        untried = [p for p in candidates if not p.get("_probe_failed")]
+        candidates = untried or candidates
         fresh = [p for p in candidates if p.get("key") not in self._used_before]
         pool_ = fresh or candidates
         valid = [p for p in pool_ if p.get("_valid")]
+        if not valid:
+            # fall back to proven sessions from the whole pool before
+            # resorting to an unproven one
+            valid = [p for p in candidates if p.get("_valid")]
         proxy = random.choice(valid) if valid else random.choice(pool_)
         key = proxy.get("key")
         self._used_at[key] = now
@@ -438,6 +452,76 @@ class ProxyPool:
                 await conn.close()
         except Exception:
             return False
+
+    async def validate_until(self, target: int = 12,
+                             concurrency: int = 8,
+                             timeout: float = 6.0,
+                             max_tests: int = 0,
+                             log: Optional[Callable] = None) -> dict:
+        """Probe sessions until ``target`` of them reach Discord.
+
+        Stops as soon as the target is met, so a 663-session pool costs a
+        few seconds rather than a full sweep. Sessions that answer are
+        marked ``_valid`` (take() prefers those); ones that fail here are
+        recorded as ``_probe_failed`` but NOT blacklisted — a burst can
+        false-fail a good session, and the worker's own probe is the gate.
+        """
+        stats = {"tested": 0, "reachable": 0, "failed": 0}
+        already = [p for p in self._proxies if p.get("_valid")]
+        if len(already) >= target:
+            stats["reachable"] = len(already)
+            return stats
+        pending = [p for p in self._proxies
+                   if not p.get("_valid")
+                   and p.get("key") not in self._failed]
+        random.shuffle(pending)
+        if max_tests:
+            pending = pending[:max_tests]
+        if not pending:
+            return stats
+
+        found = [len(already)]
+        stop = asyncio.Event()
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(p):
+            if stop.is_set():
+                return
+            async with sem:
+                if stop.is_set():
+                    return
+                ok = await self.probe(p, timeout=timeout)
+                stats["tested"] += 1
+                if ok:
+                    p["_valid"] = True
+                    p.pop("_probe_failed", None)
+                    self._failed.discard(p.get("key"))
+                    stats["reachable"] += 1
+                    found[0] += 1
+                    if found[0] >= target:
+                        stop.set()
+                else:
+                    p["_probe_failed"] = True
+                    stats["failed"] += 1
+                if log and stats["tested"] % 10 == 0:
+                    log(f"[Proxy] Validated {stats['tested']} — "
+                        f"{found[0]} working")
+
+        await asyncio.gather(*(_one(p) for p in pending),
+                             return_exceptions=True)
+        self.valid_count = sum(1 for p in self._proxies if p.get("_valid"))
+        return stats
+
+    @property
+    def working_count(self) -> int:
+        """Sessions proven to reach Discord."""
+        return sum(1 for p in self._proxies if p.get("_valid"))
+
+    @property
+    def unproven_count(self) -> int:
+        return sum(1 for p in self._proxies
+                   if not p.get("_valid") and not p.get("_probe_failed")
+                   and p.get("key") not in self._failed)
 
     async def sweep(self, window: float = 10.0,
                     concurrency: int = SWEEP_CONCURRENCY,

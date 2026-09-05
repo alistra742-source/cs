@@ -77,6 +77,9 @@ WORKER_COUNT = 1
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_SWEEP_DELAY_S = max(15.0, float(os.environ.get("LOW_MEMORY_SWEEP_DELAY_S", "60")))
 LOW_MEMORY_SWEEP_CONCURRENCY = max(1, min(8, int(os.environ.get("LOW_MEMORY_SWEEP_CONCURRENCY", "4"))))
+# How many Discord-reachable sessions to prove BEFORE workers start. Small
+# on purpose: a worker only needs one good session at a time.
+PROXY_WARMUP_TARGET = max(1, int(os.environ.get("PROXY_WARMUP_TARGET", "12")))
 WORKER_IDS = [f"B{i+1}" for i in range(WORKER_COUNT)]
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -612,23 +615,44 @@ def _browser_busy() -> bool:
                for state in _workers.values())
 
 
-async def _deferred_proxy_sweep(n_sessions: int) -> None:
-    """Validate a large proxy pool only while the renderer is idle.
+async def validate_working_set(target: int = 0) -> dict:
+    """Prove a WORKING SET of sessions before the workers need them.
 
-    Workers retain their one-at-a-time live probe, so deferring this optional
-    dashboard-wide sweep does not weaken the connection gate for an attempt.
+    The old deferred sweep waited for an idle renderer, which never happens
+    while a worker is running — so a freshly bought pool sat at
+    "0 Discord-reachable" forever and take() handed out unproven sessions.
+    This validates a bounded slice up front (cheap: a few concurrent HTTPS
+    GETs), so START always draws from sessions known to reach Discord.
+    """
+    if proxy_pool is None:
+        return {"tested": 0, "reachable": 0}
+    target = target or PROXY_WARMUP_TARGET
+    _log(f"[Proxy] Validating sessions against discord.com "
+         f"(target {target} working)...")
+    stats = await proxy_pool.validate_until(
+        target=target,
+        concurrency=(LOW_MEMORY_SWEEP_CONCURRENCY if LOW_MEMORY_MODE else 25),
+        log=_log)
+    ok = stats.get("reachable", 0)
+    if ok:
+        _log(f"[Proxy] [OK] {ok} session(s) verified Discord-reachable "
+             f"(tested {stats.get('tested', 0)})")
+    else:
+        _log(f"[Proxy] [WARN] 0 of {stats.get('tested', 0)} sessions could "
+             f"reach discord.com — check the provider/plan", level="warn")
+    return stats
+
+
+async def _deferred_proxy_sweep(n_sessions: int) -> None:
+    """Keep validating the REST of the pool in the background.
+
+    The working set is proven up front by validate_working_set(); this only
+    tops up the dashboard's picture of the remaining sessions.
     """
     if proxy_pool is None or not n_sessions:
         return
     if LOW_MEMORY_MODE:
-        _log(
-            f"[Proxy] Low-memory mode: deferred {n_sessions}-session sweep; "
-            "workers still probe their selected session individually"
-        )
         await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
-        while _running and _browser_busy():
-            _log("[Proxy] Low-memory mode: browser active, delaying bulk validation")
-            await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
         if not _running:
             return
         concurrency = LOW_MEMORY_SWEEP_CONCURRENCY
@@ -751,7 +775,16 @@ async def _start_all_async(cfg: dict) -> None:
     asyncio.create_task(_proxy_file_watcher())
 
     if n_sessions and _proxies_available and proxy_pool is not None:
-        # ── Start workers IMMEDIATELY — they self-probe proxies ──
+        # ── Prove a working set BEFORE the workers draw from the pool ──
+        # Without this, take() hands out unproven sessions and a dead one
+        # costs a full browser launch (and, with TOR disabled, an aborted
+        # attempt). A few seconds here saves minutes later.
+        try:
+            await validate_working_set()
+        except Exception as e:
+            _log(f"[Proxy] Warm-up validation error: {e}", level="warn")
+
+        # ── Start workers — they still self-probe their chosen session ──
         # The sweep below runs concurrently; workers don't wait for it.
         # Each worker does a fast single-shot probe before launching a
         # browser, so dead sessions are caught in ~3s not 10s.
@@ -1145,6 +1178,29 @@ def _mask_proxy_key(key: str) -> str:
     if m:
         sid = "s-" + m.group(1)[:10]
     return f"{sid} @ {host}" if sid else host
+
+@app.route('/proxies/validate', methods=['POST'])
+def handle_proxy_validate():
+    """Validate sessions on demand (dashboard button).
+
+    ?target=N  how many working sessions to prove (default: all loaded).
+    """
+    if not (_proxies_available and proxy_pool is not None):
+        return jsonify({"error": "proxies module not loaded"})
+    try:
+        target = int(request.args.get("target") or 0)
+    except Exception:
+        target = 0
+    if not target:
+        target = proxy_pool.count or 1
+    try:
+        stats = _run_in_loop(validate_working_set(target))
+    except Exception as e:
+        return jsonify({"error": str(e)})
+    out = dict(stats or {})
+    out.update(proxy_pool.stats())
+    return jsonify(out)
+
 
 @app.route('/proxies')
 def handle_proxies():
@@ -1757,9 +1813,14 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 <div class="row">
 <div class="col stat"><div class="n" id="proxyTotal">0</div><div class="l">Total</div></div>
-<div class="col stat"><div class="n" id="proxyValid">0</div><div class="l">Valid</div></div>
+<div class="col stat"><div class="n" id="proxyValid" style="color:#3ba55d">0</div><div class="l">Working</div></div>
+<div class="col stat"><div class="n" id="proxyUnproven" style="color:#b58900">0</div><div class="l">Unproven</div></div>
 <div class="col stat"><div class="n" id="proxyUsed">0</div><div class="l">Used</div></div>
-<div class="col stat"><div class="n" id="proxyInvalid">0</div><div class="l">Invalid</div></div>
+<div class="col stat"><div class="n" id="proxyInvalid" style="color:#ed4245">0</div><div class="l">Dead</div></div>
+</div>
+<div class="flex mt">
+<button onclick="validateProxies()" id="btnValidateProxies">CHECK PROXIES</button>
+<span id="proxyCheckMsg" style="font-size:11px;color:#8a8a93;align-self:center"></span>
 </div>
 </div>
 
@@ -1959,12 +2020,7 @@ function refreshStatus(){
       $('statGenerated').textContent=(s&&s.generated)||0;
       $('statValid').textContent=(s&&s.valid)||0;
       $('statExpired').textContent=(s&&s.expired)||0;
-      if(s&&s.proxies){
-        $('proxyTotal').textContent=s.proxies.total||0;
-        $('proxyValid').textContent=s.proxies.valid||0;
-        $('proxyUsed').textContent=s.proxies.used||0;
-        $('proxyInvalid').textContent=s.proxies.invalid||0;
-      }
+      if(s&&s.proxies){ applyProxyStats(s.proxies); }
     }catch(e){}
   }).catch(function(){});
 }
@@ -2031,8 +2087,45 @@ window.refreshTokens=refreshTokens;
 function refreshProxies(){
   api('/proxies/refresh').then(function(r){return r.json()}).then(function(d){
     toast(d.message||d.error||'Refreshed');
+    applyProxyStats(d);
   }).catch(function(e){toast('Error: '+e.message)});
 }
+
+function applyProxyStats(d){
+  if(!d)return;
+  var set=function(id,v){var el=$(id); if(el&&v!==undefined&&v!==null)el.textContent=v;};
+  set('proxyTotal', d.available!==undefined?d.available:d.fetched);
+  set('proxyValid', d.verified!==undefined?d.verified:d.valid);
+  set('proxyUnproven', d.unproven);
+  set('proxyUsed', d.used);
+  set('proxyInvalid', d.dead!==undefined?d.dead:d.failed);
+  var badge=$('proxyStats');
+  if(badge){
+    var ok=(d.verified!==undefined?d.verified:d.valid)||0;
+    var tot=(d.available!==undefined?d.available:d.fetched)||0;
+    badge.textContent=ok+' / '+tot+' working';
+    badge.className='badge '+(ok>0?'badge-ok':'badge-warn');
+  }
+}
+window.applyProxyStats=applyProxyStats;
+
+function validateProxies(){
+  var btn=$('btnValidateProxies'), msg=$('proxyCheckMsg');
+  if(btn){btn.disabled=true;btn.textContent='CHECKING...';}
+  if(msg)msg.textContent='Testing sessions against discord.com...';
+  api('/proxies/validate',{method:'POST'}).then(function(r){return r.json()})
+   .then(function(d){
+     if(d.error){toast('Error: '+d.error); if(msg)msg.textContent=d.error;}
+     else{
+       applyProxyStats(d);
+       var m=(d.reachable||0)+' working of '+(d.tested||0)+' tested';
+       if(msg)msg.textContent=m;
+       toast(m);
+     }
+   }).catch(function(e){toast('Error: '+e.message)})
+   .then(function(){if(btn){btn.disabled=false;btn.textContent='CHECK PROXIES';}});
+}
+window.validateProxies=validateProxies;
 window.refreshProxies=refreshProxies;
 
 function viewAllLogs(){
