@@ -1633,6 +1633,7 @@ class DiscordAutomation:
         # Discord's client fingerprint (from /api/v9/experiments) plus the
         # form values the direct-API register submit needs.
         self._discord_fingerprint = ""
+        self._captcha_session_id = ""
         self._dob_iso = ""
         self._display_name_used = ""
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
@@ -2199,6 +2200,9 @@ class DiscordAutomation:
             rqtoken = data.get("captcha_rqtoken")
             if isinstance(rqtoken, str) and rqtoken:
                 self._rqtoken = rqtoken
+            sess = data.get("captcha_session_id")
+            if isinstance(sess, str) and sess:
+                self._captcha_session_id = sess
             if rq:
                 self._rqdata = rq
                 self._log(f"[Captcha] Captured enterprise rqdata "
@@ -5245,15 +5249,16 @@ class DiscordAutomation:
             return False
 
     _DIRECT_REGISTER_JS = r"""(p) => {
-        // Submit the registration ourselves, with the captcha token in the
-        // body. Clicking the button does not work: after the first
-        // captcha-required response Discord's client holds the challenge
-        // open and never re-POSTs, so no interception point ever sees a
-        // second request. Issuing it directly is the only way the token
-        // reaches the API.
+        // Replay the register POST with the solved captcha.
         //
-        // __nc_direct marks this request so our OWN interceptors skip it —
-        // re-encoding an already-complete body produced HTTP 0.
+        // Discord expects the token in HEADERS, not the JSON body:
+        //   X-Captcha-Key         the solved hCaptcha token
+        //   X-Captcha-Rqtoken     echoed back from the 400 challenge
+        //   X-Captcha-Session-Id  echoed back from the 400 challenge
+        // Putting captcha_key in the body is the old (pre-enterprise)
+        // shape and is what 'captcha-required' kept complaining about.
+        //
+        // __nc_direct marks the body so our own interceptors skip it.
         const body = {
             fingerprint: p.fingerprint || undefined,
             email: p.email,
@@ -5264,21 +5269,22 @@ class DiscordAutomation:
             consent: true,
             date_of_birth: p.dob,
             gift_code_sku_id: null,
-            captcha_key: p.token,
             promotional_email_opt_in: false,
             __nc_direct: 1
         };
-        if (p.rqtoken) body.captcha_rqtoken = p.rqtoken;
-        const payload = JSON.stringify(body);
+        const headers = {
+            'Content-Type': 'application/json',
+            'X-Discord-Locale': 'en-US',
+            'X-Debug-Options': 'bugReporterEnabled',
+            'X-Captcha-Key': p.token
+        };
+        if (p.rqtoken) headers['X-Captcha-Rqtoken'] = p.rqtoken;
+        if (p.session) headers['X-Captcha-Session-Id'] = p.session;
         return fetch('/api/v9/auth/register', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Discord-Locale': 'en-US',
-                'X-Debug-Options': 'bugReporterEnabled'
-            },
+            headers: headers,
             credentials: 'include',
-            body: payload
+            body: JSON.stringify(body)
         }).then(async (r) => {
             let text = '';
             try { text = await r.text(); } catch (e) {}
@@ -5309,6 +5315,7 @@ class DiscordAutomation:
             "dob": dob,
             "token": token,
             "rqtoken": getattr(self, "_rqtoken", "") or "",
+            "session": getattr(self, "_captcha_session_id", "") or "",
             "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
         }
         try:
@@ -5331,7 +5338,9 @@ class DiscordAutomation:
             self._register_accepted = True
             self._log("[Captcha] [OK] Discord accepted the registration")
             return True
-        # Surface the reason so the next step is obvious.
+        # Surface the reason, and pick up the FRESH challenge Discord
+        # hands back — on invalid-response it issues new rqdata/rqtoken,
+        # so the next attempt must use those, not the stale pair.
         try:
             data = json.loads(body)
             keys = data.get("captcha_key")
@@ -5340,12 +5349,25 @@ class DiscordAutomation:
                 self._log(f"[NoneCap] Discord rejected the token: "
                           f"{keys[0]}" + (f" — {hint}" if hint else ""),
                           level="warn")
+            refreshed = []
             new_rq = data.get("captcha_rqdata")
-            if isinstance(new_rq, str) and len(new_rq) > 8:
+            if isinstance(new_rq, str) and len(new_rq) > 8 \
+                    and new_rq != getattr(self, "_rqdata", ""):
                 self._rqdata = new_rq
+                refreshed.append("rqdata")
             new_rqt = data.get("captcha_rqtoken")
-            if isinstance(new_rqt, str) and new_rqt:
+            if isinstance(new_rqt, str) and new_rqt \
+                    and new_rqt != getattr(self, "_rqtoken", ""):
                 self._rqtoken = new_rqt
+                refreshed.append("rqtoken")
+            new_sess = data.get("captcha_session_id")
+            if isinstance(new_sess, str) and new_sess:
+                self._captcha_session_id = new_sess
+                refreshed.append("session")
+            if refreshed:
+                self._log(f"[NoneCap] Fresh challenge issued "
+                          f"({', '.join(refreshed)}) — the next attempt "
+                          f"will use it")
         except Exception:
             pass
         return False

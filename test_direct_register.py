@@ -36,7 +36,7 @@ const f = %s;
   const out = await f({
     email:'a@b.c', username:'user1', global_name:'User One',
     password:'pw', dob:'1998-05-01', token:'P1_TOKEN',
-    rqtoken:'RQT1', fingerprint:'FP123'
+    rqtoken:'RQT1', session:'SESS1', fingerprint:'FP123'
   });
   console.log(JSON.stringify({seen: {url: seen.url,
     method: seen.init.method, credentials: seen.init.credentials,
@@ -70,11 +70,21 @@ class TestRegisterPayload(unittest.TestCase):
     def test_sends_cookies(self):
         self.assertEqual(self.r["seen"]["credentials"], "include")
 
-    def test_carries_the_captcha_token(self):
-        self.assertEqual(self.r["seen"]["body"]["captcha_key"], "P1_TOKEN")
+    def test_token_goes_in_the_header(self):
+        """Discord reads X-Captcha-Key, NOT body.captcha_key."""
+        self.assertEqual(self.r["seen"]["headers"]["X-Captcha-Key"],
+                         "P1_TOKEN")
 
-    def test_carries_the_rqtoken(self):
-        self.assertEqual(self.r["seen"]["body"]["captcha_rqtoken"], "RQT1")
+    def test_rqtoken_goes_in_the_header(self):
+        self.assertEqual(self.r["seen"]["headers"]["X-Captcha-Rqtoken"],
+                         "RQT1")
+
+    def test_session_id_goes_in_the_header(self):
+        self.assertEqual(self.r["seen"]["headers"]["X-Captcha-Session-Id"],
+                         "SESS1")
+
+    def test_body_no_longer_carries_the_token(self):
+        self.assertNotIn("captcha_key", self.r["seen"]["body"])
 
     def test_carries_the_fingerprint(self):
         self.assertEqual(self.r["seen"]["body"]["fingerprint"], "FP123")
@@ -181,6 +191,27 @@ class TestPromiseAwaiting(unittest.TestCase):
 
     def test_bare_fetch_expression_is_awaited(self):
         self.assertTrue(self._wrap('fetch("/x")', None)[1])
+
+
+class TestFreshChallengeOnRejection(unittest.TestCase):
+    """invalid-response comes with a NEW challenge; reuse is guaranteed fail."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_session_id_is_captured(self):
+        self.assertIn("captcha_session_id", self.src)
+        self.assertIn("self._captcha_session_id", self.src)
+
+    def test_rejection_refreshes_all_three(self):
+        i = self.src.index("Fresh challenge issued")
+        block = self.src[max(0, i - 1800):i]
+        for key in ("captcha_rqdata", "captcha_rqtoken",
+                    "captcha_session_id"):
+            self.assertIn(key, block)
+
+    def test_refresh_is_logged(self):
+        self.assertIn("Fresh challenge issued", self.src)
 
 
 if __name__ == "__main__":
