@@ -157,7 +157,7 @@ class TestWiring(unittest.TestCase):
 
     def test_rejection_refreshes_rqdata(self):
         i = self.src.index("async def _direct_register_with_token")
-        block = self.src[i:i + 4000]
+        block = self.src[i:i + 7000]
         self.assertIn("captcha_rqdata", block)
 
 
@@ -343,6 +343,44 @@ direct({email:'a@b.c', username:'u', global_name:'U', password:'p',
         i = src.index("window.__ncDirectInflight = true")
         j = src.index("return fetch('/api/v9/auth/register'", i)
         self.assertLess(i, j, "flag must be set before the call")
+
+
+class TestFailureLogging(unittest.TestCase):
+    """A rejection must state the whole picture, not fragments."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_full_reject_body_is_logged(self):
+        self.assertIn('body[{i}:]', self.src)
+        self.assertNotIn("body[:220]", self.src)
+
+    def test_sent_values_are_logged(self):
+        i = self.src.index("SENT key=")
+        block = self.src[i - 200:i + 400]
+        for field in ("respkey", "rqtoken", "session", "rqdata"):
+            self.assertIn(field, block)
+
+    def test_token_prefix_is_logged(self):
+        import inspect
+
+        import nonecap_solver
+        src = inspect.getsource(nonecap_solver.NoneCapSolver)
+        self.assertIn("last_token_prefix", src)
+
+    def test_direct_status_counts_as_delivery(self):
+        # A real HTTP 400 means the token WAS delivered; the old message
+        # claimed it "never reached a register request".
+        self.assertIn("direct_status", self.src)
+        i = self.src.index("delivered = (")
+        self.assertIn("direct_status", self.src[i:i + 220])
+
+    def test_verdict_block_exists(self):
+        self.assertIn("VERDICT", self.src)
+        i = self.src.index("VERDICT")
+        block = self.src[i:i + 2200]
+        self.assertIn("Remaining cause", block)
+        self.assertIn("last_solve_id", block)
 
 
 if __name__ == "__main__":

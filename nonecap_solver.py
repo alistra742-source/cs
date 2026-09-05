@@ -87,6 +87,7 @@ class NoneCapSolver:
         # hCaptcha's getRespKey() value (E0_…). Sites that verify the
         # token and key TOGETHER need both; Discord is one of them.
         self.last_resp_key = ""
+        self.last_token_prefix = ""
 
     @property
     def enabled(self) -> bool:
@@ -206,8 +207,13 @@ class NoneCapSolver:
                 charged = solve.get("credits_charged")
                 charged_txt = (f"{charged} credit(s)"
                                if charged is not None else "credits n/a")
+                # Token PREFIX identifies the kind hCaptcha minted:
+                # P1_ = standard pass, P0_ = passive/low-friction,
+                # E0_/E1_ = the response-key family. A prefix mismatch
+                # against what the site expects is a real failure mode.
+                self.last_token_prefix = token[:3]
                 self._log(f"[NoneCap] Token received "
-                          f"({len(token)} chars, {charged_txt}"
+                          f"({len(token)} chars, {token[:3]}…, {charged_txt}"
                           + (f", resp_key {self.last_resp_key[:6]}…"
                              if self.last_resp_key else ", no resp_key")
                           + ")")
