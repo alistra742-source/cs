@@ -481,10 +481,22 @@ async def live_screenshot(bot) -> str:
             if len(shots) > 10:
                 bot._screenshots = shots[-8:]
         return b64
-    try:
-        bot._log(f"[Live] screenshot failed: {last_err}", level="warn")
-    except Exception:
-        pass
+    # Throttle: an uncommitted navigation (slow circuit) makes EVERY capture
+    # in its window return empty, which used to spam "[Live] screenshot
+    # failed: empty capture" into ALL LOGS every camera tick. One line per
+    # reason per 20s says the same thing without drowning the feed.
+    now = time.time()
+    stamp = getattr(bot, "_live_shot_log", None) or {}
+    if now - float(stamp.get(last_err, 0.0)) >= 20.0:
+        stamp[last_err] = now
+        try:
+            bot._live_shot_log = stamp
+        except Exception:
+            pass
+        try:
+            bot._log(f"[Live] screenshot failed: {last_err}", level="warn")
+        except Exception:
+            pass
     return ""
 
 
