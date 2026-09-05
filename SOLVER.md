@@ -320,17 +320,26 @@ and after.
 
 ## NoneCap (hosted solver) — tried FIRST
 
-> **If tokens come back `invalid-response`:** first confirm the direct
-> submit actually returned an HTTP status. A `HTTP 0` means the register
-> call never resolved and the token was never really judged.
+> **Discord's rqdata is IP-BOUND.** The blob is welded to `discord.com`
+> *and* to the exact exit IP that requested the challenge. If the solver
+> mints the token on its own IP while you register from yours, the binding
+> breaks and Discord returns `invalid-response` — forever, no matter how
+> correct everything else is.
 >
-> Only after a genuine 4xx is IP binding worth suspecting. hCaptcha can
-> tie a token to the solving IP; `NONECAP_PROXY` pins NoneCap's solve to
-> the same egress the browser uses:
+> The worker's proxy is forwarded to NoneCap automatically. Override with:
 > ```
 > NONECAP_PROXY = socks5://user:pass@host:1080
 > ```
-> This is optional and unset by default — most sitekeys do not require it.
+>
+> **TOR cannot satisfy this.** A local SOCKS port is not reachable by the
+> solver, and the exit rotates per circuit. TOR + hosted solver is an
+> architectural dead end for Discord registration. You need a **sticky
+> residential** session used for everything: `/experiments`, the register
+> POST, the solve, and the verify. Datacenter IPs score badly; rotating
+> ones snap the binding mid-flow.
+>
+> Match the `user_agent` given to the solver to the browser's real UA
+> (done automatically).
 
 
 NoneCap returns a real hCaptcha token (`P1_…`, the kind that passes

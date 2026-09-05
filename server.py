@@ -4873,6 +4873,32 @@ class DiscordAutomation:
                 return val
         return ""
 
+    def _solver_proxy_url(self) -> str:
+        """The egress the solver must mint the token through.
+
+        Discord's enterprise rqdata is bound to the exit IP that asked for
+        the challenge. If NoneCap solves on its own IP while we register
+        from ours, the binding breaks -> invalid-response, every time.
+
+        Returns "" when there is nothing shareable (TOR is a local SOCKS
+        port the solver cannot reach), which the caller reports plainly.
+        """
+        override = (os.environ.get("NONECAP_PROXY") or "").strip()
+        if override:
+            return override
+        p = self.proxy
+        if isinstance(p, dict):
+            server = str(p.get("server") or "").strip()
+            user = str(p.get("username") or "").strip()
+            pwd = str(p.get("password") or "").strip()
+            if server:
+                if user and "@" not in server:
+                    scheme, _, hostport = server.partition("://")
+                    if hostport:
+                        return f"{scheme}://{user}:{pwd}@{hostport}"
+                return server
+        return ""
+
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
 
@@ -4922,6 +4948,13 @@ class DiscordAutomation:
         except Exception:
             page_url = "https://discord.com/register"
 
+        if not self._solver_proxy_url():
+            self._log(
+                "[NoneCap] No shareable egress — the solver will mint on "
+                "ITS IP while we register from TOR. Discord's rqdata is "
+                "IP-bound, so this is expected to return invalid-response. "
+                "Set NONECAP_PROXY (or use a residential proxy) to fix it.",
+                level="warn")
         rqdata = await self._live_rqdata()
         if not rqdata:
             self._log("[NoneCap] No enterprise rqdata found — solving as "
@@ -4958,9 +4991,14 @@ class DiscordAutomation:
             except Exception:
                 ua = ""
             invisible = bool(getattr(self, "_captcha_invisible", False))
+            # rqdata is welded to the EXIT IP that requested the challenge.
+            # A token minted on the solver's own IP breaks that binding and
+            # comes back invalid-response, so forward our egress.
+            egress = self._solver_proxy_url()
             token = await self._nonecap.solve(sitekey, str(page_url),
                                               rqdata=rqdata,
                                               invisible=invisible,
+                                              proxy=egress,
                                               user_agent=str(ua))
             if not token:
                 # Failed solves are not charged, so retrying is free.

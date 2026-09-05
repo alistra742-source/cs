@@ -394,5 +394,59 @@ class TestNoSelfInjection(unittest.TestCase):
         self.assertIn("own-direct-request", block)
 
 
+class TestEgressForwarding(unittest.TestCase):
+    """rqdata is IP-bound: the solver must mint from OUR exit IP.
+
+    Confirmed by practitioners running this exact flow — 'the rqdata blob
+    is welded to discord.com AND to the exact exit IP that asked for the
+    challenge'. Solver mints on its own IP -> invalid-response.
+    """
+
+    def _url(self, proxy):
+        import server
+
+        class B:
+            pass
+
+        b = B()
+        b.proxy = proxy
+        return server.DiscordAutomation._solver_proxy_url(b)
+
+    def test_tor_has_no_shareable_egress(self):
+        self.assertEqual(self._url(None), "")
+
+    def test_auth_proxy_is_rendered_with_credentials(self):
+        self.assertEqual(
+            self._url({"server": "http://gate:8080", "username": "u",
+                       "password": "p"}),
+            "http://u:p@gate:8080")
+
+    def test_inline_credentials_are_left_alone(self):
+        self.assertEqual(self._url({"server": "http://u:p@gate:8080"}),
+                         "http://u:p@gate:8080")
+
+    def test_socks5_is_supported(self):
+        self.assertEqual(
+            self._url({"server": "socks5://gate:1080", "username": "u",
+                       "password": "p"}),
+            "socks5://u:p@gate:1080")
+
+    def test_env_override_wins(self):
+        import os
+        os.environ["NONECAP_PROXY"] = "http://override:1"
+        try:
+            self.assertEqual(self._url(None), "http://override:1")
+        finally:
+            del os.environ["NONECAP_PROXY"]
+
+    def test_egress_is_passed_to_the_solver(self):
+        src = open("server.py").read()
+        self.assertIn("proxy=egress", src)
+
+    def test_missing_egress_is_called_out(self):
+        src = open("server.py").read()
+        self.assertIn("No shareable egress", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
