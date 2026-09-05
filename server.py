@@ -5794,8 +5794,22 @@ class DiscordAutomation:
             # document). A crop that lands off-image returns solid black —
             # which is exactly the "0 contours on every round" symptom.
             iw, ih = im.size
-            crop = im.crop((max(0, x0), max(0, y0),
-                            min(iw, x1), min(ih, y1)))
+            # Clamp to a VALID rect. An element scrolled out of view gives
+            # negative or beyond-image coords, and PIL then raises
+            # "Coordinate 'right' is less than 'left'" — which killed every
+            # drag round with "Surface screenshot failed".
+            cx0 = max(0, min(x0, iw - 1))
+            cy0 = max(0, min(y0, ih - 1))
+            cx1 = max(cx0 + 1, min(x1, iw))
+            cy1 = max(cy0 + 1, min(y1, ih))
+            if (cx1 - cx0) < 60 or (cy1 - cy0) < 60:
+                self._log(f"[Captcha] Element rect ({x0},{y0},{x1},{y1}) is "
+                          f"outside the {iw}x{ih} frame — using the whole "
+                          f"frame", level="warn")
+                cx0, cy0, cx1, cy1 = 0, 0, iw, ih
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
+            crop = im.crop((cx0, cy0, cx1, cy1))
             if not self._surface_is_usable(crop):
                 self._log(f"[Captcha] Cropped surface looks blank "
                           f"({crop.size[0]}x{crop.size[1]} of {iw}x{ih} at "
@@ -6430,7 +6444,25 @@ class DiscordAutomation:
         return True
 
     async def _solve_text_round(self, frame, prompt) -> bool:
-        """text_entry: vision model reads the characters, we type them."""
+        """text_entry: answer the question and type it.
+
+        hCaptcha now serves plain word problems ("The jar begins with 19
+        coins... how many now?"). The prompt is already captured as TEXT,
+        so arithmetic needs no vision at all — it is instant, free and
+        exact, where a vision round trip is none of those.
+        """
+        try:
+            import text_puzzle
+            local = text_puzzle.solve(prompt)
+        except Exception:
+            local = ""
+        if local:
+            self._log(f"[Captcha] Text puzzle solved locally: {local!r}")
+            if await self._type_challenge_answer(frame, local):
+                return True
+            self._log("[Captcha] Could not type the local answer — "
+                      "falling back to vision", level="warn")
+
         shot, _ = await self._challenge_surface(frame)
         if not shot:
             return False
