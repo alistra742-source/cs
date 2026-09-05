@@ -374,13 +374,19 @@ class TestNoSelfInjection(unittest.TestCase):
     def setUp(self):
         self.src = open("server.py").read()
 
-    def test_direct_body_is_marked(self):
-        self.assertIn("__nc_direct", self.src)
+    def test_direct_request_sets_an_inflight_flag(self):
+        # The old body marker leaked to Discord as an unknown field, so
+        # the guard is now an in-flight flag on both sides.
+        self.assertIn("__ncDirectInflight", self.src)
+        self.assertIn("_nc_direct_inflight", self.src)
 
-    def test_cdp_mutator_skips_marked_bodies(self):
+    def test_marker_no_longer_leaks_into_the_body(self):
+        self.assertNotIn("__nc_direct:", self.src)
+
+    def test_cdp_mutator_skips_our_own_request(self):
         i = self.src.index("def _mutate_register_body")
         block = self.src[i:i + 1200]
-        self.assertIn("__nc_direct", block)
+        self.assertIn("_nc_direct_inflight", block)
 
     def test_js_hook_skips_marked_bodies(self):
         i = self.src.index("_CAPTCHA_HOOK_JS")

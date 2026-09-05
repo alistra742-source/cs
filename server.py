@@ -1634,6 +1634,8 @@ class DiscordAutomation:
         # form values the direct-API register submit needs.
         self._discord_fingerprint = ""
         self._captcha_session_id = ""
+        self._captcha_invisible = False
+        self._nc_direct_inflight = False
         self._dob_iso = ""
         self._display_name_used = ""
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
@@ -2203,6 +2205,16 @@ class DiscordAutomation:
             sess = data.get("captcha_session_id")
             if isinstance(sess, str) and sess:
                 self._captcha_session_id = sess
+            # Discord tells us the widget MODE. Registration serves
+            # INVISIBLE hCaptcha, and an invisible token is minted
+            # differently from a checkbox one — solving the wrong mode
+            # yields a token hCaptcha refuses (invalid-response).
+            inv = data.get("should_serve_invisible")
+            if isinstance(inv, bool):
+                if inv != getattr(self, "_captcha_invisible", None):
+                    self._log(f"[Captcha] Discord wants "
+                              f"{'INVISIBLE' if inv else 'visible'} hCaptcha")
+                self._captcha_invisible = inv
             if rq:
                 self._rqdata = rq
                 self._log(f"[Captcha] Captured enterprise rqdata "
@@ -4931,7 +4943,10 @@ class DiscordAutomation:
                               "blob for this attempt")
                     rqdata = fresh
             self._log(f"[NoneCap] Attempt {attempt}/{tries}"
-                      + (" (enterprise)" if rqdata else " (plain)"))
+                      + (" (enterprise" if rqdata else " (plain")
+                      + (", invisible)"
+                         if getattr(self, "_captcha_invisible", False)
+                         else ")"))
             # hCaptcha binds the token to the solving IP and UA. Give
             # NoneCap the same ones this browser is using, or Discord
             # answers invalid-response even for a perfect solve.
@@ -4942,8 +4957,10 @@ class DiscordAutomation:
                     timeout=5.0) or ""
             except Exception:
                 ua = ""
+            invisible = bool(getattr(self, "_captcha_invisible", False))
             token = await self._nonecap.solve(sitekey, str(page_url),
                                               rqdata=rqdata,
+                                              invisible=invisible,
                                               user_agent=str(ua))
             if not token:
                 # Failed solves are not charged, so retrying is free.
@@ -5106,7 +5123,7 @@ class DiscordAutomation:
                 window.__ncSeen.push('non-object-body');
                 return bodyText;
             }
-            if (obj.__nc_direct) {
+            if (window.__ncDirectInflight) {
                 window.__ncSeen.push('own-direct-request');
                 return bodyText;
             }
@@ -5161,8 +5178,8 @@ class DiscordAutomation:
         if not token or not body:
             return None
         # Never rewrite our OWN direct submit: it already carries the
-        # token, and re-encoding the body produced HTTP 0.
-        if '"__nc_direct"' in body or "__nc_direct" in body:
+        # captcha headers, and re-encoding the body corrupted it.
+        if getattr(self, "_nc_direct_inflight", False):
             return None
         low = url.lower()
         if "/api/" not in low:
@@ -5279,7 +5296,8 @@ class DiscordAutomation:
         // Putting captcha_key in the body is the old (pre-enterprise)
         // shape and is what 'captcha-required' kept complaining about.
         //
-        // __nc_direct marks the body so our own interceptors skip it.
+        // window.__ncDirectInflight tells our own interceptors to leave
+        // this request alone — it already carries the captcha headers.
         const body = {
             fingerprint: p.fingerprint || undefined,
             email: p.email,
@@ -5290,8 +5308,7 @@ class DiscordAutomation:
             consent: true,
             date_of_birth: p.dob,
             gift_code_sku_id: null,
-            promotional_email_opt_in: false,
-            __nc_direct: 1
+            promotional_email_opt_in: false
         };
         const headers = {
             'Content-Type': 'application/json',
@@ -5307,10 +5324,14 @@ class DiscordAutomation:
             credentials: 'include',
             body: JSON.stringify(body)
         }).then(async (r) => {
+            window.__ncDirectInflight = false;
             let text = '';
             try { text = await r.text(); } catch (e) {}
-            return {status: r.status, body: text.slice(0, 600)};
-        }).catch((e) => ({status: -1, body: String(e && e.message || e)}));
+            return {status: r.status, body: text.slice(0, 1200)};
+        }).catch((e) => {
+            window.__ncDirectInflight = false;
+            return {status: -1, body: String(e && e.message || e)};
+        });
     }"""
 
     async def _direct_register_with_token(self, token: str) -> bool:
@@ -5339,6 +5360,7 @@ class DiscordAutomation:
             "session": getattr(self, "_captcha_session_id", "") or "",
             "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
         }
+        self._nc_direct_inflight = True
         try:
             res = await asyncio.wait_for(
                 self._page.evaluate(self._DIRECT_REGISTER_JS, payload),
@@ -5346,11 +5368,14 @@ class DiscordAutomation:
         except Exception as e:
             self._log(f"[NoneCap] Direct register failed: "
                       f"{type(e).__name__}: {e}", level="warn")
+            self._nc_direct_inflight = False
             return False
         if not isinstance(res, dict):
             self._log(f"[NoneCap] Direct register returned {res!r}",
                       level="warn")
+            self._nc_direct_inflight = False
             return False
+        self._nc_direct_inflight = False
         status = int(res.get("status") or 0)
         body = str(res.get("body") or "")
         self._log(f"[NoneCap] Direct register -> HTTP {status}: "

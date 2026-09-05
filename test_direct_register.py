@@ -26,6 +26,7 @@ def register_js() -> str:
 
 
 HARNESS = """
+global.window = global;
 let seen = null;
 global.fetch = async (url, init) => {
   seen = {url, init};
@@ -112,7 +113,8 @@ class TestRegisterPayload(unittest.TestCase):
         self.assertIn("invalid-response", r["out"]["body"])
 
     def test_network_error_is_caught(self):
-        script = ("global.fetch = async () => { throw new Error('boom'); };\n"
+        script = ("global.window = global;\n"
+                  "global.fetch = async () => { throw new Error('boom'); };\n"
                   "const f = %s;\n"
                   "f({email:'a',username:'u',password:'p',dob:'2000-01-01',"
                   "token:'T'}).then(o => console.log(JSON.stringify(o)));"
@@ -212,6 +214,60 @@ class TestFreshChallengeOnRejection(unittest.TestCase):
 
     def test_refresh_is_logged(self):
         self.assertIn("Fresh challenge issued", self.src)
+
+
+class TestInvisibleMode(unittest.TestCase):
+    """Discord's 400 says should_serve_invisible:true for registration.
+
+    An invisible hCaptcha token is minted differently from a checkbox one.
+    Solving the wrong mode yields a token hCaptcha refuses — which is
+    exactly the invalid-response we kept getting.
+    """
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_flag_is_captured(self):
+        self.assertIn("should_serve_invisible", self.src)
+        self.assertIn("self._captcha_invisible", self.src)
+
+    def test_flag_is_passed_to_the_solver(self):
+        self.assertIn("invisible=invisible", self.src)
+
+    def test_mode_is_logged(self):
+        self.assertIn("INVISIBLE", self.src)
+
+    def test_solver_forwards_it(self):
+        import inspect
+        import nonecap_solver
+        src = inspect.getsource(nonecap_solver.NoneCapSolver.solve)
+        self.assertIn('payload["invisible"] = True', src)
+
+
+class TestNoMarkerLeak(unittest.TestCase):
+    """__nc_direct was being POSTed to Discord as an unknown field."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_marker_is_gone_from_the_body(self):
+        self.assertNotIn("__nc_direct:", self.src)
+        self.assertNotIn('"__nc_direct"', self.src)
+
+    def test_inflight_flag_replaces_it(self):
+        self.assertIn("__ncDirectInflight", self.src)
+        self.assertIn("_nc_direct_inflight", self.src)
+
+    def test_flag_is_cleared_on_every_path(self):
+        i = self.src.index("async def _direct_register_with_token")
+        block = self.src[i:i + 5000]
+        self.assertGreaterEqual(
+            block.count("self._nc_direct_inflight = False"), 3)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_body_has_no_marker(self):
+        r = run()
+        self.assertNotIn("__nc_direct", json.dumps(r["seen"]["body"]))
 
 
 if __name__ == "__main__":
