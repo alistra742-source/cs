@@ -1637,6 +1637,7 @@ class DiscordAutomation:
             self._events = None
         # Hosted hCaptcha solver (NoneCap). Created lazily on first use.
         self._nonecap = None
+        self._proxy_relay = None
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
@@ -1808,13 +1809,24 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (nodriver applies it as Chrome
-        --proxy-server/--proxy-user/--proxy-pass launch flags — a
-        context-level proxy would be rejected when the browser already has
-        one). Returns the Playwright-style {server, username, password} dict
-        (or None for TOR/direct)."""
+        """Proxy dict for browser launch, or None for TOR/direct.
+
+        CHROME CANNOT AUTHENTICATE FROM THE COMMAND LINE. There is no
+        --proxy-user/--proxy-pass switch (those are silently ignored) and
+        credentials inside --proxy-server are stripped, so an authenticated
+        gateway answers 407 and the tab lands on chrome-error://
+        chromewebdata/ in 0.0s — exactly the "PROXY SESSION DEAD" loop,
+        even for sessions that validate perfectly from aiohttp.
+
+        When a relay is running we point Chrome at it instead: a local,
+        unauthenticated port that injects Proxy-Authorization upstream.
+        Same exit IP, so the captcha's IP binding is unaffected.
+        """
         if not (self.proxy and isinstance(self.proxy, dict)):
             return None
+        relay = getattr(self, "_proxy_relay", None)
+        if relay is not None and getattr(relay, "port", 0):
+            return {"server": relay.url}
         p = self.proxy
         proto = p.get("proto", "http")
         lp = {"server": f"{proto}://{p.get('host')}:{p.get('port')}"}
@@ -1822,6 +1834,32 @@ class DiscordAutomation:
             lp["username"] = p.get("username")
             lp["password"] = p.get("password", "")
         return lp
+
+    async def _start_proxy_relay(self) -> None:
+        """(Re)start the local auth relay for the current session."""
+        await self._stop_proxy_relay()
+        if not (self.proxy and isinstance(self.proxy, dict)):
+            return
+        if not self.proxy.get("username"):
+            return
+        try:
+            from proxy_relay import relay_for
+            self._proxy_relay = await asyncio.wait_for(
+                relay_for(self.proxy, log=self._log), timeout=10)
+        except Exception as e:
+            self._proxy_relay = None
+            self._log(f"[Relay] Could not start proxy relay: "
+                      f"{type(e).__name__}: {e}", level="warn")
+
+    async def _stop_proxy_relay(self) -> None:
+        relay = getattr(self, "_proxy_relay", None)
+        if relay is None:
+            return
+        self._proxy_relay = None
+        try:
+            await relay.stop()
+        except Exception:
+            pass
 
     async def _relaunch_browser(self) -> None:
         """Close and relaunch the browser bound to self.proxy. The engine
@@ -1833,6 +1871,7 @@ class DiscordAutomation:
             except Exception:
                 pass
             self._browser = None
+        await self._start_proxy_relay()
         args = launch_args(headless=self.headless)
         # The engine pins the proxy at browser launch. When there is no sticky
         # residential session, relaunch must ride TOR exactly like initialize()
@@ -1892,6 +1931,7 @@ class DiscordAutomation:
     async def initialize(self) -> None:
         self._playwright = await async_playwright().start()
 
+        await self._start_proxy_relay()
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 

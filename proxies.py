@@ -12,6 +12,7 @@ The pool hands out proxy dicts so the browser worker can pass
 username/password to Playwright separately.
 """
 import asyncio
+import base64
 import json
 import os
 import random
@@ -453,9 +454,48 @@ class ProxyPool:
         except Exception:
             return False
 
+    @staticmethod
+    async def _connect_probe(proxy: Dict[str, str],
+                             timeout: float = 6.0) -> bool:
+        """Probe the way CHROME does: raw CONNECT to discord.com:443.
+
+        aiohttp's proxy support was giving false positives — it sends
+        Proxy-Authorization automatically, so a session that Chrome cannot
+        authenticate to still looked healthy. This speaks the proxy
+        protocol directly, so 407s and dead tunnels are caught here rather
+        than after a browser launch.
+        """
+        host = proxy.get("host")
+        port = proxy.get("port")
+        if not host or not port:
+            return False
+        head = b"CONNECT discord.com:443 HTTP/1.1\r\n" \
+               b"Host: discord.com:443\r\n"
+        if proxy.get("username"):
+            raw = f"{proxy['username']}:{proxy.get('password','')}".encode()
+            head += b"Proxy-Authorization: Basic " + \
+                base64.b64encode(raw) + b"\r\n"
+        head += b"\r\n"
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port)), timeout=timeout)
+            writer.write(head)
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            return b" 200 " in line
+        except Exception:
+            return False
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
     async def validate_until(self, target: int = 12,
-                             concurrency: int = 8,
-                             timeout: float = 6.0,
+                             concurrency: int = 60,
+                             timeout: float = 4.0,
                              max_tests: int = 0,
                              log: Optional[Callable] = None) -> dict:
         """Probe sessions until ``target`` of them reach Discord.
@@ -490,7 +530,7 @@ class ProxyPool:
             async with sem:
                 if stop.is_set():
                     return
-                ok = await self.probe(p, timeout=timeout)
+                ok = await self._connect_probe(p, timeout=timeout)
                 stats["tested"] += 1
                 if ok:
                     p["_valid"] = True
