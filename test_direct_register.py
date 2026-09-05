@@ -135,7 +135,7 @@ class TestWiring(unittest.TestCase):
 
     def test_direct_submit_runs_after_the_click_path(self):
         i = self.src.index("_click_form_submit(), timeout=15.0")
-        j = self.src.index("_direct_register_with_token(token)")
+        j = self.src.index("_direct_register_with_token(\n")
         self.assertLess(i, j)
 
     def test_success_sets_the_accepted_flag(self):
@@ -381,6 +381,91 @@ class TestFailureLogging(unittest.TestCase):
         block = self.src[i:i + 2200]
         self.assertIn("Remaining cause", block)
         self.assertIn("last_solve_id", block)
+
+
+class TestChallengeTripleIsPinned(unittest.IsolatedAsyncioTestCase):
+    """The token, rqtoken and session must belong to the SAME challenge.
+
+    The /auth/register response hook fires while the solve is awaited and
+    replaces self._rqtoken / _captcha_session_id with the NEXT challenge's
+    values. Reading them live at submit time paired THIS token with the
+    NEXT challenge — an automatic invalid-response, every attempt.
+    """
+
+    async def test_submit_uses_the_solved_challenge_not_the_next_one(self):
+        import asyncio as aio
+
+        import server
+
+        sent = []
+
+        class FakePage:
+            url = "https://discord.com/register"
+            frames = []
+            bot = None
+
+            async def evaluate(self, js, arg=None):
+                j = str(js)
+                if "location.href" in j:
+                    return "https://discord.com/register"
+                if "__ncToken" in j:
+                    return {"tok": True, "rq": True, "rk": True}
+                if "h-captcha-response" in j:
+                    return {"fields": 2, "callbacks": 1, "react": True}
+                if "X-Captcha-Key" in j:
+                    sent.append((arg.get("rqtoken"), arg.get("session")))
+                    # the race, exactly as it happens in production
+                    self.bot._rqtoken = "rqt-NEXT"
+                    self.bot._captcha_session_id = "sess-NEXT"
+                    return {"status": 400,
+                            "body": '{"captcha_key":["invalid-response"]}'}
+                if "__ncHookInstalled" in j:
+                    return "installed"
+                return {}
+
+            async def screenshot(self):
+                return b""
+
+        bot = server.DiscordAutomation.__new__(server.DiscordAutomation)
+        page = FakePage()
+        attrs = dict(
+            _page=page, _rqtoken="rqt-CURRENT",
+            _captcha_session_id="sess-CURRENT", _captcha_respkey="E1_k",
+            _pending_captcha_token="", _nc_direct_inflight=False,
+            _discord_fingerprint="fp", _dob_iso="1996-07-28",
+            _display_name_used="u", _email="a@b.c", _username="u",
+            _password="p", _last_direct_status=0, _register_accepted=False,
+            _solved_rqdata="R" * 216, _cdp_interceptor_on=False,
+            _cdp_injections=0, _cdp_inject_note="")
+        for k, v in attrs.items():
+            setattr(bot, k, v)
+        page.bot = bot
+        bot._log = lambda m, level="info": None
+
+        await bot._apply_hcaptcha_token(
+            "P1_" + "t" * 50, solved_rqtoken="rqt-CURRENT",
+            solved_session="sess-CURRENT")
+
+        self.assertEqual(sent[0], ("rqt-CURRENT", "sess-CURRENT"))
+        # and prove the race really did fire
+        self.assertEqual(bot._rqtoken, "rqt-NEXT")
+
+    def test_solve_snapshots_the_triple(self):
+        src = open("server.py").read()
+        self.assertIn("solved_rqtoken = getattr(self", src)
+        self.assertIn("solved_session = getattr(self", src)
+        i = src.index("solved_rqtoken = getattr(self")
+        j = src.index("self._nonecap.solve(", i)
+        self.assertLess(i, j, "snapshot must happen BEFORE the solve")
+
+    def test_submit_accepts_the_pinned_values(self):
+        import inspect
+
+        import server
+        sig = inspect.signature(
+            server.DiscordAutomation._direct_register_with_token)
+        self.assertIn("rqtoken", sig.parameters)
+        self.assertIn("session", sig.parameters)
 
 
 if __name__ == "__main__":

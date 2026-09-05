@@ -4879,6 +4879,15 @@ class DiscordAutomation:
             # A token minted on the solver's own IP breaks that binding and
             # comes back invalid-response, so forward our egress.
             egress = self._solver_proxy_url()
+            # Snapshot the challenge this token will be bound to. The
+            # /auth/register response hook fires while we are awaiting the
+            # solve and replaces self._rqtoken / _captcha_session_id with
+            # the NEXT challenge's values — sending those alongside THIS
+            # token is an automatic invalid-response.
+            solved_rqdata = rqdata
+            solved_rqtoken = getattr(self, "_rqtoken", "") or ""
+            solved_session = getattr(self, "_captcha_session_id", "") or ""
+            self._solved_rqdata = solved_rqdata
             token = await self._nonecap.solve(sitekey, str(page_url),
                                               rqdata=rqdata,
                                               proxy=egress)
@@ -4894,7 +4903,9 @@ class DiscordAutomation:
                               "the local solver", level="warn")
                     return False
                 continue
-            if await self._apply_hcaptcha_token(token):
+            if await self._apply_hcaptcha_token(
+                    token, solved_rqtoken=solved_rqtoken,
+                    solved_session=solved_session):
                 self._log("[Captcha] [OK] NoneCap token accepted — "
                           "challenge cleared")
                 if self._events is not None:
@@ -5290,7 +5301,9 @@ class DiscordAutomation:
         });
     }"""
 
-    async def _direct_register_with_token(self, token: str) -> bool:
+    async def _direct_register_with_token(self, token: str,
+                                          rqtoken: str = None,
+                                          session: str = None) -> bool:
         """POST /auth/register ourselves with the captcha token attached.
 
         Returns True when Discord accepts it (2xx with a session token).
@@ -5312,8 +5325,13 @@ class DiscordAutomation:
             "password": password,
             "dob": dob,
             "token": token,
-            "rqtoken": getattr(self, "_rqtoken", "") or "",
-            "session": getattr(self, "_captcha_session_id", "") or "",
+            # PINNED at solve time. Reading self._* here sent the NEXT
+            # challenge's rqtoken/session with THIS challenge's token —
+            # a guaranteed invalid-response.
+            "rqtoken": (rqtoken if rqtoken is not None
+                        else getattr(self, "_rqtoken", "") or ""),
+            "session": (session if session is not None
+                        else getattr(self, "_captcha_session_id", "") or ""),
             "respkey": getattr(self, "_captcha_respkey", "") or "",
             "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
         }
@@ -5345,9 +5363,9 @@ class DiscordAutomation:
         # rather than inferred from three separate lines.
         tok = getattr(self, "_pending_captcha_token", "") or ""
         rk = getattr(self, "_captcha_respkey", "") or ""
-        rqt = getattr(self, "_rqtoken", "") or ""
-        sid = getattr(self, "_captcha_session_id", "") or ""
-        rq = getattr(self, "_rqdata", "") or ""
+        rqt = payload.get("rqtoken") or ""
+        sid = payload.get("session") or ""
+        rq = getattr(self, "_solved_rqdata", "") or ""
         import hashlib as _hh
         def _h8(v):
             return _hh.md5(v.encode()).hexdigest()[:8] if v else "-"
@@ -5395,7 +5413,9 @@ class DiscordAutomation:
             pass
         return False
 
-    async def _apply_hcaptcha_token(self, token: str) -> bool:
+    async def _apply_hcaptcha_token(self, token: str,
+                                    solved_rqtoken: str = None,
+                                    solved_session: str = None) -> bool:
         """Inject a solved token and confirm the page actually advanced."""
         try:
             applied = await asyncio.wait_for(
@@ -5469,7 +5489,8 @@ class DiscordAutomation:
         # The click did not produce a register request (Discord keeps the
         # challenge open instead of re-POSTing), so send it ourselves with
         # the token attached.
-        ok_direct = await self._direct_register_with_token(token)
+        ok_direct = await self._direct_register_with_token(
+            token, rqtoken=solved_rqtoken, session=solved_session)
         await self._disarm_cdp_captcha_interceptor()
         if ok_direct:
             return True

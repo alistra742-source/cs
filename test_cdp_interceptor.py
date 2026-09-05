@@ -217,7 +217,7 @@ class TestNotArmedAtPageCreation(unittest.TestCase):
 
     def test_disarm_exists_and_runs_after_the_submit(self):
         self.assertIn("_disarm_cdp_captcha_interceptor", self.src)
-        i = self.src.index("_direct_register_with_token(token)")
+        i = self.src.index("_direct_register_with_token(\n")
         self.assertIn("_disarm_cdp_captcha_interceptor",
                       self.src[i:i + 400])
 
