@@ -4938,12 +4938,25 @@ class DiscordAutomation:
             "(real HTTP 400, not 0), solve minted through OUR proxy exit.",
             level="warn")
         self._log(
-            "[NoneCap] Remaining cause: the TOKEN itself is refused by "
-            "hCaptcha for this enterprise sitekey. That is solver-side "
-            "(token reputation), not something this code can change. "
-            "Quote solve id "
-            f"{getattr(self._nonecap, 'last_solve_id', '?')} to NoneCap "
-            "support with sitekey a9b5fb07-92ff-493f-86fe-352a2803b3df.",
+            "[NoneCap] Every request parameter is now verified byte-correct, "
+            "including the rqdata/rqtoken/session pinning fixed in 1b0f996 "
+            "(solved-with and sent-with hashes match on every attempt).",
+            level="warn")
+        self._log(
+            "[NoneCap] Remaining cause: the token is refused by hCaptcha "
+            "itself. NoneCap's API accepts only {type, sitekey, url, "
+            "rqdata, proxy} — it has NO rqtoken parameter — so the solve "
+            "is bound to rqdata alone. If Discord's enterprise sitekey "
+            "also binds the token to captcha_rqtoken, no caller can "
+            "satisfy that through this API.", level="warn")
+        self._log(
+            f"[NoneCap] ASK NONECAP: 'Does solve id "
+            f"{getattr(self._nonecap, 'last_solve_id', '?')} "
+            "(sitekey a9b5fb07-92ff-493f-86fe-352a2803b3df, "
+            "hcaptcha_enterprise, invisible, fresh rqdata, own proxy) "
+            "produce a token Discord accepts? Discord returns "
+            "invalid-response on every one. Do you support Discord "
+            "registration, and does your API take captcha_rqtoken?'",
             level="warn")
         self._log(
             "[NoneCap] =========================================",
