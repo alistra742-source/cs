@@ -1149,6 +1149,26 @@ def _tor_newnym():
     return False
 
 
+def _tor_allowed() -> bool:
+    """Is a TOR downgrade permitted?
+
+    Not when residential sessions are configured: Discord binds the
+    captcha challenge to the exit IP and the solver is handed OUR proxy,
+    so quietly switching to TOR guarantees an invalid-response and gives
+    Discord a flagged exit on top. TOR_FALLBACK=1 forces it back on.
+    """
+    env = (os.environ.get("TOR_FALLBACK") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        import proxies as _p
+        return not _p.configured()
+    except Exception:
+        return True
+
+
 def _tor_check():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1820,9 +1840,13 @@ class DiscordAutomation:
         # context-level proxy is ignored by the engine) and Discord's
         # Cloudflare blocks the datacenter IP with a browser error page.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and not self._direct and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check() \
+                and _tor_allowed():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
+        if launch_proxy is not None:
+            self._log(f"[Proxy] Browser launching via "
+                      f"{'TOR' if self._tor_enabled else launch_proxy.get('server')}")
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
         await self._build_context()
@@ -1882,9 +1906,13 @@ class DiscordAutomation:
         # firefox launch — a proxy passed later to new_context() would be
         # rejected and traffic would go direct.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and not self._direct and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check() \
+                and _tor_allowed():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
+        if launch_proxy is not None:
+            self._log(f"[Proxy] Browser launching via "
+                      f"{'TOR' if self._tor_enabled else launch_proxy.get('server')}")
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 

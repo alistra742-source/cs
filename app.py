@@ -36,9 +36,21 @@ PROXY_FORCE = (
 )
 
 # Fall back to TOR (socks5://127.0.0.1:9050) when the proxy pool is
-# exhausted or every session is dead (e.g. vaultproxies at 0.00 GB quota).
-# Disable with TOR_FALLBACK=0.
-TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0", "false", "no", "off")
+# exhausted or every session is dead.
+#
+# DEFAULT OFF whenever residential sessions are configured. Discord's
+# enterprise hCaptcha binds rqdata to the exit IP, and the solver is given
+# OUR proxy — a silent TOR fallback breaks that binding and guarantees
+# invalid-response, while also handing Discord a heavily-flagged exit. If
+# proxies are configured we wait for a live one instead of quietly
+# downgrading. Set TOR_FALLBACK=1 to opt back in.
+_TOR_FALLBACK_ENV = (os.environ.get("TOR_FALLBACK") or "").strip().lower()
+if _TOR_FALLBACK_ENV in ("1", "true", "yes", "on"):
+    TOR_FALLBACK = True
+elif _TOR_FALLBACK_ENV in ("0", "false", "no", "off"):
+    TOR_FALLBACK = False
+else:
+    TOR_FALLBACK = not PROXY_FORCE
 
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
@@ -343,7 +355,10 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 tor_fallback = True
                 _log(f"[{wid}] [Proxy] No usable proxy sessions — falling back to TOR (socks5://127.0.0.1:9050)", level="warn")
             else:
-                _log(f"[{wid}] [Proxy] No proxy sessions (forced mode) — refreshing and waiting...", level="warn")
+                _log(f"[{wid}] [Proxy] No usable session right now — waiting "
+                     f"(TOR is disabled: Discord binds the captcha to the "
+                     f"exit IP, so a TOR downgrade would fail anyway)",
+                     level="warn")
                 state["proxy"] = "waiting-for-proxy"
                 await asyncio.sleep(5)
                 continue
@@ -370,7 +385,12 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 proxy = None
                 consecutive_tunnel_fails += 1
                 backoff = min(backoff * 2, 8)
-                if consecutive_tunnel_fails >= 4:
+                # A handful of dead sessions out of hundreds is normal —
+                # rotate, do not condemn the pool. Only give up once we have
+                # burned a meaningful slice of it.
+                _dead_limit = 4 if not PROXY_FORCE else max(
+                    12, min(40, (proxy_pool.count if proxy_pool else 0) // 8))
+                if consecutive_tunnel_fails >= _dead_limit:
                     if TOR_FALLBACK and _tor_check() and not tor_fallback:
                         tor_fallback = True
                         proxy = None
@@ -379,8 +399,18 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                         _proxy_stats_line(wid)
                         await asyncio.sleep(1)
                         continue
-                    _log(f"[{wid}] {consecutive_tunnel_fails} consecutive tunnel failures — aborting (all sessions appear dead)")
-                    break
+                    _log(f"[{wid}] {consecutive_tunnel_fails} consecutive "
+                         f"dead sessions — pausing 30s and refreshing the "
+                         f"pool (TOR disabled)", level="warn")
+                    consecutive_tunnel_fails = 0
+                    backoff = 0.3
+                    try:
+                        if proxy_pool is not None:
+                            await proxy_pool.refresh()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                    continue
                 _proxy_stats_line(wid)
                 await asyncio.sleep(backoff)
                 continue

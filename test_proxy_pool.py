@@ -73,5 +73,58 @@ class TestEgressMatchesBrowser(unittest.TestCase):
                       server.DiscordAutomation._solver_proxy_url(Bot()))
 
 
+class TestTorIsDisabledWhenProxiesExist(unittest.TestCase):
+    """A silent TOR downgrade breaks the IP binding AND flags the exit."""
+
+    def test_app_tor_fallback_off(self):
+        import app
+        self.assertTrue(app.PROXY_FORCE)
+        self.assertFalse(app.TOR_FALLBACK)
+
+    def test_server_tor_not_allowed(self):
+        import server
+        self.assertFalse(server._tor_allowed())
+
+    def test_tor_can_be_forced_back_on(self):
+        import os
+        import server
+        os.environ["TOR_FALLBACK"] = "1"
+        try:
+            self.assertTrue(server._tor_allowed())
+        finally:
+            os.environ.pop("TOR_FALLBACK", None)
+
+    def test_tor_launch_sites_are_gated(self):
+        src = open("server.py").read()
+        for i, line in enumerate(src.splitlines()):
+            if 'socks5://127.0.0.1:9050' in line and 'launch_proxy = {' in line:
+                window = "\n".join(src.splitlines()[max(0, i - 4):i])
+                self.assertIn("_tor_allowed()", window,
+                              f"ungated TOR launch at line {i + 1}")
+
+    def test_dead_session_limit_scales_with_pool(self):
+        """4 dead sessions out of 663 must not condemn the pool."""
+        src = open("app.py").read()
+        self.assertIn("_dead_limit", src)
+        i = src.index("_dead_limit")
+        self.assertIn("PROXY_FORCE", src[i:i + 200])
+
+
+class TestNoTorInTheSolverPath(unittest.TestCase):
+    def test_egress_is_never_a_local_socks_port(self):
+        import server
+        entry = proxies.vault_proxies()[0]
+
+        class Bot:
+            proxy = {"server": f"http://{entry['host']}:{entry['port']}",
+                     "username": entry["username"],
+                     "password": entry["password"]}
+
+        egress = server.DiscordAutomation._solver_proxy_url(Bot())
+        self.assertNotIn("127.0.0.1", egress)
+        self.assertNotIn("9050", egress)
+        self.assertIn(entry["host"], egress)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
