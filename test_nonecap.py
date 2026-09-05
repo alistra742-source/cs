@@ -472,11 +472,20 @@ class TestWidgetRqdataCrossCheck(unittest.TestCase):
         block = self.src[i:i + 400]
         self.assertIn("rqdata = live_rq", block)
 
-    def test_retry_forces_a_fresh_read(self):
+    def test_retry_rebinds_to_the_fresh_challenge(self):
         i = self.src.index("Discord issues a NEW challenge")
-        block = self.src[i:i + 900]
-        self.assertIn('self._rqdata = ""', block)
+        block = self.src[i:i + 1600]
+        # Must NOT wipe the cache: the 400 handler already stored the fresh
+        # blob, and clearing it fell back to the stale getcaptcha payload
+        # (attempt 2 logged the same rqdata hash as attempt 1).
+        self.assertIn("Do NOT wipe self._rqdata", block)
         self.assertIn("_widget_rqdata()", block)
+
+    def test_retry_waits_for_rotation_instead_of_resolving_a_refused_blob(self):
+        i = self.src.index("Discord issues a NEW challenge")
+        block = self.src[i:i + 2600]
+        self.assertIn("challenge did NOT rotate", block)
+        self.assertIn("await asyncio.sleep(1.0)", block)
 
     def test_solve_parameters_are_logged(self):
         self.assertIn("sitekey={sitekey} url={page_url}", self.src)

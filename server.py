@@ -5146,7 +5146,11 @@ class DiscordAutomation:
             if attempt > 1:
                 # Discord issues a NEW challenge with invalid-response, so a
                 # retry MUST rebind to it — same rqdata twice can only fail.
-                self._rqdata = ""          # force a re-read, not the cache
+                #
+                # Do NOT wipe self._rqdata here: the 400 handler has ALREADY
+                # stored the fresh blob, and clearing it made _live_rqdata()
+                # fall back to the stale /getcaptcha payload — which is why
+                # attempt 2 logged the same rqdata hash as attempt 1.
                 fresh = await self._live_rqdata()
                 widget = await self._widget_rqdata()
                 w_rq = str(widget.get("rqdata") or "")
@@ -5159,8 +5163,24 @@ class DiscordAutomation:
                               f"({len(fresh)} chars)")
                     rqdata = fresh
                 elif fresh:
-                    self._log("[NoneCap] retry: rqdata unchanged — the "
-                              "challenge did not rotate", level="warn")
+                    # Give the widget a moment to fetch the new challenge,
+                    # then look again. Re-solving a refused blob is a
+                    # guaranteed failure and a wasted credit.
+                    for _ in range(6):
+                        await asyncio.sleep(1.0)
+                        again = await self._live_rqdata()
+                        if again and again != rqdata:
+                            fresh = again
+                            break
+                    if fresh != rqdata:
+                        self._log(f"[NoneCap] retry bound to the FRESH "
+                                  f"challenge after waiting "
+                                  f"({len(fresh)} chars)")
+                        rqdata = fresh
+                    else:
+                        self._log("[NoneCap] retry: challenge did NOT rotate "
+                                  "— re-solving the same rqdata cannot pass",
+                                  level="warn")
             self._log(f"[NoneCap] Attempt {attempt}/{tries}"
                       + (" (enterprise" if rqdata else " (plain")
                       + (", invisible)"
