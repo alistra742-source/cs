@@ -169,3 +169,44 @@ it to first in `_drag_verified` and drop the wasted attempts.
 
 Telemetry never blocks or breaks a solve — posts are fire-and-forget and
 every error is swallowed at debug level.
+
+## Standalone vision service (`vision_service.py`)
+
+A 24/7 endpoint that takes an image + the challenge prompt and returns an
+answer. Runs as its OWN service — Railway, a VPS, anywhere:
+
+```
+python vision_service.py          # binds $PORT, default 8099
+```
+
+Backends, picked automatically from whichever key is present:
+
+| env | backend |
+|---|---|
+| `OPENAI_API_KEY` (+ optional `OPENAI_BASE`, `OPENAI_MODEL`) | gpt-4o and any OpenAI-compatible host (Groq, OpenRouter, vLLM…) |
+| `GEMINI_API_KEY` (+ `GEMINI_MODEL`) | Gemini |
+| `OLLAMA_BASE` (+ `OLLAMA_MODEL`) | self-hosted |
+
+Force one with `VISION_BACKEND=openai|gemini|ollama`. Protect the
+endpoint with `VISION_SERVICE_TOKEN` (sent as `Authorization: Bearer`).
+
+```
+GET  /health  -> {"ok":true,"backend":"openai","model":"gpt-4o"}
+POST /solve   {"prompt":..., "shape":"tiles|points|bbox|drag|count|text",
+               "images":["<b64>",...], "examples":["<b64>",...]}
+              -> {"type":"tiles","indices":[1,4,7]}
+```
+
+Answers are returned in the shape hCaptcha grades — tile indices,
+normalised 0-1 points, a bbox, or a drag from/to pair. Replies are parsed
+out of code fences and prose, coordinates are clamped, and out-of-range
+tile indices are dropped.
+
+**It is NOT wired into the bot.** Discord serves *invisible enterprise*
+hCaptcha (`should_serve_invisible: true`), where the token is minted by
+`hcaptcha.execute()` after hCaptcha scores the session — clicking correct
+tiles is necessary but not sufficient. The previous local stack
+(Roboflow → RT-DETR → gemma3:4b) cleared zero Discord challenges in ~20
+runs, and NoneCap's purpose-built enterprise tokens are still refused.
+This service is here for a target where solving the visible challenge is
+what actually mints the token.
