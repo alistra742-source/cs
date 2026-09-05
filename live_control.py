@@ -442,6 +442,30 @@ async def live_meta(bot) -> dict:
     return _attach_pointer_fields(meta, bot)
 
 
+async def _capture_live_frame(page) -> tuple:
+    """One full-browser-view attempt -> (PNG bytes, error text).
+
+    The capture policy (reveal the register form, OOM safety net, reject
+    truncated/tiny PNGs) lives in server.capture_page_screenshot — this is
+    just the live camera's single attempt wrapper, returning the exact
+    reason a frame was rejected so the caller can decide whether to retry
+    (transient) or report (real failure).
+    """
+    try:
+        shot = await capture_page_screenshot(
+            page, fullpage_timeout=10.0, viewport_timeout=6.0, reveal="live")
+        if not shot:
+            return (b"", "empty capture")
+        if not png_is_complete(shot):
+            return (b"", "incomplete png")
+        width, height = png_dimensions(shot)
+        if width < 200 or height < 200:
+            return (b"", f"tiny frame {width}x{height}")
+        return (shot, "")
+    except Exception as e:
+        return (b"", str(e))
+
+
 async def live_screenshot(bot) -> str:
     """Full browser-view PNG -> base64 for the live feed.
 
@@ -455,24 +479,29 @@ async def live_screenshot(bot) -> str:
     page = getattr(bot, "_page", None)
     if page is None:
         return ""
-    last_err = ""
-    try:
-        shot = await capture_page_screenshot(
-            page, fullpage_timeout=10.0, viewport_timeout=6.0, reveal="live")
-        if not shot:
-            last_err = "empty capture"
-        elif not png_is_complete(shot):
-            last_err = "incomplete png"
-            shot = b""
-        else:
-            width, height = png_dimensions(shot)
-            if width < 200 or height < 200:
-                last_err = f"tiny frame {width}x{height}"
-                shot = b""
-    except Exception as e:
-        last_err = str(e)
-        shot = b""
-    if shot and not last_err:
+    shot, last_err = await _capture_live_frame(page)
+    if not shot:
+        # Chrome returns an EMPTY frame (no PNG data at all) while the page
+        # is still loading and its compositor has not committed a frame yet
+        # — see nodriver's own save_screenshot ("could not take screenshot
+        # ... page has not finished loading yet"). A single burst of
+        # attempts can fire entirely inside that no-frame window and wrongly
+        # report a broken camera on every slow SPA load. Pace a few retries
+        # over the next couple of seconds so a frame that appears mid-poll
+        # is caught the moment it exists; only give up for real when an
+        # attempt burns actual time (a stuck renderer, not a page that just
+        # has not painted yet).
+        for _ in range(5):
+            await asyncio.sleep(0.4)
+            retry_started = time.monotonic()
+            retry_shot, retry_err = await _capture_live_frame(page)
+            last_err = retry_err or last_err
+            if retry_shot:
+                shot = retry_shot
+                break
+            if time.monotonic() - retry_started >= 2.5:
+                break
+    if shot:
         b64 = base64.b64encode(shot).decode("utf-8")
         shots = getattr(bot, "_screenshots", None)
         if shots is not None:
@@ -481,8 +510,16 @@ async def live_screenshot(bot) -> str:
             if len(shots) > 10:
                 bot._screenshots = shots[-8:]
         return b64
+    # A loading SPA can legitimately go without a frame for a while; the
+    # next 3s camera poll keeps trying. Log the miss at most once every 20s
+    # instead of spamming ALL LOGS with an identical warning every poll.
     try:
-        bot._log(f"[Live] screenshot failed: {last_err}", level="warn")
+        now = time.monotonic()
+        last_log = float(getattr(bot, "_live_shot_fail_logged", 0.0) or 0.0)
+        if now - last_log >= 20.0:
+            bot._live_shot_fail_logged = now
+            bot._log(f"[Live] no camera frame yet: {last_err} - retrying on next poll",
+                     level="warn")
     except Exception:
         pass
     return ""
