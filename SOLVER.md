@@ -217,10 +217,18 @@ what actually mints the token.
 |---|---|---|
 | 1 NoneCap | `NONECAP_API` | hosted enterprise **token** |
 | 2 AZcaptcha | `API_KEY2` | hosted **token** (`in.php`/`res.php`, rqdata via `data`) |
-| 3 OpenRouter | `API_KEY3` | **coordinates** — gemini-2.5-flash |
-| 4 Google AI | `API_KEY4` | **coordinates** — gemini-2.5-flash |
+| 3 OpenRouter | `API_KEY3` | **coordinates** — google/gemini-2.5-flash |
+| 4 Google AI | `API_KEY4` | **coordinates** — gemini-3.5-flash (auto-falls back to gemini-2.5-flash) |
 
 Tried in order; the first that clears the round wins.
+
+> Google retires older model generations for **new** API keys ("This model
+> ... is no longer available to new users" → HTTP 404). The Google tier
+> defaults to `gemini-3.5-flash` and walks `GOOGLE_MODEL_FALLBACKS`
+> (default `gemini-3.5-flash,gemini-2.5-flash`) when the key's model is
+> refused. Keys created before the retirement can pin
+> `GOOGLE_MODEL=gemini-2.5-flash` explicitly. AZcaptcha submit retries
+> transient errors (`ERROR_MAINTENANCE`, …) 3× before falling through.
 
 ### Why tiers 3-4 are different in kind
 
@@ -256,4 +264,6 @@ Per shape they get one exact output spec — `{"indices":[1,4,7]}`,
 code fences stripped, JSON dug out of prose, percentages rescaled,
 out-of-range tile indices dropped, coords clamped to 0-1.
 
-Optional: `OPENROUTER_MODEL`, `GOOGLE_MODEL`, `VISION_TIMEOUT` (45s).
+Optional: `OPENROUTER_MODEL`, `GOOGLE_MODEL`, `GOOGLE_MODEL_FALLBACKS`
+(comma-separated, default `gemini-3.5-flash,gemini-2.5-flash`),
+`VISION_TIMEOUT` (45s).

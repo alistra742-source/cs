@@ -3,8 +3,9 @@
 
     1  NoneCap        NONECAP_API   hosted enterprise token
     2  AZcaptcha      API_KEY2      hosted token (in.php / res.php)
-    3  OpenRouter     API_KEY3      gemini-2.5-flash, VISION
-    4  Google AI      API_KEY4      gemini-2.5-flash, VISION
+    3  OpenRouter     API_KEY3      google/gemini-2.5-flash, VISION
+    4  Google AI      API_KEY4      gemini-3.5-flash (falls back to
+                                     gemini-2.5-flash), VISION
 
 Tiers 1-2 return a **token** — the site's own hCaptcha is satisfied by
 submitting it.
@@ -57,8 +58,18 @@ AZCAPTCHA_BASE = (os.environ.get("AZCAPTCHA_BASE")
                   or "http://azcaptcha.com").rstrip("/")
 OPENROUTER_MODEL = (os.environ.get("OPENROUTER_MODEL")
                     or "google/gemini-2.5-flash").strip()
+# Google retires older model generations for NEW API keys/projects ("This
+# model ... is no longer available to new users" -> HTTP 404). gemini-2.5-flash
+# hit exactly that in mid-2026, so the default points at a current stable
+# generation and _google() walks GOOGLE_MODEL_FALLBACKS when the key's model
+# is refused. Set GOOGLE_MODEL=gemini-2.5-flash explicitly on keys that still
+# have access.
 GOOGLE_MODEL = (os.environ.get("GOOGLE_MODEL")
-                or "gemini-2.5-flash").strip()
+                or "gemini-3.5-flash").strip()
+GOOGLE_MODEL_FALLBACKS = [m.strip() for m in
+                          (os.environ.get("GOOGLE_MODEL_FALLBACKS")
+                           or "gemini-3.5-flash,gemini-2.5-flash")
+                          .split(",") if m.strip()]
 VISION_TIMEOUT = float(os.environ.get("VISION_TIMEOUT") or "45")
 
 
@@ -88,6 +99,11 @@ class AZCaptcha:
         if not self.enabled:
             self.last_error = "not configured"
             return None
+        # Transient submit errors (maintenance windows, no free slot) are
+        # routine on shared captcha farms — one blip should not burn this
+        # tier for the whole session, so submit is retried a few times.
+        _TRANSIENT = ("ERROR_MAINTENANCE", "ERROR_NO_SLOT_AVAILABLE",
+                      "ERROR_TOO_MANY_BIDDERS", "ERROR_TOO_BIG_CAPTCHA_FILE")
         data = {
             "key": self._key,
             "method": "hcaptcha",
@@ -105,17 +121,41 @@ class AZCaptcha:
         try:
             cfg = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=cfg) as s:
-                self._log(f"[AZcaptcha] Submitting hcaptcha "
-                          f"{sitekey[:8]}… (rqdata={'yes' if rqdata else 'no'})")
-                async with s.post(f"{AZCAPTCHA_BASE}/in.php",
-                                  data=data) as r:
-                    body = await r.json(content_type=None)
-                if str(body.get("status")) != "1":
+                cid = ""
+                for attempt in range(3):
+                    note = f" — try {attempt + 1}/3" if attempt else ""
+                    self._log(f"[AZcaptcha] Submitting hcaptcha "
+                              f"{sitekey[:8]}… "
+                              f"(rqdata={'yes' if rqdata else 'no'}){note}")
+                    try:
+                        async with s.post(f"{AZCAPTCHA_BASE}/in.php",
+                                          data=data) as r:
+                            body = await r.json(content_type=None)
+                    except Exception as _e:
+                        if attempt < 2:
+                            self._log(f"[AZcaptcha] submit network error "
+                                      f"({type(_e).__name__}) — retrying",
+                                      level="warn")
+                            await asyncio.sleep(3)
+                            continue
+                        raise
+                    if str(body.get("status")) == "1":
+                        cid = str(body.get("request"))
+                        break
                     self.last_error = str(body.get("request") or body)[:120]
+                    if (any(t in self.last_error for t in _TRANSIENT)
+                            and attempt < 2):
+                        self._log(f"[AZcaptcha] submit transient "
+                                  f"({self.last_error}) — retrying",
+                                  level="warn")
+                        await asyncio.sleep(3)
+                        continue
                     self._log(f"[AZcaptcha] submit failed: "
                               f"{self.last_error}", level="warn")
                     return None
-                cid = str(body.get("request"))
+                if not cid:
+                    self.last_error = "submit failed"
+                    return None
                 self.last_id = cid
                 # poll
                 deadline = asyncio.get_event_loop().time() + timeout
@@ -336,21 +376,33 @@ class VisionSolver:
             parts.append({"inline_data": {"mime_type": "image/jpeg",
                                           "data": b}})
         cfg = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
+        models = [GOOGLE_MODEL]
+        models += [m for m in GOOGLE_MODEL_FALLBACKS if m not in models]
         async with aiohttp.ClientSession(timeout=cfg) as s:
-            async with s.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/"
-                    f"models/{GOOGLE_MODEL}:generateContent",
-                    headers={"x-goog-api-key": self._key,
-                             "Content-Type": "application/json"},
-                    json={"contents": [{"parts": parts}],
-                          "generationConfig": {"temperature": 0.0,
-                                               "maxOutputTokens": 300}}) as r:
-                if r.status != 200:
-                    raise RuntimeError(
-                        f"HTTP {r.status}: {(await r.text())[:160]}")
-                d = await r.json()
-        return (d["candidates"][0]["content"]["parts"][0]["text"]
-                or "").strip()
+            for model in models:
+                async with s.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/"
+                        f"models/{model}:generateContent",
+                        headers={"x-goog-api-key": self._key,
+                                 "Content-Type": "application/json"},
+                        json={"contents": [{"parts": parts}],
+                              "generationConfig": {"temperature": 0.0,
+                                                   "maxOutputTokens": 300}}) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        return (d["candidates"][0]["content"]["parts"]
+                                [0]["text"] or "").strip()
+                    body = (await r.text())[:300]
+                    is_refused = (r.status == 404 and (
+                        "no longer available" in body
+                        or "not found" in body or "not_found" in body))
+                    if is_refused and model != models[-1]:
+                        self._log(f"[google] model {model} refused by this "
+                                  f"API key (HTTP 404) — trying "
+                                  f"{models[models.index(model) + 1]}",
+                                  level="warn")
+                        continue
+                    raise RuntimeError(f"HTTP {r.status}: {body}")
 
     async def solve(self, question: str, images: List[bytes],
                     shape: str = "tiles",

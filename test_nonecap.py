@@ -657,7 +657,9 @@ class TestNoneCapPathRuns(unittest.IsolatedAsyncioTestCase):
             else:
                 os.environ["NONECAP_API"] = old
         self.assertFalse(ok)
-        self.assertEqual(len(FakeSolver.calls), 3, "all 3 attempts must run")
+        self.assertEqual(len(FakeSolver.calls), 2,
+                         "default is 2 total attempts before falling "
+                         "through to the next tier")
 
 
 if __name__ == "__main__":

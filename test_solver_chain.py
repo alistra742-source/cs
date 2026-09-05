@@ -47,6 +47,29 @@ class TestKeyWiring(unittest.TestCase):
         self.assertFalse(got["openrouter"])
 
 
+class TestGoogleModelDefaults(unittest.TestCase):
+    """Google retired gemini-2.5-flash for NEW keys (HTTP 404 "no longer
+    available to new users"), so the default must point at a current
+    stable generation and the retired model may only be a fallback."""
+
+    def test_default_is_a_current_stable_generation(self):
+        if "GOOGLE_MODEL" in os.environ:
+            self.skipTest("GOOGLE_MODEL overridden in the environment")
+        self.assertEqual(sc.GOOGLE_MODEL, "gemini-3.5-flash")
+
+    def test_retired_model_is_only_a_fallback(self):
+        if "GOOGLE_MODEL_FALLBACKS" in os.environ:
+            self.skipTest("GOOGLE_MODEL_FALLBACKS set in the environment")
+        self.assertIn("gemini-2.5-flash", sc.GOOGLE_MODEL_FALLBACKS)
+        self.assertIn(sc.GOOGLE_MODEL, sc.GOOGLE_MODEL_FALLBACKS)
+        # Primary + fallbacks are tried in order without duplicates.
+        models = [sc.GOOGLE_MODEL]
+        models += [m for m in sc.GOOGLE_MODEL_FALLBACKS
+                   if m not in models]
+        self.assertEqual(len(models), len(set(models)))
+        self.assertEqual(models[0], sc.GOOGLE_MODEL)
+
+
 class TestCoordinatesOnlyPrompt(unittest.TestCase):
     """The user asked specifically: coordinates and image only."""
 

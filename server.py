@@ -4784,11 +4784,34 @@ class DiscordAutomation:
         ox, oy = await self._frame_origin(frame)
         box = {"x": float(info["x"]) + ox, "y": float(info["y"]) + oy,
                "width": float(info["width"]), "height": float(info["height"])}
+        # Chrome's captureScreenshot returns a degenerate (often 1x1) image
+        # until the frame's compositor commits a real frame. Right after the
+        # challenge re-renders (token rejected, tier switch, fresh round)
+        # that no-frame window is the NORM, so one screenshot crops into a
+        # blank 1x1 that then goes to the vision model. Pace retries so a
+        # real frame is caught the moment it exists; give up quietly when
+        # Chrome truly has nothing to paint.
+        from PIL import Image
+        import io as _io
+        im = None
+        for attempt in range(5):
+            try:
+                raw = await asyncio.wait_for(frame.screenshot(), timeout=3.0)
+                cand = Image.open(_io.BytesIO(raw)).convert("RGB")
+            except Exception:
+                cand = None
+            if (cand is not None and cand.size[0] >= 120
+                    and cand.size[1] >= 120):
+                im = cand
+                break
+            if attempt < 4:
+                await asyncio.sleep(0.5)
+        if im is None:
+            self._log("[Captcha] Challenge surface not painted yet after "
+                      "retries — skipping the vision round", level="warn")
+            return None, None
         try:
-            raw = await frame.screenshot()
-            from PIL import Image
-            import io as _io
-            im = Image.open(_io.BytesIO(raw)).convert("RGB")
+            iw, ih = im.size
             x0 = int(info["x"]); y0 = int(info["y"])
             x1 = x0 + int(info["width"])
             y1 = y0 + int(info["height"])
@@ -4797,7 +4820,6 @@ class DiscordAutomation:
             # space (device pixel ratio, or the element sitting in a nested
             # document). A crop that lands off-image returns solid black —
             # which is exactly the "0 contours on every round" symptom.
-            iw, ih = im.size
             # Clamp to a VALID rect. An element scrolled out of view gives
             # negative or beyond-image coords, and PIL then raises
             # "Coordinate 'right' is less than 'left'" — which killed every
@@ -4826,7 +4848,8 @@ class DiscordAutomation:
             crop.save(buf, "JPEG", quality=92)
             return buf.getvalue(), box
         except Exception as e:
-            self._log(f"[Captcha] Surface screenshot failed: {e}", level="debug")
+            self._log(f"[Captcha] Surface screenshot failed: {e}",
+                      level="debug")
             return None, None
 
     def _denorm(self, point, box):
