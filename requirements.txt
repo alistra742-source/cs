@@ -16,13 +16,6 @@ flask>=3.0.0
 # Email checker (MX record lookups; optional - falls back to plain DNS)
 dnspython>=2.6.0
 
-# Image handling for the Roboflow vision solver (tile screenshots are
-# downscaled and base64-encoded before they are POSTed to the workflow).
+# Image handling (challenge screenshots for the live dashboard camera).
 Pillow>=10.0.0
 numpy>=1.26.0
-
-# Shape matching for hCaptcha drag rounds ("drag the icon to where it
-# fits"). cv2.matchShapes compares contours via Hu moments, which are
-# invariant to translation, rotation and scale — exactly the property the
-# glyph pairing needs. Headless build: no GUI libs, ~40 MB.
-opencv-python-headless>=4.9.0

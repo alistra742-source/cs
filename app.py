@@ -1622,37 +1622,6 @@ def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-async def _vision_warmup(interval: float = 600.0) -> None:
-    """Keep the Roboflow workflow warm and report misconfiguration early.
-
-    Roboflow's serverless tier scales a workflow to zero when idle, so the
-    first captcha after a quiet period pays a cold start. A describe call
-    every 10 minutes keeps it resident and surfaces a bad API_KEY or a
-    wrong workspace/workflow id in the log instead of mid-solve.
-    """
-    import vision_solver as _vs
-    if not _vs.API_KEY:
-        _log("[Vision] API_KEY is not set — the Roboflow solver is disabled "
-             "until it is configured", level="warn")
-        return
-    client = _vs.RoboflowVisionClient(
-        log=lambda m, level="info": _log(m, level=level))
-    was_up: Optional[bool] = None
-    while True:
-        try:
-            up, _ = await client.check()
-        except Exception:
-            up = False
-        if was_up is not None and up != was_up:
-            if up:
-                _log(f"[Vision] Roboflow back UP "
-                     f"({client.workspace}/{client.workflow})", level="warn")
-            else:
-                _log(f"[Vision] Roboflow DOWN "
-                     f"({client.workspace}/{client.workflow}) — captcha "
-                     "rounds will fail until it answers", level="warn")
-        was_up = up
-        await asyncio.sleep(interval)
 
 def main() -> None:
     global _loop
@@ -1668,10 +1637,6 @@ def main() -> None:
     t.start()
 
     # Keep the Roboflow workflow warm (no-op without API_KEY).
-    try:
-        asyncio.run_coroutine_threadsafe(_vision_warmup(), _loop)
-    except Exception as e:
-        print(f"[app] vision warmup not started: {e}", flush=True)
 
     # Auto-migrate DB (DATABASE_URL from env)
 

@@ -18,8 +18,6 @@ from captcha_solver import (
     read_hcaptcha_token,
 )
 from duckmail import TempMail
-from vision_solver import RoboflowVisionClient
-from drag_solver import DragSolver
 import hcaptcha_types as hct
 import human_mouse as hm
 
@@ -1625,9 +1623,6 @@ class DiscordAutomation:
         self._username = ""
         self._password = ""
         self._token = ""
-        # Roboflow workflow (Gemini 3.6 Flash) answers the image grid
-        # directly (see vision_solver.py; configured with API_KEY).
-        self._vision = RoboflowVisionClient(log=self._log)
         # Outcome telemetry (Roboflow Vision Events). Disabled unless
         # VISION_EVENTS=1; never allowed to affect a solve.
         try:
@@ -4457,11 +4452,12 @@ class DiscordAutomation:
                     self._log(f"[Captcha] Captcha check error: {e}", level="warn")
                 return False
 
-            # ---- VISION SOLVER: reads the image grid via vision_solver ----
-            # The bot reads the challenge instruction, screenshots every tile, asks a
-            # Roboflow workflow running Gemini 3.6 Flash (API_KEY)
-            # which tiles match, clicks them + Verify, and hCaptcha itself
-            # mints the token. See vision_solver.py.
+            # ---- HOSTED SOLVER (NoneCap) — the only solver ----
+            # NoneCap returns a real P1_ token bound to Discord's
+            # enterprise rqdata; we replay /auth/register with it in the
+            # X-Captcha-* headers. There is no local vision fallback: the
+            # Roboflow/RT-DETR/Gemma stack never cleared a single Discord
+            # challenge and cost 20-45s per round to fail.
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -4492,249 +4488,16 @@ class DiscordAutomation:
             if nc_ok:
                 return True
 
-            # Probe the vision endpoint with RETRIES and NO permanent
-            # failure cache. Hosted endpoints (Railway etc.) cold-start on
-            # the first request after sleeping — one fast probe would mark
-            # a healthy service down for the bot's whole lifetime (the
-            # "vision unreachable" that kills every captcha round).
-            # _vision_ready is only set on success, so a service that was
-            # down and comes back re-probes cleanly on the next challenge.
-            if not getattr(self, "_vision_ready", False):
-                ok, models = False, []
-                # Authentication/protocol failures are deterministic: waiting
-                # and replaying the same request cannot fix them.  Only retry
-                # transient connection, timeout, rate-limit, and 5xx failures.
-                terminal_probe_errors = {"authentication", "authorization", "protocol"}
-                # A cold serverless workflow can take longer than 3 probes.
-                # Keep trying while the challenge is still on screen — the
-                # round is only lost when hCaptcha takes it away.
-                _probe_budget = int(os.environ.get("VISION_PROBE_TRIES", "6"))
-                probes_made = 0
-                for _probe in range(_probe_budget):
-                    probes_made = _probe + 1
-                    ok, models = await self._vision.check()
-                    if ok:
-                        break
-                    check_error = getattr(self._vision, "last_check_error", "")
-                    if check_error in terminal_probe_errors:
-                        break
-                    if _probe < _probe_budget - 1:
-                        self._log(
-                            f"[Captcha] Vision endpoint temporarily unavailable "
-                            f"(probe {_probe + 1}/{_probe_budget}, "
-                            f"{check_error or 'unknown error'}) - "
-                            "retrying in 10s", level="warn")
-                        await asyncio.sleep(10)
-                if not ok:
-                    check_error = getattr(self._vision, "last_check_error", "")
-                    http_status = getattr(self._vision, "last_check_http_status", None)
-                    if check_error == "authentication":
-                        self._log(
-                            f"[Captcha] Roboflow rejected authentication "
-                            f"(HTTP {http_status or 401}). API_KEY is missing or "
-                            "invalid — set it to your Roboflow API key from "
-                            "app.roboflow.com/settings/api; do not put the "
-                            "secret in logs.", level="error")
-                    elif check_error == "authorization":
-                        self._log(
-                            f"[Captcha] Vision endpoint denied access "
-                            f"(HTTP {http_status or 403}); check that the key can "
-                            "run this workflow.", level="error")
-                    elif check_error == "protocol":
-                        self._log(
-                            f"[Captcha] Workflow {self._vision.workspace}/"
-                            f"{self._vision.workflow} was not found (HTTP 404) — "
-                            "check ROBOFLOW_WORKSPACE / ROBOFLOW_WORKFLOW.",
-                            level="error")
-                    else:
-                        self._log(
-                            f"[Captcha] Vision server unavailable after {probes_made} "
-                            f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
-                            "- check API_KEY / the workflow. Later challenges "
-                            "will re-probe automatically.", level="error")
-                    # The Gemini workflow is unusable. Before giving up on
-                    # the whole round, see whether the RT-DETR backup
-                    # detector answers — it is a different endpoint on the
-                    # same host, so a broken/misconfigured workflow does
-                    # not imply the backup is down too.
-                    backup_ok = False
-                    try:
-                        backup_ok = await self._vision.check_rtdetr()
-                        if not backup_ok:
-                            backup_ok = await self._vision.check_gemma()
-                    except Exception:
-                        backup_ok = False
-                    if backup_ok:
-                        self._log(
-                            "[Captcha] Gemini workflow unavailable — "
-                            "falling back to the RT-DETR backup detector "
-                            f"({self._vision.rtdetr_model_id})", level="warn")
-                        self._vision_ready = True
-                    else:
-                        return False
-                else:
-                    self._vision_ready = True
-
-            for solve_attempt in range(3):
-                if solve_attempt:
-                    await asyncio.sleep(3)
-                    self._log(
-                        f"[Captcha] Retrying vision solve (attempt {solve_attempt + 1}/3)...",
-                        level="warn")
-                if await self._past_captcha():
-                    self._log("[Captcha] Page already past captcha")
-                    return True
-                # hCaptcha can show several rounds in a row - keep solving
-                # until it mints the token or the challenge resets. Each
-                # round is CLASSIFIED first: hCaptcha has five challenge
-                # families (grid binary, reference binary, point, bbox,
-                # drag, multiple choice, text) and answering a point round
-                # with tile indices (or vice versa) is a guaranteed fail —
-                # and a loud automation signal.
-                last_sig = None
-                for round_i in range(8):
-                    if await self._past_captcha():
-                        return True
-                    chall = await self._challenge_iframe()
-                    if chall is None or not await self._challenge_rendered(chall):
-                        # After Next the iframe often drops to a loader.
-                        # Wait for the next challenge to paint — do NOT
-                        # treat the dip as "challenge over".
-                        chall = await self._wait_for_image_challenge(timeout=10.0)
-                    if chall is None:
-                        if await read_hcaptcha_token(self._page):
-                            self._log(
-                                "[Captcha] [OK] hCaptcha token minted by the solved "
-                                "challenge - submitting form")
-                            await self._click_form_submit()
-                            for _ in range(8):
-                                await asyncio.sleep(1.0)
-                                if await self._past_captcha():
-                                    return True
-                        break
-                    frame = await self._hcaptcha_frame_for(chall)
-                    if frame is None:
-                        await asyncio.sleep(1.5)
-                        continue
-                    dom = await self._probe_challenge_dom(frame)
-                    prompt = await self._read_challenge_prompt(frame)
-                    if not prompt:
-                        # DOM prompt empty (still painting?) — the payload's
-                        # requester_question is a solid fallback.
-                        prompt = hct.question_text(self._challenge_payload or {})
-                    if not prompt:
-                        self._log("[Captcha] Prompt not readable yet (new round loading?)",
-                                  level="warn")
-                        await asyncio.sleep(2)
-                        continue
-                    family = hct.classify(self._challenge_payload, dom, prompt)
-                    # Live tower wording is a Move-badge drag even when
-                    # /getcaptcha labelled the round image_label_area_select.
-                    if hct.is_tower_prompt(prompt) and family != hct.DRAG_DROP:
-                        self._log(
-                            f"[Captcha] Tower wording — forcing drag-drop "
-                            f"(was {family})")
-                        family = hct.DRAG_DROP
-                    sig = (prompt, family, int((dom or {}).get("tiles") or 0))
-                    # Same prompt + same layout: we already answered this
-                    # grid. Re-clicking tiles TOGGLES them off. Just hit
-                    # Next again and wait for the next challenge.
-                    if last_sig is not None and sig == last_sig:
-                        self._log(
-                            "[Captcha] Same challenge still showing — clicking Next again")
-                        await self._click_challenge_verify(frame)
-                        await asyncio.sleep(1.2)
-                        continue
-                    self._log(
-                        f"[Captcha] Challenge round {round_i + 1} "
-                        f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
-                    if family == hct.DRAG_DROP:
-                        if hct.is_tower_prompt(prompt):
-                            ok = await self._solve_tower_round(frame, prompt)
-                        elif hct.is_pattern_prompt(prompt):
-                            ok = await self._solve_pattern_round(frame, prompt)
-                        else:
-                            ok = await self._solve_drag_round(frame, prompt)
-                    elif family == hct.AREA_POINT:
-                        ok = await self._solve_point_round(frame, prompt,
-                                                           bbox=False)
-                    elif family == hct.AREA_BBOX:
-                        ok = await self._solve_point_round(frame, prompt,
-                                                           bbox=True)
-                    elif family == hct.MULTIPLE_CHOICE:
-                        ok = await self._solve_choice_round(frame, prompt)
-                    elif family == hct.TEXT_ENTRY:
-                        ok = await self._solve_text_round(frame, prompt)
-                    elif family == hct.COUNT:
-                        ok = await self._solve_count_round(frame, prompt)
-                    else:
-                        ok = await self._solve_binary_round(frame, prompt, dom)
-                    if self._events is not None:
-                        self._events.report_nowait(
-                            "pass" if ok else "fail",
-                            family=str(family), round=round_i + 1,
-                            prompt=str(prompt)[:200],
-                            tiles=int((dom or {}).get("tiles") or 0))
-                    if not ok:
-                        self._log("[Captcha] Round not solved - retrying",
-                                  level="warn")
-                        await asyncio.sleep(2)
-                        continue
-                    await asyncio.sleep(0.7)
-                    await self._click_challenge_verify(frame)
-                    last_sig = sig
-                    # Wait for hCaptcha to accept (token minted) OR paint
-                    # the next challenge (new prompt / new layout).
-                    token_seen = False
-                    advanced = False
-                    for _ in range(14):
-                        await asyncio.sleep(0.7)
-                        if await self._past_captcha():
-                            self._log("[Captcha] [OK] Vision solve ACCEPTED - past captcha")
-                            return True
-                        if await read_hcaptcha_token(self._page):
-                            token_seen = True
-                            self._log(
-                                "[Captcha] [OK] hCaptcha token minted by the solved "
-                                "challenge - submitting form")
-                            await self._click_form_submit()
-                            break
-                        c2 = await self._challenge_iframe()
-                        if c2 is None or not await self._challenge_rendered(c2):
-                            continue
-                        f2 = await self._hcaptcha_frame_for(c2)
-                        if f2 is None:
-                            continue
-                        p2 = await self._read_challenge_prompt(f2)
-                        if not p2:
-                            p2 = hct.question_text(self._challenge_payload or {})
-                        d2 = await self._probe_challenge_dom(f2)
-                        fam2 = hct.classify(self._challenge_payload, d2, p2)
-                        sig2 = (p2, fam2, int((d2 or {}).get("tiles") or 0))
-                        if p2 and sig2 != last_sig:
-                            self._log(
-                                f"[Captcha] Next challenge ready: {p2[:80]}")
-                            advanced = True
-                            break
-                    if token_seen:
-                        for _ in range(8):
-                            await asyncio.sleep(1.0)
-                            if await self._past_captcha():
-                                self._log(
-                                    "[Captcha] [OK] Registration submitted after "
-                                    "vision solve")
-                                return True
-                        self._log(
-                            "[Captcha] Form submitted after solve but not past captcha "
-                            "yet - retrying",
-                            level="warn")
-                    elif advanced:
-                        continue
-                self._log("[Captcha] Vision solve not accepted across rounds - retrying",
-                          level="warn")
-            self._log("[Captcha] [FAIL] Vision solver could not clear the challenge",
-                      level="error")
-            await asyncio.sleep(2)
+            # ── NoneCap is the ONLY solver ──────────────────────────
+            # The local vision stack is gone: it never cleared a single
+            # Discord challenge, and every round it "tried" cost 20-45s
+            # of model timeouts plus
+            # stray clicks that are themselves an automation signal.
+            # Failing fast and rotating to a fresh session beats burning
+            # two minutes on a solver that cannot win.
+            self._log("[Captcha] [FAIL] NoneCap could not clear the "
+                      "challenge — rotating session", level="error")
+            await asyncio.sleep(1)
             return False
 
         except Exception as e:
@@ -4981,71 +4744,7 @@ class DiscordAutomation:
                 return f"{scheme}://{user}:{pwd}@{hostport}"
         return server_url
 
-    _WIDGET_RQDATA_JS = r"""() => {
-        // What rqdata is the LIVE widget actually bound to?
-        //
-        // We hand the solver the rqdata from Discord's 400. But the widget
-        // already running in this page fetched its OWN challenge — if the
-        // two differ, the solver mints a token for challenge A while
-        // Discord validates against challenge B, and hCaptcha answers
-        // invalid-response no matter how correct everything else is.
-        const out = {rqdata: '', sitekey: '', found: []};
-        const push = (k, v) => {
-            if (typeof v === 'string' && v.length > 8) out.found.push([k, v]);
-        };
-        try {
-            const h = window.hcaptcha;
-            if (h) {
-                for (const fn of ['getConfig', 'getWidgetConfig']) {
-                    if (typeof h[fn] === 'function') {
-                        try {
-                            const c = h[fn]();
-                            if (c) {
-                                push(fn + '.rqdata', c.rqdata);
-                                if (typeof c.sitekey === 'string')
-                                    out.sitekey = c.sitekey;
-                            }
-                        } catch (e) {}
-                    }
-                }
-                for (const k of Object.keys(h)) {
-                    try {
-                        const v = h[k];
-                        if (v && typeof v === 'object') {
-                            for (const kk of Object.keys(v)) {
-                                const w = v[kk];
-                                if (w && typeof w === 'object') {
-                                    push('reg.' + kk, w.rqdata);
-                                    if (!out.sitekey &&
-                                        typeof w.sitekey === 'string')
-                                        out.sitekey = w.sitekey;
-                                }
-                            }
-                        }
-                    } catch (e) {}
-                }
-            }
-        } catch (e) {}
-        try {
-            for (const el of document.querySelectorAll(
-                    '[data-rqdata], [data-sitekey]')) {
-                push('dom', el.getAttribute('data-rqdata'));
-                if (!out.sitekey)
-                    out.sitekey = el.getAttribute('data-sitekey') || '';
-            }
-        } catch (e) {}
-        if (out.found.length) out.rqdata = out.found[0][1];
-        return out;
-    }"""
 
-    async def _widget_rqdata(self) -> dict:
-        """Read the rqdata/sitekey the LIVE widget is bound to."""
-        try:
-            return await asyncio.wait_for(
-                self._page.evaluate(self._WIDGET_RQDATA_JS),
-                timeout=6.0) or {}
-        except Exception:
-            return {}
 
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
@@ -5834,62 +5533,6 @@ class DiscordAutomation:
             pass
         return False
 
-    async def _challenge_surface(self, frame):
-        """(screenshot bytes, page-space box) of the biggest canvas/image in
-        the challenge frame — the click surface for point/bbox/drag rounds."""
-        try:
-            info = await frame.evaluate(self._SURFACE_JS)
-        except Exception:
-            info = None
-        if not info or float(info.get("width", 0)) < 60:
-            return None, None
-        ox, oy = await self._frame_origin(frame)
-        box = {"x": float(info["x"]) + ox, "y": float(info["y"]) + oy,
-               "width": float(info["width"]), "height": float(info["height"])}
-        try:
-            raw = await frame.screenshot()
-            from PIL import Image
-            import io as _io
-            im = Image.open(_io.BytesIO(raw)).convert("RGB")
-            x0 = int(info["x"]); y0 = int(info["y"])
-            x1 = x0 + int(info["width"])
-            y1 = y0 + int(info["height"])
-            # The rect comes from getBoundingClientRect INSIDE the frame,
-            # but frame.screenshot() is not always that same coordinate
-            # space (device pixel ratio, or the element sitting in a nested
-            # document). A crop that lands off-image returns solid black —
-            # which is exactly the "0 contours on every round" symptom.
-            iw, ih = im.size
-            # Clamp to a VALID rect. An element scrolled out of view gives
-            # negative or beyond-image coords, and PIL then raises
-            # "Coordinate 'right' is less than 'left'" — which killed every
-            # drag round with "Surface screenshot failed".
-            cx0 = max(0, min(x0, iw - 1))
-            cy0 = max(0, min(y0, ih - 1))
-            cx1 = max(cx0 + 1, min(x1, iw))
-            cy1 = max(cy0 + 1, min(y1, ih))
-            if (cx1 - cx0) < 60 or (cy1 - cy0) < 60:
-                self._log(f"[Captcha] Element rect ({x0},{y0},{x1},{y1}) is "
-                          f"outside the {iw}x{ih} frame — using the whole "
-                          f"frame", level="warn")
-                cx0, cy0, cx1, cy1 = 0, 0, iw, ih
-                box = {"x": ox, "y": oy, "width": float(iw),
-                       "height": float(ih)}
-            crop = im.crop((cx0, cy0, cx1, cy1))
-            if not self._surface_is_usable(crop):
-                self._log(f"[Captcha] Cropped surface looks blank "
-                          f"({crop.size[0]}x{crop.size[1]} of {iw}x{ih} at "
-                          f"{x0},{y0}) — using the whole frame instead",
-                          level="warn")
-                crop = im
-                box = {"x": ox, "y": oy, "width": float(iw),
-                       "height": float(ih)}
-            buf = _io.BytesIO()
-            crop.save(buf, "JPEG", quality=92)
-            return buf.getvalue(), box
-        except Exception as e:
-            self._log(f"[Captcha] Surface screenshot failed: {e}", level="debug")
-            return None, None
 
     @staticmethod
     def _surface_is_usable(im) -> bool:
@@ -5911,83 +5554,10 @@ class DiscordAutomation:
         except Exception:
             return True
 
-    def _denorm(self, point, box):
-        """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
-        return hct.denorm(point, box)
 
     # ── per-family round solvers ───────────────────────────────────────────
 
-    async def _solve_binary_round(self, frame, prompt, dom) -> bool:
-        """image_label_binary (+ its reference-image affordance variant).
 
-        Every tile is screenshotted and sent to the Roboflow/Gemini
-        workflow together with the challenge question."""
-        tiles = await self._screenshot_challenge_tiles(frame)
-        if not tiles:
-            return False
-        examples = await self._capture_example_images(frame)
-        self._log(
-            f"[Captcha] Asking {self._vision.model} which tiles match...")
-        answer = await self._vision.solve(prompt, tiles, shape="tiles",
-                                          examples=examples)
-        if not answer:
-            return False
-        if answer.get("type") == "text":
-            self._log(f"[Captcha] Text answer on grid round: {answer.get('text')!r}")
-            return await self._type_challenge_answer(frame,
-                                                     answer.get("text", ""))
-        indices = [i for i in answer.get("indices", [])
-                   if isinstance(i, int) and 1 <= i <= len(tiles)]
-        self._log(f"[Captcha] Clicking tiles: {indices}")
-        return await self._click_challenge_tiles(frame, indices)
-
-    async def _solve_point_round(self, frame, prompt, bbox: bool = False) -> bool:
-        """area_select: click a point — or, for bbox rounds, drag out the
-        box's diagonal. Answered by the Roboflow/Gemini workflow."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        # Safety net: if the wording is a drag round that reached here via a
-        # mis-classification, do the drag instead of clicking. Clicking a
-        # drag round can never pass, so this is strictly better than
-        # answering the wrong gesture.
-        if not bbox:
-            try:
-                import hcaptcha_detect
-                if hcaptcha_detect.classify(prompt) in ("drag", "tower",
-                                                        "pattern"):
-                    self._log("[Captcha] Prompt is a DRAG round — switching "
-                              "gesture (was classified points)", level="warn")
-                    return await self._solve_drag_round(frame, prompt)
-            except Exception:
-                pass
-        answer = await self._vision.solve(
-            prompt, [shot], shape=("bbox" if bbox else "points"))
-        if not answer:
-            return False
-        if bbox:
-            if answer.get("type") != "bbox":
-                return False
-            bb = answer["bbox"]
-            x1, y1 = self._denorm((bb["x1"], bb["y1"]), box)
-            x2, y2 = self._denorm((bb["x2"], bb["y2"]), box)
-            self._log(f"[Captcha] Drawing box ({x1:.0f},{y1:.0f})->"
-                      f"({x2:.0f},{y2:.0f})")
-            await hm.drag(self._page, (x1, y1), (x2, y2))
-            return True
-        if answer.get("type") == "points" and answer.get("points"):
-            clicked = 0
-            for pt in answer.get("points") or []:
-                try:
-                    x, y = self._denorm(pt, box)
-                except Exception:
-                    continue
-                self._log(f"[Captcha] Point click at ({x:.0f},{y:.0f})")
-                await hm.click(self._page, x, y)
-                clicked += 1
-                await asyncio.sleep(random.uniform(0.15, 0.38))
-            return clicked > 0
-        return False
 
     async def _frame_shot(self, frame):
         """Whole-frame screenshot bytes, used when the element crop fails."""
@@ -5997,179 +5567,8 @@ class DiscordAutomation:
         except Exception:
             return None
 
-    async def _solve_drag_round(self, frame, prompt) -> bool:
-        """image_drag_drop: a REAL press/move/release drag (hCaptcha ignores
-        synthetic clicks here — DragSolver only matches Arkose iframes, so
-        these rounds used to be unreachable)."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        # Shape-match FIRST. "Drag the icon to where it fits" is a
-        # relational geometry question, not an object-detection one: every
-        # candidate is the same kind of outlined glyph, so a detector has
-        # no class that separates them. Template matching on the glyph
-        # signature answers it directly and for free.
-        answer = None
-        # Primary: OpenCV contour matching (cv2.matchShapes / Hu moments),
-        # the standard tool for "which of these outlines is the same shape".
-        try:
-            import shape_match_cv
-            answer = shape_match_cv.solve_drag(shot, log=self._log)
-            if answer:
-                self._log(f"[Captcha] OpenCV matcher paired the piece "
-                          f"(Hu distance {answer.get('distance')}, "
-                          f"{answer.get('candidates')} candidates)")
-        except Exception as e:
-            self._log(f"[Captcha] OpenCV matcher error: "
-                      f"{type(e).__name__}: {e}", level="warn")
-        # If the cropped surface yielded nothing, retry on the FULL frame.
-        # The crop depends on getBoundingClientRect matching the screenshot
-        # coordinate space, which is not guaranteed; the whole frame always
-        # contains the board.
-        if not answer:
-            full = await self._frame_shot(frame)
-            if full:
-                try:
-                    import shape_match_cv
-                    alt = shape_match_cv.solve_drag(full, log=self._log)
-                except Exception:
-                    alt = None
-                if alt:
-                    self._log("[Captcha] Matched on the full frame "
-                              "(element crop was unusable)")
-                    # Coordinates are now relative to the frame, not the
-                    # element box — remap the answer's reference box.
-                    try:
-                        ox, oy = await self._frame_origin(frame)
-                        wh = await frame.evaluate(
-                            "() => ({w: window.innerWidth,"
-                            " h: window.innerHeight})")
-                        box = {"x": ox, "y": oy,
-                               "width": float(wh.get("w") or 0),
-                               "height": float(wh.get("h") or 0)}
-                        answer = alt
-                    except Exception:
-                        pass
-        # Secondary: the radial-FFT matcher.
-        if not answer:
-            try:
-                import shape_drag
-                answer = shape_drag.solve_shape_drag(shot, log=self._log)
-                if answer:
-                    self._log(f"[Captcha] Radial matcher paired the piece "
-                              f"(confidence {answer.get('confidence')})")
-                else:
-                    self._log("[Captcha] Both shape matchers found no "
-                              "pairing", level="warn")
-            except Exception as e:
-                self._log(f"[Captcha] Radial matcher error: "
-                          f"{type(e).__name__}: {e}", level="warn")
-        if not answer:
-            # Tier 3 (Gemma) is a ~45s round trip that has timed out on
-            # every drag round so far, and a drag round cannot be answered
-            # by a detector at all. Skip straight to the geometric pairing
-            # rather than stalling the challenge.
-            answer = await self._vision.solve(prompt, [shot], shape="drag")
-        if not answer:
-            # LAST RESORT: pair by geometry alone (piece = the glyph set
-            # apart near an edge, target = the odd one out in the cluster).
-            # Guessing a plausible drag beats leaving the round unanswered.
-            try:
-                import shape_drag
-                gray = shape_drag._to_gray(shot)
-                if gray is not None:
-                    boxes = shape_drag.find_candidates(
-                        gray, percentile=88.0, floor=0.02)
-                    pts = []
-                    gh, gw = gray.shape
-                    for (x0, y0, x1, y1) in boxes:
-                        pts.append(((x0 + x1) / 2.0 / gw,
-                                    (y0 + y1) / 2.0 / gh,
-                                    (x1 - x0) / float(gw),
-                                    (y1 - y0) / float(gh), 0.5, "glyph"))
-                    from vision_solver import pair_drag
-                    pair = pair_drag(pts)
-                    if pair:
-                        answer = {"type": "drag", "from": pair[0],
-                                  "to": pair[1]}
-                        self._log("[Captcha] Falling back to geometric "
-                                  "piece/hole pairing")
-            except Exception as e:
-                self._log(f"[Captcha] Geometric fallback failed: "
-                          f"{type(e).__name__}", level="debug")
-        if not answer or answer.get("type") != "drag":
-            self._log("[Captcha] No drag answer — skipping this round "
-                      "instead of clicking blindly", level="warn")
-            return False
-        fx, fy = self._denorm(answer["from"], box)
-        tx, ty = self._denorm(answer["to"], box)
-        self._log(f"[Captcha] Dragging piece ({fx:.0f},{fy:.0f}) -> "
-                  f"({tx:.0f},{ty:.0f})")
-        return await self._drag_verified(frame, (fx, fy), (tx, ty))
 
-    async def _piece_signature(self, frame):
-        """Cheap fingerprint of the challenge surface, used to tell whether
-        a drag actually moved anything (vs the piece springing back)."""
-        try:
-            shot, _ = await self._challenge_surface(frame)
-        except Exception:
-            return None
-        if not shot:
-            return None
-        try:
-            import hashlib
-            from PIL import Image
-            import io as _io
-            im = Image.open(_io.BytesIO(shot)).convert("L").resize((64, 64))
-            return hashlib.md5(im.tobytes()).hexdigest()
-        except Exception:
-            return None
 
-    async def _drag_verified(self, frame, src, dst) -> bool:
-        """Drag, CHECK it stuck, and escalate the gesture if it snapped back.
-
-        hCaptcha drag widgets are built three different ways (raw pointer
-        tracking, HTML5 drag-and-drop, pointer-capture) and the wrong
-        channel leaves the piece exactly where it started. Rather than
-        guess, try each and verify against a before/after fingerprint of
-        the surface — the piece landing somewhere new changes the pixels.
-        """
-        strategies = (
-            ("pointer", hm.drag),
-            ("slow-pointer", hm.drag_slow),
-            ("html5-dnd", hm.drag_html5),
-            ("pointer-events", hm.drag_pointer_events),
-        )
-        for name, fn in strategies:
-            before = await self._piece_signature(frame)
-            try:
-                res = await fn(self._page, src, dst)
-            except Exception as e:
-                self._log(f"[Captcha] Drag via {name} errored: "
-                          f"{type(e).__name__}", level="warn")
-                continue
-            if isinstance(res, str) and res not in ("ok", None):
-                self._log(f"[Captcha] Drag via {name}: {res}", level="debug")
-            await asyncio.sleep(0.6)
-            after = await self._piece_signature(frame)
-            if before is None or after is None:
-                # Cannot verify — assume the gesture landed.
-                self._log(f"[Captcha] Drag via {name} (unverified)")
-                return True
-            if before != after:
-                self._log(f"[Captcha] Drag via {name} STUCK "
-                          f"(surface changed)")
-                if self._events is not None:
-                    self._events.report_nowait(
-                        "pass", stage="drag_gesture", gesture=name)
-                return True
-            self._log(f"[Captcha] Drag via {name} snapped back — "
-                      f"trying the next gesture", level="warn")
-        self._log("[Captcha] All drag gestures snapped back", level="warn")
-        if self._events is not None:
-            self._events.report_nowait("fail", stage="drag_gesture",
-                                       gesture="all-failed")
-        return False
 
     _TOWER_PIECE_JS = r"""() => {
         const vis = (el) => !!(el) &&
@@ -6248,83 +5647,7 @@ class DiscordAutomation:
         cy = (float(info["y"]) + float(info["h"]) / 2.0) / bh + 0.05
         return (max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)))
 
-    async def _solve_tower_round(self, frame, prompt) -> bool:
-        """Wooden-block tower: drag the Move piece onto the incomplete stack.
 
-        Live prompt: "Move the correct missing block segment onto the
-        incomplete tower". hCaptcha serves this under area_select, but
-        the answer is a real press/move/release drag — a point click
-        never picks up the piece. Offline wood-mask heuristic
-        first; a SHORT vision ``shape="tower"`` call is last resort
-        (a long 504 expires the challenge).
-        """
-        shot, box = await self._tower_frame_shot(frame)
-        if not shot or not box:
-            shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            self._log("[Captcha] Tower: no screenshot", level="warn")
-            return False
-        hint = await self._tower_piece_hint(frame, box)
-        debug = {}
-        got = None
-        try:
-            got = hct.locate_tower_drag(shot, piece_hint=hint, debug=debug)
-        except Exception as e:
-            debug["reason"] = "error:%s" % type(e).__name__
-            self._log(f"[Captcha] Offline tower error: {e}", level="debug")
-            got = None
-        self._log(f"[Captcha] Tower heuristic: {debug}")
-        if got and got.get("from") and got.get("to"):
-            fx, fy = self._denorm(got["from"], box)
-            tx, ty = self._denorm(got["to"], box)
-            self._log(
-                f"[Captcha] Offline tower drag "
-                f"({got['from'][0]:.2f},{got['from'][1]:.2f}) -> "
-                f"({got['to'][0]:.2f},{got['to'][1]:.2f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        # Do not sit on a 180s 504 — that expires the challenge.
-        answer = await self._vision.solve(
-            prompt, [shot], shape="tower", timeout=18.0)
-        if answer and answer.get("type") == "drag":
-            fx, fy = self._denorm(answer["from"], box)
-            tx, ty = self._denorm(answer["to"], box)
-            self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
-                      f"({tx:.0f},{ty:.0f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        # Last resort: DOM piece + heuristic drop (even if `from` was missing).
-        best = debug.get("best") if isinstance(debug, dict) else None
-        if hint and isinstance(best, dict) and best.get("to"):
-            fx, fy = self._denorm(hint, box)
-            tx, ty = self._denorm(best["to"], box)
-            self._log(
-                f"[Captcha] Tower last-resort drag "
-                f"({hint[0]:.2f},{hint[1]:.2f}) -> "
-                f"({best['to'][0]:.2f},{best['to'][1]:.2f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        return False
-
-    async def _solve_pattern_round(self, frame, prompt) -> bool:
-        """Pattern completion ("put one of the animals into the empty spot
-        to complete the pattern"): a 3x3 icon grid with one empty cell and
-        a row of candidates.
-
-        The workflow answers with a candidate->hole drag; the gesture is a
-        real humanized drag (some builds also accept click-to-place)."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        answer = await self._vision.solve(prompt, [shot], shape="pattern")
-        if not answer or answer.get("type") != "drag":
-            return False
-        fx, fy = self._denorm(answer["from"], box)
-        tx, ty = self._denorm(answer["to"], box)
-        self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
-                  f"-> ({tx:.0f},{ty:.0f})")
-        await hm.drag(self._page, (fx, fy), (tx, ty))
-        return True
 
     async def _probe_pattern_dom(self, frame, surface_box):
         """Visible small square-ish elements in the challenge frame, split
@@ -6400,64 +5723,7 @@ class DiscordAutomation:
         except Exception:
             return None
 
-    async def _solve_choice_round(self, frame, prompt) -> bool:
-        """multiple_choice: read the option buttons, ask the model, click
-        the chosen option with a humanized box click."""
-        options = await frame.evaluate("""() => {
-            const out = [];
-            for (const el of document.querySelectorAll(
-                    '.answer-option, [class*="answer-option" i], ' +
-                    '[class*="choice" i] button, .options [role="button"]')) {
-                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                if (t.length < 2 || t.length > 200) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width < 40 || r.height < 14) continue;
-                out.push({ text: t.slice(0, 200), box: {
-                    x: r.left, y: r.top, width: r.width, height: r.height } });
-            }
-            return out;
-        }""")
-        if not options or len(options) < 2:
-            return False
-        shot, _ = await self._challenge_surface(frame)
-        listing = "\n".join("%d. %s" % (i + 1, o["text"])
-                            for i, o in enumerate(options))
-        answer = await self._vision.solve(
-            prompt + "\nOPTIONS:\n" + listing, [shot] if shot else [b""],
-            shape="choice")
-        if not answer or answer.get("type") != "choice":
-            return False
-        idx = answer.get("index")
-        if not isinstance(idx, int) or not (1 <= idx <= len(options)):
-            return False
-        ox, oy = await self._frame_origin(frame)
-        b = options[idx - 1]["box"]
-        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
-                    "width": b["width"], "height": b["height"]}
-        self._log(f"[Captcha] Multiple-choice -> option {idx}: "
-                  f"{options[idx - 1]['text'][:60]!r}")
-        await hm.click_box(self._page, page_box)
-        return True
 
-    async def _solve_count_round(self, frame, prompt) -> bool:
-        """counting ("How many X are in this image?"): numeric answer
-        options. The workflow counts the detections, then the option
-        button matching the count is clicked."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot:
-            return False
-        n = None
-        if n is None:
-            answer = await self._vision.solve(prompt, [shot], shape="count")
-            if not answer or answer.get("type") != "count":
-                return False
-            n = answer.get("count")
-        if not isinstance(n, int) or n < 1:
-            self._log("[Captcha] Counting produced no usable number",
-                      level="warn")
-            return False
-        self._log(f"[Captcha] Counting answer: {n}")
-        return await self._click_number_option(frame, n)
 
     async def _click_number_option(self, frame, n: int) -> bool:
         """Click the numeric answer option whose label equals ``n``.
@@ -6509,94 +5775,7 @@ class DiscordAutomation:
         await hm.click_box(self._page, page_box)
         return True
 
-    async def _solve_text_round(self, frame, prompt) -> bool:
-        """text_entry: answer the question and type it.
 
-        hCaptcha now serves plain word problems ("The jar begins with 19
-        coins... how many now?"). The prompt is already captured as TEXT,
-        so arithmetic needs no vision at all — it is instant, free and
-        exact, where a vision round trip is none of those.
-        """
-        try:
-            import text_puzzle
-            local = text_puzzle.solve(prompt)
-        except Exception:
-            local = ""
-        if local:
-            self._log(f"[Captcha] Text puzzle solved locally: {local!r}")
-            if await self._type_challenge_answer(frame, local):
-                return True
-            self._log("[Captcha] Could not type the local answer — "
-                      "falling back to vision", level="warn")
-
-        shot, _ = await self._challenge_surface(frame)
-        if not shot:
-            return False
-        answer = await self._vision.solve(prompt, [shot], shape="text")
-        if answer and answer.get("type") == "text":
-            self._log(f"[Captcha] Text challenge: {answer.get('text')!r}")
-            return await self._type_challenge_answer(frame,
-                                                     answer.get("text", ""))
-        return False
-
-    async def _click_challenge_tiles(self, frame, indices) -> bool:
-        """Humanized clicks on the given 1-based tile indices (reading order).
-
-        hCaptcha grades pointer telemetry, so a bare element.click() in a
-        tight loop is an automation tell. Each tile gets a Bezier glide to a
-        gaussian landing point inside its box (frame origin applied) with a
-        real down/dwell/up, and a human 0.18-0.55 s pause between tiles.
-        element.click() remains only as a last-resort fallback."""
-        for sel in ('div.task-image, [class*="task-image" i]',
-                    '.task-grid img, [class*="task-grid" i] img, '
-                    '.challenge-content img'):
-            try:
-                n = await frame.locator(sel).count()
-            except Exception:
-                continue
-            if n == 0:
-                continue
-            # tile rects are frame-local (getBoundingClientRect); add the
-            # iframe's own page offset once
-            try:
-                rects = await frame.evaluate("""(sel) => {
-                    const out = [];
-                    for (const el of document.querySelectorAll(sel)) {
-                        const r = el.getBoundingClientRect();
-                        out.push({ x: r.left, y: r.top,
-                                   width: r.width, height: r.height });
-                    }
-                    return out;
-                }""", sel)
-            except Exception:
-                rects = None
-            ox, oy = await self._frame_origin(frame)
-            clicked = 0
-            for idx in indices:
-                if not (isinstance(idx, int) and 1 <= idx <= n):
-                    continue
-                done = False
-                if rects and len(rects) >= idx:
-                    r = rects[idx - 1]
-                    if r and r.get("width"):
-                        try:
-                            await hm.click_box(self._page, {
-                                "x": r["x"] + ox, "y": r["y"] + oy,
-                                "width": r["width"], "height": r["height"]})
-                            done = True
-                        except Exception:
-                            done = False
-                if not done:
-                    try:
-                        await frame.locator(sel).nth(idx - 1).click(timeout=5000)
-                        done = True
-                    except Exception:
-                        continue
-                clicked += 1
-                await asyncio.sleep(random.uniform(0.18, 0.55))
-            if clicked:
-                return True
-        return False
 
     _NEXT_VERIFY_JS = r"""() => {
         const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -6696,39 +5875,7 @@ class DiscordAutomation:
                 continue
         return False
 
-    async def _type_challenge_answer(self, frame, text: str) -> bool:
-        """Fill the answer input for 'type the characters' challenges."""
-        try:
-            inp = frame.locator('input[type="text"], input:not([type]), textarea').first
-            await inp.click(timeout=4000)
-            await inp.fill(text, timeout=4000)
-            self._log("[Captcha] Typed challenge answer")
-            return True
-        except Exception:
-            return False
 
-    async def _solve_funcaptcha(self) -> bool:
-        """FunCAPTCHA (Arkose) solver using vision AI (DragSolver).
-
-        Uses the Roboflow/Gemini workflow (configured via API_KEY) to
-        handle slider puzzles, tile-click challenges, and drag-to-match
-        challenges served by Arkose Labs FunCAPTCHA.
-        """
-        try:
-            solver = DragSolver(
-                page=self._page,
-                vision=self._vision,
-                log=self._log,
-            )
-            if await solver.detect(timeout=8.0):
-                self._log("[FunCAPTCHA] DragSolver engaged", level="info")
-                return await solver.solve(timeout=45.0)
-            self._log("[FunCAPTCHA] No FunCAPTCHA frame detected by DragSolver",
-                      level="warn")
-            return False
-        except Exception as e:
-            self._log(f"[FunCAPTCHA] DragSolver error: {e}", level="error")
-            return False
 
     async def _form_ready(self) -> dict:
         """Evaluate _FORM_READY_JS with the locale-aware DOB label table."""

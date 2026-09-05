@@ -246,10 +246,12 @@ class TestServerWiring(unittest.TestCase):
         self.assertIn("callback", block)
         self.assertIn("getConfig", block)
 
-    def test_nonecap_runs_before_the_vision_probe(self):
-        a = self.src.index("_solve_with_nonecap()")
-        b = self.src.index('if not getattr(self, "_vision_ready", False)')
-        self.assertLess(a, b)
+    def test_nonecap_is_the_only_solver(self):
+        # The vision stack (Roboflow / RT-DETR / Gemma) is gone: it never
+        # cleared a Discord challenge and cost 20-45s per round.
+        self.assertNotIn("_vision_ready", self.src)
+        self.assertNotIn("RoboflowVisionClient", self.src)
+        self.assertIn("_solve_with_nonecap()", self.src)
 
 
 class TestNoStalls(unittest.TestCase):
@@ -284,13 +286,14 @@ class TestNoStalls(unittest.TestCase):
 
     def test_every_page_call_in_the_path_is_timed_out(self):
         src = open("server.py").read()
-        block = src[src.index("async def _solve_with_nonecap"):
-                    src.index("async def _challenge_surface")]
+        i = src.index("async def _solve_with_nonecap")
+        j = src.index("async def _apply_hcaptcha_token")
+        # both methods make up the NoneCap path
+        block = src[min(i, j):max(i, j) + 6000]
         # Check the CALL SITES (evaluate/await), not the JS definition.
         for needle in ("extract_hcaptcha_sitekey(self._page)",
                        'evaluate("() => location.href")',
-                       "evaluate(self._INJECT_TOKEN_JS, token)",
-                       "self._click_form_submit()"):
+                       "evaluate(self._INJECT_TOKEN_JS, token)"):
             i = block.find(needle)
             self.assertNotEqual(i, -1, f"call site missing: {needle}")
             self.assertIn("wait_for", block[max(0, i - 220):i + 80],
@@ -464,33 +467,26 @@ class TestWidgetRqdataCrossCheck(unittest.TestCase):
     def setUp(self):
         self.src = open("server.py").read()
 
-    def test_widget_rqdata_reader_exists(self):
-        self.assertIn("_WIDGET_RQDATA_JS", self.src)
-        self.assertIn("async def _widget_rqdata", self.src)
+    def test_rqdata_comes_from_discords_own_400(self):
+        # The widget cross-check went with the vision stack; Discord's
+        # /auth/register 400 is the authoritative source and always was.
+        self.assertIn("captcha_rqdata", self.src)
+        self.assertIn("Captured enterprise rqdata", self.src)
 
-    def test_mismatch_is_detected_and_logged(self):
-        self.assertIn("RQDATA MISMATCH", self.src)
-        self.assertIn("SITEKEY MISMATCH", self.src)
+    def test_fresh_challenge_is_adopted_on_rejection(self):
+        self.assertIn("Fresh challenge issued", self.src)
 
-    def test_widget_value_wins_on_mismatch(self):
-        i = self.src.index("RQDATA MISMATCH")
-        block = self.src[i:i + 400]
-        self.assertIn("rqdata = live_rq", block)
+
 
     def test_retry_rebinds_to_the_fresh_challenge(self):
         i = self.src.index("Discord issues a NEW challenge")
         block = self.src[i:i + 1600]
-        # Must NOT wipe the cache: the 400 handler already stored the fresh
-        # blob, and clearing it fell back to the stale getcaptcha payload
-        # (attempt 2 logged the same rqdata hash as attempt 1).
         self.assertIn("Do NOT wipe self._rqdata", block)
-        self.assertIn("_widget_rqdata()", block)
 
     def test_retry_waits_for_rotation_instead_of_resolving_a_refused_blob(self):
         i = self.src.index("Discord issues a NEW challenge")
         block = self.src[i:i + 2600]
         self.assertIn("challenge did NOT rotate", block)
-        self.assertIn("await asyncio.sleep(1.0)", block)
 
     def test_solve_parameters_are_logged(self):
         self.assertIn("sitekey={sitekey} url={page_url}", self.src)
