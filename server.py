@@ -1655,6 +1655,7 @@ class DiscordAutomation:
         # form values the direct-API register submit needs.
         self._discord_fingerprint = ""
         self._captcha_session_id = ""
+        self._captcha_respkey = ""
         self._captcha_invisible = False
         self._nc_direct_inflight = False
         self._dob_iso = ""
@@ -5199,13 +5200,9 @@ class DiscordAutomation:
             # hCaptcha binds the token to the solving IP and UA. Give
             # NoneCap the same ones this browser is using, or Discord
             # answers invalid-response even for a perfect solve.
-            ua = ""
-            try:
-                ua = await asyncio.wait_for(
-                    self._page.evaluate("() => navigator.userAgent"),
-                    timeout=5.0) or ""
-            except Exception:
-                ua = ""
+            # NB: user_agent is deprecated in the API and ignored — the
+            # solver presents its own coherent identity. Sending ours made
+            # the request contradict itself.
             invisible = bool(getattr(self, "_captcha_invisible", False))
             # rqdata is welded to the EXIT IP that requested the challenge.
             # A token minted on the solver's own IP breaks that binding and
@@ -5213,9 +5210,10 @@ class DiscordAutomation:
             egress = self._solver_proxy_url()
             token = await self._nonecap.solve(sitekey, str(page_url),
                                               rqdata=rqdata,
-                                              invisible=invisible,
-                                              proxy=egress,
-                                              user_agent=str(ua))
+                                              proxy=egress)
+            if token:
+                self._captcha_respkey = getattr(
+                    self._nonecap, "last_resp_key", "") or ""
             if not token:
                 # Failed solves are not charged, so retrying is free.
                 if self._nonecap.last_error in ("authentication",
@@ -5572,6 +5570,10 @@ class DiscordAutomation:
         };
         if (p.rqtoken) headers['X-Captcha-Rqtoken'] = p.rqtoken;
         if (p.session) headers['X-Captcha-Session-Id'] = p.session;
+        // hCaptcha's getRespKey() pair. Enterprise verifiers check the
+        // token AND the key together; sending only the token is a
+        // half-answer.
+        if (p.respkey) headers['X-Captcha-Respkey'] = p.respkey;
         // Set BEFORE the call: our own hook runs synchronously inside
         // fetch() and would otherwise re-add captcha_key to this body.
         window.__ncDirectInflight = true;
@@ -5615,6 +5617,7 @@ class DiscordAutomation:
             "token": token,
             "rqtoken": getattr(self, "_rqtoken", "") or "",
             "session": getattr(self, "_captcha_session_id", "") or "",
+            "respkey": getattr(self, "_captcha_respkey", "") or "",
             "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
         }
         self._nc_direct_inflight = True
@@ -5716,9 +5719,19 @@ class DiscordAutomation:
                 """(a) => {
                     window.__ncToken = a[0] || '';
                     window.__ncRqToken = a[1] || '';
+                    window.__ncRespKey = a[2] || '';
+                    // Make getRespKey() answer with the solver's key too.
+                    try {
+                        if (window.hcaptcha && window.__ncRespKey) {
+                            window.hcaptcha.getRespKey =
+                                () => window.__ncRespKey;
+                        }
+                    } catch (e) {}
                     return {tok: !!window.__ncToken,
-                            rq: !!window.__ncRqToken};
-                }""", [token, getattr(self, "_rqtoken", "") or ""]),
+                            rq: !!window.__ncRqToken,
+                            rk: !!window.__ncRespKey};
+                }""", [token, getattr(self, "_rqtoken", "") or "",
+                       getattr(self, "_captcha_respkey", "") or ""]),
                 timeout=8.0)
             self._log(f"[NoneCap] Token published to the request hook "
                       f"({pub})")

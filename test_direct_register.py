@@ -231,17 +231,20 @@ class TestInvisibleMode(unittest.TestCase):
         self.assertIn("should_serve_invisible", self.src)
         self.assertIn("self._captcha_invisible", self.src)
 
-    def test_flag_is_passed_to_the_solver(self):
-        self.assertIn("invisible=invisible", self.src)
+    def test_flag_is_not_sent_to_the_solver(self):
+        # The API has NO `invisible` field (checked against nonecap-py's
+        # _build_solve_body). It infers the mode from sitekey + rqdata.
+        self.assertNotIn("invisible=invisible", self.src)
 
     def test_mode_is_logged(self):
         self.assertIn("INVISIBLE", self.src)
 
-    def test_solver_forwards_it(self):
+    def test_solver_does_not_invent_an_invisible_field(self):
         import inspect
+
         import nonecap_solver
         src = inspect.getsource(nonecap_solver.NoneCapSolver.solve)
-        self.assertIn('payload["invisible"] = True', src)
+        self.assertNotIn('payload["invisible"]', src)
 
 
 class TestNoMarkerLeak(unittest.TestCase):

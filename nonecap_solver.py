@@ -84,6 +84,9 @@ class NoneCapSolver:
         self.credits_charged = 0
         self.last_error = ""
         self.last_solve_id = ""
+        # hCaptcha's getRespKey() value (E0_…). Sites that verify the
+        # token and key TOGETHER need both; Discord is one of them.
+        self.last_resp_key = ""
 
     @property
     def enabled(self) -> bool:
@@ -118,6 +121,15 @@ class NoneCapSolver:
             self._log(f"[NoneCap] {self.last_error}", level="warn")
             return None
 
+        # Body EXACTLY as the official SDK builds it (nonecap-py
+        # _build_solve_body). Two corrections from reading that source:
+        #
+        #  * there is NO `invisible` field. I was inventing one; the API
+        #    infers the mode from the sitekey and rqdata.
+        #  * `user_agent` is DEPRECATED (2026-08-13) and ignored — worse,
+        #    the SDK notes a caller-supplied UA "replaced only some" of the
+        #    identity signals "and made the request contradict itself",
+        #    which is a plausible way to earn a low-trust token.
         payload = {
             "type": "hcaptcha_enterprise" if rqdata else "hcaptcha",
             "sitekey": sitekey,
@@ -125,14 +137,9 @@ class NoneCapSolver:
         }
         if rqdata:
             payload["rqdata"] = rqdata
-        if invisible:
-            payload["invisible"] = True
         prox = (proxy or NONECAP_PROXY).strip()
         if prox:
             payload["proxy"] = prox
-        ua = (user_agent or "").strip()
-        if ua:
-            payload["user_agent"] = ua
 
         deadline = asyncio.get_event_loop().time() + timeout
         try:
@@ -190,6 +197,7 @@ class NoneCapSolver:
             token = solve.get("token") or ""
             if status == "solved" and token:
                 self.solves += 1
+                self.last_resp_key = str(solve.get("resp_key") or "")
                 try:
                     self.credits_charged += int(
                         solve.get("credits_charged") or 0)
@@ -199,12 +207,21 @@ class NoneCapSolver:
                 charged_txt = (f"{charged} credit(s)"
                                if charged is not None else "credits n/a")
                 self._log(f"[NoneCap] Token received "
-                          f"({len(token)} chars, {charged_txt})")
+                          f"({len(token)} chars, {charged_txt}"
+                          + (f", resp_key {self.last_resp_key[:6]}…"
+                             if self.last_resp_key else ", no resp_key")
+                          + ")")
                 return token
             if status in _TERMINAL_BAD:
                 err = solve.get("error") or {}
-                msg = (err.get("message") if isinstance(err, dict)
-                       else str(err)) or status
+                if isinstance(err, dict):
+                    msg = err.get("message") or status
+                    code = err.get("code") or ""
+                    reason = err.get("reason") or ""
+                    if code or reason:
+                        msg = f"{msg} [{code}{'/' + reason if reason else ''}]"
+                else:
+                    msg = str(err) or status
                 self.failures += 1
                 self.last_error = str(msg)[:160]
                 self._log(f"[NoneCap] Solve {status}: {self.last_error} "

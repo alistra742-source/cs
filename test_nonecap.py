@@ -343,14 +343,18 @@ class TestIpAndUaBinding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(STATE["last_payload"]["proxy"],
                          "socks5://1.2.3.4:1080")
 
-    async def test_user_agent_is_forwarded(self):
+    async def test_user_agent_is_NOT_forwarded(self):
+        # Deprecated 2026-08-13 and ignored by the API. The SDK warns that
+        # a caller-supplied UA replaced only some identity signals and
+        # "made the request contradict itself".
         await self._c().solve("sk", "https://x.test/", user_agent="UA/1.0")
-        self.assertEqual(STATE["last_payload"]["user_agent"], "UA/1.0")
+        self.assertNotIn("user_agent", STATE["last_payload"])
 
     async def test_absent_by_default(self):
         await self._c().solve("sk", "https://x.test/")
         self.assertNotIn("proxy", STATE["last_payload"])
         self.assertNotIn("user_agent", STATE["last_payload"])
+        self.assertNotIn("invisible", STATE["last_payload"])
 
     async def test_env_proxy_is_used(self):
         import nonecap_solver as ns
@@ -362,10 +366,11 @@ class TestIpAndUaBinding(unittest.IsolatedAsyncioTestCase):
         finally:
             ns.NONECAP_PROXY = old
 
-    def test_server_sends_the_browser_ua(self):
+    def test_server_does_not_send_a_user_agent(self):
+        # The solver builds its own coherent identity; overriding only the
+        # UA made the request self-contradictory (SDK note, 2026-08-13).
         src = open("server.py").read()
-        self.assertIn("navigator.userAgent", src)
-        self.assertIn("user_agent=str(ua)", src)
+        self.assertNotIn("user_agent=str(ua)", src)
 
 
 class TestNoSelfInjection(unittest.TestCase):
@@ -489,6 +494,66 @@ class TestWidgetRqdataCrossCheck(unittest.TestCase):
 
     def test_solve_parameters_are_logged(self):
         self.assertIn("sitekey={sitekey} url={page_url}", self.src)
+
+
+class TestMatchesOfficialSdk(unittest.TestCase):
+    """Body must match nonecap-py's _build_solve_body exactly.
+
+    Reading the official SDK found three bugs in my hand-rolled client:
+    an `invisible` field that does not exist, a deprecated `user_agent`
+    that the SDK warns "made the request contradict itself", and a
+    resp_key I never captured at all.
+    """
+
+    def setUp(self):
+        import inspect
+
+        import nonecap_solver
+        self.src = inspect.getsource(nonecap_solver.NoneCapSolver.solve)
+
+    def test_no_invented_invisible_field(self):
+        self.assertNotIn('payload["invisible"]', self.src)
+
+    def test_no_deprecated_user_agent(self):
+        self.assertNotIn('payload["user_agent"]', self.src)
+
+    def test_keeps_the_documented_fields(self):
+        for field in ('"type"', '"sitekey"', '"url"', '"rqdata"',
+                      '"proxy"'):
+            self.assertIn(field, self.src)
+
+    def test_enterprise_requires_rqdata(self):
+        import nonecap_solver
+        c = nonecap_solver.NoneCapSolver(key="k", log=lambda *a, **k: None)
+        import asyncio
+        # no sitekey -> refuses before any network call
+        self.assertIsNone(asyncio.run(c.solve("", "https://x/")))
+
+
+class TestRespKey(unittest.TestCase):
+    """Discord verifies the token AND hCaptcha's respkey together."""
+
+    def test_solver_captures_resp_key(self):
+        import inspect
+
+        import nonecap_solver
+        src = inspect.getsource(nonecap_solver.NoneCapSolver)
+        self.assertIn("last_resp_key", src)
+        self.assertIn('solve.get("resp_key")', src)
+
+    def test_register_sends_the_respkey_header(self):
+        src = open("server.py").read()
+        self.assertIn("X-Captcha-Respkey", src)
+
+    def test_respkey_is_plumbed_from_solver_to_request(self):
+        src = open("server.py").read()
+        self.assertIn("_captcha_respkey", src)
+        self.assertIn('"respkey": getattr(self, "_captcha_respkey"', src)
+
+    def test_get_resp_key_is_patched_in_the_page(self):
+        src = open("server.py").read()
+        self.assertIn("__ncRespKey", src)
+        self.assertIn("getRespKey", src)
 
 
 if __name__ == "__main__":
