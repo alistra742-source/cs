@@ -5318,6 +5318,9 @@ class DiscordAutomation:
         };
         if (p.rqtoken) headers['X-Captcha-Rqtoken'] = p.rqtoken;
         if (p.session) headers['X-Captcha-Session-Id'] = p.session;
+        // Set BEFORE the call: our own hook runs synchronously inside
+        // fetch() and would otherwise re-add captcha_key to this body.
+        window.__ncDirectInflight = true;
         return fetch('/api/v9/auth/register', {
             method: 'POST',
             headers: headers,

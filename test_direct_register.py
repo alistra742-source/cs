@@ -270,5 +270,77 @@ class TestNoMarkerLeak(unittest.TestCase):
         self.assertNotIn("__nc_direct", json.dumps(r["seen"]["body"]))
 
 
+@unittest.skipUnless(NODE, "node not available")
+class TestHookDoesNotTouchOurOwnRequest(unittest.TestCase):
+    """The JS hook must not re-add captcha_key to our direct submit.
+
+    Live evidence: seen=['injected'] with bodyKeys ending
+    '...,captcha_key,captcha_rqtoken' — our own request was rewritten,
+    putting the token in the BODY as well as the headers. The in-flight
+    flag has to be set synchronously BEFORE fetch() is called, because the
+    patched fetch runs inline.
+    """
+
+    SCRIPT = """
+global.window = global;
+let sent = null;
+global.fetch = async (u, i) => { sent = {u, i};
+  return {status: 400, text: async () => '{}'}; };
+class XHR { open(m, u) { this.u = u; } send(b) {} }
+global.XMLHttpRequest = XHR;
+(%s)();
+window.__ncToken = 'P1_TOK';
+window.__ncRqToken = 'RQ1';
+const direct = %s;
+direct({email:'a@b.c', username:'u', global_name:'U', password:'p',
+        dob:'1994-06-04', token:'P1_TOK', rqtoken:'RQ1', session:'S1',
+        fingerprint:'FP'}).then(() => {
+  const b = JSON.parse(sent.i.body);
+  console.log(JSON.stringify({
+    seen: window.__ncSeen, injections: window.__ncInjections,
+    bodyHasCaptchaKey: ('captcha_key' in b),
+    header: sent.i.headers['X-Captcha-Key'],
+    cleared: (window.__ncDirectInflight === false)}));
+});
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        src = open("server.py").read()
+        hm = '_CAPTCHA_HOOK_JS = r"""'
+        i = src.index(hm) + len(hm)
+        hook = src[i:src.index('"""', i)]
+        script = cls.SCRIPT % (hook, register_js())
+        with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                         delete=False) as f:
+            f.write(script)
+            path = f.name
+        p = subprocess.run([NODE, path], capture_output=True, text=True,
+                           timeout=60)
+        assert p.returncode == 0, p.stderr[:400]
+        cls.r = json.loads(p.stdout.strip().splitlines()[-1])
+
+    def test_hook_recognises_our_own_request(self):
+        self.assertIn("own-direct-request", self.r["seen"])
+
+    def test_hook_does_not_inject(self):
+        self.assertEqual(self.r["injections"], 0)
+
+    def test_body_stays_clean(self):
+        self.assertFalse(self.r["bodyHasCaptchaKey"])
+
+    def test_token_is_still_in_the_header(self):
+        self.assertEqual(self.r["header"], "P1_TOK")
+
+    def test_flag_is_cleared_afterwards(self):
+        self.assertTrue(self.r["cleared"])
+
+    def test_flag_is_set_before_fetch(self):
+        src = open("server.py").read()
+        i = src.index("window.__ncDirectInflight = true")
+        j = src.index("return fetch('/api/v9/auth/register'", i)
+        self.assertLess(i, j, "flag must be set before the call")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
