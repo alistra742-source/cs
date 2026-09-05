@@ -82,8 +82,21 @@ def _wrap_js(js: Any, arg: Any = None) -> tuple:
             expr = f"({s})()"
         else:
             expr = f"({s})({json.dumps(arg)})"
-        return expr, s.startswith("async")
-    return s, False
+        # await_promise must be True for ANY function that hands back a
+        # promise, not just a literally `async` one. A plain arrow that
+        # returns fetch(...).then(...) is a promise too, and evaluating it
+        # without awaiting returns the unresolved Promise object — which
+        # marshals back as an empty value (the mystery `HTTP 0`).
+        returns_promise = (
+            s.startswith("async")
+            or ".then(" in s
+            or "fetch(" in s
+            or "await " in s
+            or "Promise" in s
+        )
+        return expr, returns_promise
+    # A bare expression can be a promise too (e.g. `fetch(...)`).
+    return s, ("fetch(" in s or ".then(" in s or s.startswith("await "))
 
 
 def _wrap_new_document(src: str) -> str:
@@ -859,11 +872,39 @@ async def _eval_on(conn, js: Any, arg: Any = None) -> Any:
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response facades for page.on()
 # ─────────────────────────────────────────────────────────────────────────────
+# Chrome omits request bodies from RequestWillBeSent unless a max size
+# is given. hCaptcha's enterprise payload is a few KB.
+_MAX_POST_DATA = 262144
+
+
 class _Request:
-    def __init__(self, event: Any):
+    def __init__(self, event: Any, tab: Any = None):
         self.url = (getattr(getattr(event, "request", None), "url", None)) or ""
         self._post_data = getattr(getattr(event, "request", None), "post_data", None)
         self._post_data_buffer = None
+        self._tab = tab
+        self._request_id = getattr(event, "request_id", None)
+
+    async def fetch_post_data(self):
+        """Pull the POST body over CDP when the event did not carry it.
+
+        Chrome truncates or omits postData depending on
+        Network.enable(maxPostDataSize); Network.getRequestPostData always
+        returns the full body while the request is still in flight.
+        """
+        if self._post_data:
+            return self._post_data
+        if self._tab is None or self._request_id is None or cdp is None:
+            return None
+        try:
+            body, _b64 = await self._tab.send(
+                cdp.network.get_request_post_data(self._request_id))
+            if body:
+                self._post_data = body
+                return body
+        except Exception:
+            pass
+        return None
 
     @property
     def post_data(self):
@@ -916,6 +957,91 @@ class _Page:
         # refresh (throttled — see _refresh_frames).
         self._frames_cache: List["_Frame"] = []
         self._frames_refreshed_at: float = 0.0
+
+    async def intercept_request_bodies(self, url_substrings, mutate) -> bool:
+        """Rewrite POST bodies at the CDP layer via Fetch.requestPaused.
+
+        Patching window.fetch/XHR is defeated whenever the page issues the
+        request from a context we do not own (service worker, a captured
+        reference taken before our patch, or a fresh document after
+        navigation). Fetch interception sits below all of that: Chrome
+        pauses the request and we hand back a modified body.
+
+        ``mutate(url, body) -> new_body_or_None`` is called for each paused
+        request whose URL contains one of ``url_substrings``.
+        """
+        if cdp is None:
+            return False
+        tab = self._tab
+        subs = [s.lower() for s in (url_substrings or []) if s]
+
+        async def _on_paused(event, _conn=None):
+            # EVERY path must end in continue_request: a paused request
+            # that is never continued blocks the page forever.
+            rid = getattr(event, "request_id", None)
+            if rid is None:
+                return
+            new_body = None
+            try:
+                req = getattr(event, "request", None)
+                url = (getattr(req, "url", "") or "")
+                body = getattr(req, "post_data", None)
+                if any(x in url.lower() for x in subs):
+                    new_body = mutate(url, body)
+            except Exception:
+                new_body = None
+            try:
+                if new_body is not None:
+                    # Fetch.continueRequest takes post_data BASE64-ENCODED.
+                    # Sending raw text yields a body Discord cannot parse.
+                    import base64 as _b64
+                    enc = _b64.b64encode(
+                        new_body.encode("utf-8")).decode("ascii")
+                    await tab.send(cdp.fetch.continue_request(
+                        request_id=rid, post_data=enc))
+                else:
+                    await tab.send(cdp.fetch.continue_request(request_id=rid))
+            except Exception:
+                # A paused request that is never continued HANGS the page.
+                try:
+                    await tab.send(cdp.fetch.continue_request(request_id=rid))
+                except Exception:
+                    pass
+
+        def _handler(event, _conn=None):
+            try:
+                asyncio.create_task(_on_paused(event, _conn))
+            except RuntimeError:
+                pass
+
+        try:
+            # tab.handlers is a defaultdict(list) in nodriver, but do not
+            # depend on that — a KeyError here silently disables the whole
+            # interceptor.
+            try:
+                tab.handlers[cdp.fetch.RequestPaused].append(_handler)
+            except KeyError:
+                tab.handlers[cdp.fetch.RequestPaused] = [_handler]
+            patterns = [
+                cdp.fetch.RequestPattern(
+                    url_pattern=f"*{sub}*",
+                    request_stage=cdp.fetch.RequestStage.REQUEST)
+                for sub in (url_substrings or ["*"])
+            ]
+            await tab.send(cdp.fetch.enable(patterns=patterns))
+            return True
+        except Exception:
+            return False
+
+    async def disable_request_interception(self) -> bool:
+        """Fetch.disable — stop pausing requests."""
+        if cdp is None:
+            return False
+        try:
+            await self._tab.send(cdp.fetch.disable())
+            return True
+        except Exception:
+            return False
 
     async def _refresh_frames(self, force: bool = False) -> None:
         # Throttled: the nav-poll loop evaluates every ~150 ms, and a full
@@ -1141,15 +1267,20 @@ class _Page:
         if event in ("request", "response"):
             if event == "request":
                 def _req_h(e, _conn=None):
-                    _call_handler(handler, _Request(e))
+                    _call_handler(handler, _Request(e, self._tab))
                 self._tab.handlers[cdp.network.RequestWillBeSent].append(_req_h)
             else:
                 def _resp_h(e, _conn=None):
                     _call_handler(handler, _Response(self._tab, e))
                 self._tab.handlers[cdp.network.ResponseReceived].append(_resp_h)
             try:
+                # max_post_data_size is REQUIRED for RequestWillBeSent to
+                # carry request.postData. Without it Chrome omits the body
+                # entirely, which is why hCaptcha's enterprise rqdata never
+                # showed up in the request hook.
                 asyncio.get_running_loop().create_task(
-                    self._tab.send(cdp.network.enable()))
+                    self._tab.send(cdp.network.enable(
+                        max_post_data_size=_MAX_POST_DATA)))
             except RuntimeError:
                 pass
         elif event == "crash":
@@ -1226,7 +1357,9 @@ class _Context:
             pass
         # nodriver does not auto-enable domains — turn on the ones the bot
         # relies on (DOM queries, page events, frame tree, screenshots).
-        for domain in (cdp.page.enable(), cdp.dom.enable(), cdp.network.enable()):
+        for domain in (cdp.page.enable(), cdp.dom.enable(),
+                       cdp.network.enable(
+                           max_post_data_size=_MAX_POST_DATA)):
             try:
                 await tab.send(domain)
             except Exception:

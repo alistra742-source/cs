@@ -18,14 +18,8 @@ from captcha_solver import (
     read_hcaptcha_token,
 )
 from duckmail import TempMail
-from vision_solver import OllamaVisionClient
-from drag_solver import DragSolver
 import hcaptcha_types as hct
 import human_mouse as hm
-
-# Mean per-tile CNN confidence required before the OFFLINE tile classifier
-# is trusted for a grid round (below this gate the vision model answers).
-_CNN_MIN_CONF = float(os.environ.get("SOLVER_CNN_MIN_CONF", "0.62"))
 
 
 # ── Shared JS: robust login-link / back-to-login detection ──────────────
@@ -355,20 +349,38 @@ _NAV_STATE_JS = r"""() => {
     const isLogin = /login|sign in|welcome back|anmelden|einloggen|logga in|logg inn|log ind|connexion|se connecter|iniciar sesi|acceder|entrar|conectar|accedi|inloggen|přihlásit|zaloguj|войти|вход|로그인|ログイン|登录|đăng nhập|giriş yap|kirjaudu/i.test(text.substring(0, 400));
     const hasQR = document.querySelector('img[src*="qr" i], [class*="qr" i]');
     const continueBtn = document.querySelector('button[type="submit"], button[class*="continue" i]');
+    // Discord sometimes paints the register form inside a same-origin
+    // iframe. document.querySelectorAll only sees the TOP document, so the
+    // poll reported inputs=0 while the form was plainly on screen. Walk
+    // reachable same-origin frames and fold their counts in.
+    let extraInputs = 0, extraButtons = 0;
+    let fEmail = null, fUser = null, fPass = null;
+    try {
+        for (const fr of Array.from(window.frames)) {
+            let doc = null;
+            try { doc = fr.document; } catch (e) { continue; }   // cross-origin
+            if (!doc) continue;
+            extraInputs += doc.querySelectorAll("input").length;
+            extraButtons += doc.querySelectorAll("button").length;
+            fEmail = fEmail || doc.querySelector('input[type="email"], input[name="email"], input[aria-label*="email" i]');
+            fUser = fUser || doc.querySelector('input[name="username"], input[aria-label*="username" i], input[aria-label*="display" i]');
+            fPass = fPass || doc.querySelector('input[type="password"], input[name="password"]');
+        }
+    } catch (e) { /* frame walk is best-effort */ }
     return JSON.stringify({
         url: location.href,
         title: document.title || "",
         readyState: document.readyState || "",
-        email: email !== null,
-        username: username !== null,
-        password: password !== null,
+        email: (email !== null) || (fEmail !== null),
+        username: (username !== null) || (fUser !== null),
+        password: (password !== null) || (fPass !== null),
         ageGate: hasAge || hasMonth !== null,
         isLogin: isLogin,
         hasQR: hasQR,
         hasButton: continueBtn !== null,
         hasAppMount: document.querySelector("#app-mount") !== null,
-        inputCount: document.querySelectorAll("input").length,
-        buttonCount: document.querySelectorAll("button").length,
+        inputCount: document.querySelectorAll("input").length + extraInputs,
+        buttonCount: document.querySelectorAll("button").length + extraButtons,
         cfClearance: document.cookie.indexOf("cf_clearance=") !== -1,
         challenge: challenge,
         textPreview: text.substring(0, 250)
@@ -1135,6 +1147,26 @@ def _tor_newnym():
     return False
 
 
+def _tor_allowed() -> bool:
+    """Is a TOR downgrade permitted?
+
+    Not when residential sessions are configured: Discord binds the
+    captcha challenge to the exit IP and the solver is handed OUR proxy,
+    so quietly switching to TOR guarantees an invalid-response and gives
+    Discord a flagged exit on top. TOR_FALLBACK=1 forces it back on.
+    """
+    env = (os.environ.get("TOR_FALLBACK") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        import proxies as _p
+        return not _p.configured()
+    except Exception:
+        return True
+
+
 def _tor_check():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1168,6 +1200,35 @@ def _cgroup_oom_kills() -> int:
         except Exception:
             pass
     return 0
+
+
+# What Discord's captcha_key values actually mean. These are the reasons
+# a register POST comes back 400 with a captcha challenge attached.
+_CAPTCHA_KEY_HINTS = {
+    "captcha-required":
+        "no token was sent at all — the hook did not reach this request",
+    "invalid-input-response":
+        "the token was malformed or already used",
+    "invalid-response":
+        "hCaptcha rejected the token (wrong sitekey, expired, or not bound "
+        "to this rqdata)",
+    "bad-request":
+        "the request shape was wrong",
+    "invalid-request":
+        "hCaptcha rejected the request parameters",
+    "expired":
+        "the token aged out (hCaptcha tokens live ~120s) — solve faster",
+    "timeout-or-duplicate":
+        "the token was already redeemed, or arrived too late",
+    "sitekey-secret-mismatch":
+        "the token was minted for a different sitekey",
+    "rqdata-mismatch":
+        "the token is not bound to THIS challenge's rqdata",
+    "rqtoken-mismatch":
+        "captcha_rqtoken did not match the challenge",
+    "ip-blocked":
+        "the exit IP is blocked — this is the proxy/TOR, not the token",
+}
 
 
 PAST_CAPTCHA_KEYWORDS = ['/channels', '/verify', '/welcome', '@me', 'discord.com/app']
@@ -1205,6 +1266,10 @@ NAV_TIMEOUT_MS = 30000
 # auto-resolve and get unlimited time; everything else rotates to a fresh
 # circuit once the budget is exhausted.
 RENDER_WAIT_BUDGET_S = 75.0
+# Hard ceiling for the whole hosted-solver step (3 solves +
+# injection + verification). Beyond this the local solver runs.
+NONECAP_STEP_BUDGET = float(
+    os.environ.get("NONECAP_STEP_BUDGET", "420"))
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_VIEWPORT = {"width": 1280, "height": 720}
 
@@ -1246,6 +1311,12 @@ FULLPAGE_MAX_PX = max(2000, int(os.environ.get("FULLPAGE_MAX_PX") or 8000))
 # (the bot is working in it). Returns 'scrolled' when it moved the page.
 _REVEAL_FORM_JS = r"""() => {
     try {
+        for (const f of document.querySelectorAll(
+                'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i], ' +
+                'iframe[src*="challenges.cloudflare.com"]')) {
+            const cr = f.getBoundingClientRect();
+            if (cr.width > 120 && cr.height > 120) return 'ok';
+        }
         const openMenu = document.querySelector(
             '[role="option"], [role="menuitem"], [class*="popout" i]');
         if (openMenu && openMenu.offsetParent !== null) return 'ok';
@@ -1273,6 +1344,17 @@ _REVEAL_FORM_LIVE_JS = r"""() => {
         const openMenu = document.querySelector(
             '[role="option"], [role="menuitem"], [class*="popout" i]');
         if (openMenu && openMenu.offsetParent !== null) return 'ok';
+        // NEVER scroll while an hCaptcha challenge is up. The challenge is
+        // an overlay pinned to the viewport; scrolling to the register form
+        // underneath it moves the whole document and the camera frame comes
+        // back as an empty grey area with the challenge scrolled out of
+        // view. The challenge IS what the operator needs to see.
+        for (const f of document.querySelectorAll(
+                'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i], ' +
+                'iframe[src*="challenges.cloudflare.com"]')) {
+            const cr = f.getBoundingClientRect();
+            if (cr.width > 120 && cr.height > 120) return 'ok';
+        }
         const form = document.querySelector('form')
             || document.querySelector(
                 'input[name="email"], input[type="email"], input[name="password"]');
@@ -1541,21 +1623,43 @@ class DiscordAutomation:
         self._username = ""
         self._password = ""
         self._token = ""
-        # Local Ollama vision model solves the hCaptcha image grid itself -
-        # vision model solves the image grid directly (see vision_solver.py).
-        self._vision = OllamaVisionClient(log=self._log)
+        # Outcome telemetry (Roboflow Vision Events). Disabled unless
+        # VISION_EVENTS=1; never allowed to affect a solve.
+        try:
+            from vision_events import VisionEvents
+            self._events = VisionEvents(log=self._log)
+        except Exception:
+            self._events = None
+        # Hosted hCaptcha solver (NoneCap). Created lazily on first use.
+        self._nonecap = None
+        self._proxy_relay = None
         # Latest hCaptcha enterprise rqdata captured from the live getcaptcha
         # request (fresh per challenge, reset at the start of each attempt).
         self._rqdata = ""
+        # Discord pairs rqdata with an rqtoken in the same challenge body.
+        self._rqtoken = ""
+        # Set when Discord's /auth/register returns 2xx — the only
+        # unambiguous proof the captcha token was accepted.
+        self._register_accepted = False
+        # Network-layer token injection state.
+        self._pending_captcha_token = ""
+        self._cdp_injections = 0
+        self._cdp_inject_note = ""
+        self._cdp_interceptor_on = False
+        # Discord's client fingerprint (from /api/v9/experiments) plus the
+        # form values the direct-API register submit needs.
+        self._discord_fingerprint = ""
+        self._captcha_session_id = ""
+        self._captcha_respkey = ""
+        self._last_direct_status = 0
+        self._captcha_invisible = False
+        self._nc_direct_inflight = False
+        self._dob_iso = ""
+        self._display_name_used = ""
         # JSON body of the last hCaptcha /getcaptcha RESPONSE — the challenge
         # payload carries request_type (which of the five challenge families
         # this round is), the prompt and the tile/reference URLs.
         self._challenge_payload = None
-        # Offline CNN solvers (tile_classifier.py). Lazy: None until first
-        # use, False when torch/weights are absent (vision-model fallback).
-        self._cnn_tile = None
-        self._cnn_point = None
-        self._cnn_drag = None
         # duckmail.sbs client — created once per bot, reused across attempts.
         # (Lost in the cybertemp→duckmail switch, which silently killed every
         # inbox creation with a NoneType crash — see git log efb6f99.)
@@ -1702,13 +1806,24 @@ class DiscordAutomation:
         return self._activity_log
 
     def _launch_proxy(self) -> Optional[dict]:
-        """The proxy rides on browser launch (nodriver applies it as Chrome
-        --proxy-server/--proxy-user/--proxy-pass launch flags — a
-        context-level proxy would be rejected when the browser already has
-        one). Returns the Playwright-style {server, username, password} dict
-        (or None for TOR/direct)."""
+        """Proxy dict for browser launch, or None for TOR/direct.
+
+        CHROME CANNOT AUTHENTICATE FROM THE COMMAND LINE. There is no
+        --proxy-user/--proxy-pass switch (those are silently ignored) and
+        credentials inside --proxy-server are stripped, so an authenticated
+        gateway answers 407 and the tab lands on chrome-error://
+        chromewebdata/ in 0.0s — exactly the "PROXY SESSION DEAD" loop,
+        even for sessions that validate perfectly from aiohttp.
+
+        When a relay is running we point Chrome at it instead: a local,
+        unauthenticated port that injects Proxy-Authorization upstream.
+        Same exit IP, so the captcha's IP binding is unaffected.
+        """
         if not (self.proxy and isinstance(self.proxy, dict)):
             return None
+        relay = getattr(self, "_proxy_relay", None)
+        if relay is not None and getattr(relay, "port", 0):
+            return {"server": relay.url}
         p = self.proxy
         proto = p.get("proto", "http")
         lp = {"server": f"{proto}://{p.get('host')}:{p.get('port')}"}
@@ -1716,6 +1831,32 @@ class DiscordAutomation:
             lp["username"] = p.get("username")
             lp["password"] = p.get("password", "")
         return lp
+
+    async def _start_proxy_relay(self) -> None:
+        """(Re)start the local auth relay for the current session."""
+        await self._stop_proxy_relay()
+        if not (self.proxy and isinstance(self.proxy, dict)):
+            return
+        if not self.proxy.get("username"):
+            return
+        try:
+            from proxy_relay import relay_for
+            self._proxy_relay = await asyncio.wait_for(
+                relay_for(self.proxy, log=self._log), timeout=10)
+        except Exception as e:
+            self._proxy_relay = None
+            self._log(f"[Relay] Could not start proxy relay: "
+                      f"{type(e).__name__}: {e}", level="warn")
+
+    async def _stop_proxy_relay(self) -> None:
+        relay = getattr(self, "_proxy_relay", None)
+        if relay is None:
+            return
+        self._proxy_relay = None
+        try:
+            await relay.stop()
+        except Exception:
+            pass
 
     async def _relaunch_browser(self) -> None:
         """Close and relaunch the browser bound to self.proxy. The engine
@@ -1727,6 +1868,7 @@ class DiscordAutomation:
             except Exception:
                 pass
             self._browser = None
+        await self._start_proxy_relay()
         args = launch_args(headless=self.headless)
         # The engine pins the proxy at browser launch. When there is no sticky
         # residential session, relaunch must ride TOR exactly like initialize()
@@ -1734,9 +1876,13 @@ class DiscordAutomation:
         # context-level proxy is ignored by the engine) and Discord's
         # Cloudflare blocks the datacenter IP with a browser error page.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and not self._direct and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check() \
+                and _tor_allowed():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
+        if launch_proxy is not None:
+            self._log(f"[Proxy] Browser launching via "
+                      f"{'TOR' if self._tor_enabled else launch_proxy.get('server')}")
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
         await self._build_context()
@@ -1782,6 +1928,7 @@ class DiscordAutomation:
     async def initialize(self) -> None:
         self._playwright = await async_playwright().start()
 
+        await self._start_proxy_relay()
         args = launch_args(headless=self.headless)
         self._log(f"[Engine] {ENGINE} launch args: {len(args)}")
 
@@ -1796,9 +1943,13 @@ class DiscordAutomation:
         # firefox launch — a proxy passed later to new_context() would be
         # rejected and traffic would go direct.
         launch_proxy = self._launch_proxy()
-        if launch_proxy is None and not self._direct and _tor_check():
+        if launch_proxy is None and not self._direct and _tor_check() \
+                and _tor_allowed():
             launch_proxy = {"server": "socks5://127.0.0.1:9050"}
             self._tor_enabled = True
+        if launch_proxy is not None:
+            self._log(f"[Proxy] Browser launching via "
+                      f"{'TOR' if self._tor_enabled else launch_proxy.get('server')}")
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless, args=args, proxy=launch_proxy)
 
@@ -1872,6 +2023,14 @@ class DiscordAutomation:
         )
         self._page = await self._context.new_page()
         self._attach_rqdata_capture()
+        # Patch fetch/XHR at page creation so EVERY register attempt is
+        # covered — installing it only at token time is a race with
+        # Discord's own submit.
+        try:
+            asyncio.get_running_loop().create_task(
+                self._install_captcha_hook_early())
+        except RuntimeError:
+            pass
         self._attach_crash_listener()
 
         # Automation-tell stripping (incl. navigator.webdriver) is done by
@@ -1941,7 +2100,7 @@ class DiscordAutomation:
             # exception path records the same diagnostics in that case.
             pass
 
-    def _on_page_request(self, request) -> None:
+    async def _on_page_request(self, request) -> None:
         try:
             url = (request.url or "").lower()
             if "hcaptcha" not in url:
@@ -1974,6 +2133,18 @@ class DiscordAutomation:
                         body = getattr(request, "post_data", None)
                     except Exception:
                         body = None
+                # Chrome can omit the body from the event entirely. The
+                # engine can still fetch it over CDP while the request is
+                # in flight — this is the path that finally yields the
+                # enterprise rqdata for Discord.
+                if not body:
+                    fetch = getattr(request, "fetch_post_data", None)
+                    if callable(fetch):
+                        try:
+                            body = await asyncio.wait_for(fetch(),
+                                                          timeout=5.0)
+                        except Exception:
+                            body = None
                 if body is not None:
                     rqdata = extract_rqdata_from_body(body)
             if rqdata:
@@ -1985,18 +2156,138 @@ class DiscordAutomation:
             self._log(f"[Captcha] rqdata capture error: {e}", level="debug")
 
     async def _on_page_response(self, response) -> None:
-        """Stash the /getcaptcha JSON (the challenge payload) as it arrives."""
+        """Stash the challenge payload AND Discord's own captcha rqdata.
+
+        Two different sources, both arriving as responses:
+
+        1. hCaptcha's /getcaptcha JSON -> the challenge payload (family,
+           prompt, tiles).
+        2. Discord's OWN API. When registration needs a captcha, Discord
+           answers POST /api/v9/auth/register with HTTP 400 and a body
+           containing captcha_sitekey and **captcha_rqdata**. That is where
+           the enterprise blob actually lives for this flow — hCaptcha's
+           request never carries it, which is why the request hook found
+           nothing no matter how the body was read.
+        """
         try:
             url = (response.url or "").lower()
-            if "hcaptcha" not in url or "getcaptcha" not in url:
+            status = int(getattr(response, "status", 0) or 0)
+
+            # ── 1. hCaptcha challenge payload ──
+            if "hcaptcha" in url and "getcaptcha" in url and status == 200:
+                try:
+                    data = await response.json()
+                    if isinstance(data, dict) and data.get("request_type"):
+                        self._read_challenge_payload(data)
+                except Exception:
+                    pass
                 return
-            if response.status != 200:
+
+            # ── 2b. Discord's client fingerprint ──
+            # /auth/register wants the fingerprint the client was issued.
+            if "discord.com/api" in url and "/experiments" in url \
+                    and status == 200:
+                try:
+                    data = await asyncio.wait_for(response.json(),
+                                                  timeout=5.0)
+                    fp = (data or {}).get("fingerprint")
+                    if isinstance(fp, str) and len(fp) > 8:
+                        if fp != getattr(self, "_discord_fingerprint", ""):
+                            self._discord_fingerprint = fp
+                            self._log(f"[Captcha] Captured Discord "
+                                      f"fingerprint ({len(fp)} chars)")
+                except Exception:
+                    pass
                 return
-            data = await response.json()
-            if isinstance(data, dict) and data.get("request_type"):
-                self._read_challenge_payload(data)
-        except Exception:
-            pass
+
+            # ── 2a. Did a register call SUCCEED? ──
+            if ("discord.com/api" in url and "/auth/register" in url
+                    and status in (200, 201)):
+                self._register_accepted = True
+                self._log("[Captcha] Discord accepted the registration "
+                          "(captcha cleared)")
+                return
+
+            # ── 2. Discord's captcha challenge response ──
+            if "discord.com/api" not in url:
+                return
+            if not any(p in url for p in ("/auth/register", "/auth/login",
+                                          "/auth/", "/users/@me")):
+                return
+            # The captcha challenge is delivered as a 4xx error body.
+            if status not in (400, 403, 429):
+                return
+            data = None
+            for _try in range(3):
+                try:
+                    data = await asyncio.wait_for(response.json(),
+                                                  timeout=5.0)
+                    break
+                except Exception:
+                    # The body is not always in the CDP store the instant
+                    # responseReceived fires.
+                    await asyncio.sleep(0.35)
+            if not isinstance(data, dict):
+                return
+            # ── DIAGNOSTIC: say exactly WHY Discord rejected us ──
+            # captcha_key is a list of machine-readable reasons. This is
+            # the difference between "the token was wrong" and "the token
+            # was never sent" and "you are IP-banned".
+            try:
+                keys = data.get("captcha_key")
+                if isinstance(keys, list) and keys:
+                    reasons = ", ".join(str(k) for k in keys[:6])
+                    self._log(f"[Captcha] Discord says: {reasons}",
+                              level="warn")
+                    hint = _CAPTCHA_KEY_HINTS.get(str(keys[0]).strip())
+                    if hint:
+                        self._log(f"[Captcha] -> {hint}", level="warn")
+                    if self._events is not None:
+                        self._events.report_nowait(
+                            "fail", stage="discord_reject",
+                            reason=str(keys[0])[:80])
+                # Anything else Discord chose to tell us.
+                for k in ("message", "code", "errors"):
+                    v = data.get(k)
+                    if v:
+                        self._log(f"[Captcha] Discord {k}: "
+                                  f"{str(v)[:200]}", level="warn")
+            except Exception:
+                pass
+
+            rq = ""
+            for key in ("captcha_rqdata", "captcha_rq_data", "rqdata"):
+                val = data.get(key)
+                if isinstance(val, str) and len(val) > 8:
+                    rq = val
+                    break
+            sk = data.get("captcha_sitekey")
+            if isinstance(sk, str) and len(sk) > 8:
+                self._hcaptcha_sitekey = sk
+            rqtoken = data.get("captcha_rqtoken")
+            if isinstance(rqtoken, str) and rqtoken:
+                self._rqtoken = rqtoken
+            sess = data.get("captcha_session_id")
+            if isinstance(sess, str) and sess:
+                self._captcha_session_id = sess
+            # Discord tells us the widget MODE. Registration serves
+            # INVISIBLE hCaptcha, and an invisible token is minted
+            # differently from a checkbox one — solving the wrong mode
+            # yields a token hCaptcha refuses (invalid-response).
+            inv = data.get("should_serve_invisible")
+            if isinstance(inv, bool):
+                if inv != getattr(self, "_captcha_invisible", None):
+                    self._log(f"[Captcha] Discord wants "
+                              f"{'INVISIBLE' if inv else 'visible'} hCaptcha")
+                self._captcha_invisible = inv
+            if rq:
+                self._rqdata = rq
+                self._log(f"[Captcha] Captured enterprise rqdata "
+                          f"({len(rq)} chars) from Discord's "
+                          f"{url.split('/api')[-1][:40]} response")
+        except Exception as e:
+            self._log(f"[Captcha] response capture error: {e}",
+                      level="debug")
 
     def _read_challenge_payload(self, data: dict = None) -> Optional[dict]:
         """Store /getcaptcha JSON and log the challenge family it carries.
@@ -2443,6 +2734,7 @@ class DiscordAutomation:
         max_reloads = 0 if LOW_MEMORY_MODE else 2
         _render_wait_start = time.time()
         self._log(f"[Nav] Waiting for registration form to render (no timeout - reloads<={max_reloads}, reload_after={reload_after:.0f}s)...")
+        last_probe = ""          # last page probe result (see the poll below)
         blank_since = None       # when the page first looked blank
         challenge_since = None   # when a Cloudflare challenge first appeared
         reload_count = 0         # reloads attempted for a blank/hung SPA
@@ -2501,6 +2793,7 @@ class DiscordAutomation:
                 if elapsed >= last_log + 3.0:
                     last_log = elapsed
                     probe = "(no probe)"
+                    last_probe = probe
                     try:
                         probe = await asyncio.wait_for(self._page.evaluate(
                             """() => {
@@ -2516,7 +2809,20 @@ class DiscordAutomation:
                         ), timeout=2.0)
                     except Exception as _pe:
                         probe = f"probe-failed: {type(_pe).__name__}: {_pe}"
+                    last_probe = probe
                     self._log(f"[Nav] Page unreadable ({int(elapsed)}s, {dead_reads}x in a row) - probe: {probe}")
+                # A dead CDP session can never recover on this page object;
+                # is_closed() may still say False, so match the protocol
+                # error directly instead of burning 20 reads on a corpse.
+                # NOTE: last_probe persists across iterations — `probe` only
+                # exists inside the throttled logging block above.
+                if "session with given id not found" in str(last_probe).lower() \
+                        or "target closed" in str(last_probe).lower():
+                    self._nav_error = ("CDP session dead - rebuilding "
+                                       "browser context")
+                    self._log("[Nav] CDP session is dead - rebuilding the "
+                              "browser context", level="warn")
+                    return False
                 if dead_reads >= 20:
                     self._nav_error = "page unreadable 20x in a row (white screen / tab dead) - rotating circuit"
                     self._log("[Nav] Page unreadable 20x in a row - page died, rotating circuit")
@@ -2827,7 +3133,9 @@ class DiscordAutomation:
         screenshot = await capture_page_screenshot(
             self._page, log=self._log, fullpage_timeout=20.0, reveal="live")
         if not screenshot or not png_is_complete(screenshot):
-            return ""
+            # Keep showing the last good frame rather than blanking the
+            # feed to grey — a dropped capture is not a dead browser.
+            return self._screenshots[-1] if self._screenshots else ""
         b64 = base64.b64encode(screenshot).decode('utf-8')
         self._screenshots.append(b64)
         # Tiny ring on purpose: each frame is a full-viewport PNG in base64
@@ -2847,6 +3155,9 @@ class DiscordAutomation:
         # rqdata is single-use and per-challenge: never carry a stale blob
         # from a previous page load into this attempt's solve.
         self._rqdata = ""
+        self._rqtoken = ""
+        # A previous attempt's success must never satisfy this attempt.
+        self._register_accepted = False
 
         # app.py closes + nulls self._mail between attempts (prevents aiohttp
         # connector leaks) while REUSING this bot object for the next attempt —
@@ -2928,14 +3239,40 @@ class DiscordAutomation:
             # writing values during that window gets them wiped on the next
             # re-render (the "fields stay empty" bug). Wait a fixed 20s so
             # hydration fully finishes before the filler runs.
-            self._log("[Nav] Waiting 20s for Discord to fully settle before filling...")
-            settle_deadline = time.time() + 20.0
+            # ADAPTIVE settle: poll until the DOM stops changing instead of
+            # burning a flat 20s on every attempt. Discord usually settles
+            # in 2-4s; the old fixed wait cost ~16s per attempt for nothing.
+            settle_max = float(os.environ.get("SETTLE_MAX", "20"))
+            settle_quiet = float(os.environ.get("SETTLE_QUIET", "1.5"))
+            self._log(f"[Nav] Settling (adaptive, quiet={settle_quiet:g}s, "
+                      f"max={settle_max:g}s)...")
+            settle_deadline = time.time() + settle_max
+            _sig_js = ('() => { const d = document; return "" + '
+                       'd.querySelectorAll("input").length + ":" + '
+                       'd.querySelectorAll("button").length + ":" + '
+                       '(d.body ? d.body.innerHTML.length : 0); }')
+            last_sig, stable_since = None, None
             while time.time() < settle_deadline:
                 if self._stopped.is_set():
                     self._nav_error = "stopped by user"
                     self._log("[Nav] Stopped by user during settle wait")
                     return False
-                await asyncio.sleep(0.5)
+                try:
+                    sig = await asyncio.wait_for(
+                        self._page.evaluate(_sig_js), timeout=2.0)
+                except Exception:
+                    sig = None
+                now = time.time()
+                if sig is not None and sig == last_sig:
+                    if stable_since is None:
+                        stable_since = now
+                    elif now - stable_since >= settle_quiet:
+                        self._log(f"[Nav] DOM stable — settled in "
+                                  f"{now - (settle_deadline - settle_max):.1f}s")
+                        break
+                else:
+                    last_sig, stable_since = sig, None
+                await asyncio.sleep(0.3)
 
             # Fill the form
             if self._page is None:
@@ -3182,7 +3519,15 @@ class DiscordAutomation:
             return False
 
     async def _past_captcha(self) -> bool:
-        """True when the page has moved past the captcha into Discord."""
+        """True when the page has moved past the captcha into Discord.
+
+        The URL is not the only signal: Discord's SPA can accept the
+        registration and mint a session without navigating anywhere the
+        keyword list would match. A 2xx on /auth/register is definitive,
+        so trust that first.
+        """
+        if getattr(self, "_register_accepted", False):
+            return True
         try:
             cur_url = self._page.url
             return any(k in cur_url for k in PAST_CAPTCHA_KEYWORDS)
@@ -3439,12 +3784,37 @@ class DiscordAutomation:
         frame = await self._hcaptcha_frame_for(iframe)
         if frame is None:
             return ""
+        # Read only VISIBLE error UI. The old version scanned the whole
+        # body innerText, which on the checkbox iframe includes hCaptcha's
+        # inline hsw script blob (`/* { "version": "1", "hash": ... }`).
+        # A keyword buried in that payload looked like an error banner and
+        # killed a perfectly healthy widget before it could be solved.
         try:
-            text = await frame.evaluate(
-                "() => (document.body ? document.body.innerText : '')")
+            text = await frame.evaluate(r"""() => {
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) return false;
+                    const cs = getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none'
+                        && parseFloat(cs.opacity || '1') > 0.05;
+                };
+                const out = [];
+                for (const el of document.querySelectorAll(
+                        '.error, .error-text, [class*="error" i], '
+                        + '[role="alert"], .display-error, .text-error')) {
+                    if (!vis(el)) continue;
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t && t.length <= 200) out.push(t);
+                }
+                return out.join(' | ');
+            }""")
         except Exception:
             return ""
         low = (text or "").lower()
+        # Script/JSON payloads are never error banners.
+        if "\"hash\"" in low or "/*" in low or len(low) > 300:
+            return ""
         for kw in ("rate limited or network error", "rate limited",
                    "network error", "please retry", "please try again",
                    "automated queries"):
@@ -4027,8 +4397,13 @@ class DiscordAutomation:
                                 "() => (document.body ? document.body.innerText.substring(0, 500) : '')")
                             low = page_text.lower()
                             if ('captcha' in low or 'security' in low or 'verify' in low):
-                                self._log("[Captcha] No hCaptcha frames — trying FunCAPTCHA solver", level="warn")
-                                return await self._solve_funcaptcha()
+                                # FunCAPTCHA/Arkose needed the vision stack
+                                # that is gone; Discord register serves
+                                # hCaptcha anyway. Rotate instead.
+                                self._log("[Captcha] Non-hCaptcha challenge "
+                                          "detected — rotating session",
+                                          level="warn")
+                                return False
                         except Exception:
                             pass
 
@@ -4074,21 +4449,21 @@ class DiscordAutomation:
                                         or 'security' in page_text.lower()
                                         or 'verify' in page_text.lower())
                     if has_captcha_text:
-                        self._log("[Captcha] FunCAPTCHA detected - pixel tile solver...")
-                        return await self._solve_funcaptcha()
+                        self._log("[Captcha] Non-hCaptcha challenge on the "
+                                  "page — rotating session", level="warn")
+                        return False
                     self._log(f"[Captcha] No captcha indicators on page: {self._page.url[:40]}", level="warn")
                     return False
                 except Exception as e:
                     self._log(f"[Captcha] Captcha check error: {e}", level="warn")
                 return False
 
-            # ---- VISION SOLVER: reads the image grid via vision_solver ----
-            # The bot reads the challenge instruction, screenshots every
-            # the challenge instruction, screenshots every tile, asks a
-            # vision model (local Ollama or remote VISION_API_BASE endpoint)
-            # which tiles match, clicks them + Verify, and hCaptcha itself
-            # mints the token. See vision_solver.py for the recommended
-            # model (ahmadwaqar/smolvlm2-256m-video:q8_0).
+            # ---- HOSTED SOLVER (NoneCap) — the only solver ----
+            # NoneCap returns a real P1_ token bound to Discord's
+            # enterprise rqdata; we replay /auth/register with it in the
+            # X-Captcha-* headers. There is no local vision fallback: the
+            # Roboflow/RT-DETR/Gemma stack never cleared a single Discord
+            # challenge and cost 20-45s per round to fail.
             if await self._past_captcha():
                 self._log("[Captcha] Page already past captcha")
                 return True
@@ -4100,225 +4475,55 @@ class DiscordAutomation:
                 return False
             self._log("[Captcha] [READY] Image challenge rendered - reading prompt + tiles")
 
-            # Probe the vision endpoint with RETRIES and NO permanent
-            # failure cache. Hosted endpoints (Railway etc.) cold-start on
-            # the first request after sleeping — one fast probe would mark
-            # a healthy service down for the bot's whole lifetime (the
-            # "Ollama server unreachable" that kills every captcha round).
-            # _vision_ready is only set on success, so a service that was
-            # down and comes back re-probes cleanly on the next challenge.
-            if not getattr(self, "_vision_ready", False):
-                ok, models = False, []
-                # Authentication/protocol failures are deterministic: waiting
-                # and replaying the same request cannot fix them.  Only retry
-                # transient connection, timeout, rate-limit, and 5xx failures.
-                terminal_probe_errors = {"authentication", "authorization", "protocol"}
-                probes_made = 0
-                for _probe in range(3):
-                    probes_made = _probe + 1
-                    ok, models = await self._vision.check()
-                    if ok:
-                        break
-                    check_error = getattr(self._vision, "last_check_error", "")
-                    if check_error in terminal_probe_errors:
-                        break
-                    if _probe < 2:
-                        self._log(
-                            f"[Captcha] Vision endpoint temporarily unavailable "
-                            f"(probe {_probe + 1}/3, {check_error or 'unknown error'}) - "
-                            "retrying in 10s", level="warn")
-                        await asyncio.sleep(10)
-                if not ok:
-                    check_error = getattr(self._vision, "last_check_error", "")
-                    http_status = getattr(self._vision, "last_check_http_status", None)
-                    if check_error == "authentication":
-                        self._log(
-                            f"[Captcha] Vision endpoint is UP but rejected authentication "
-                            f"(HTTP {http_status or 401}). This app and the Vision AI "
-                            "service have different or missing VISION_API_KEY values. "
-                            "Configure both Railway services from the same shared variable; "
-                            "do not put the secret in logs.", level="error")
-                    elif check_error == "authorization":
-                        self._log(
-                            f"[Captcha] Vision endpoint denied access "
-                            f"(HTTP {http_status or 403}); check the gateway authorization "
-                            "policy.", level="error")
-                    elif check_error == "protocol":
-                        self._log(
-                            f"[Captcha] Vision endpoint at {self._vision.base} is reachable "
-                            "but is not a compatible Ollama API; expected GET /api/tags.",
-                            level="error")
-                    else:
-                        self._log(
-                            f"[Captcha] Vision server unavailable after {probes_made} "
-                            f"probe(s) at {self._vision.base} ({check_error or 'unknown error'}) "
-                            "- check VISION_API_BASE / service status. Later challenges "
-                            "will re-probe automatically.", level="error")
-                    # Do not issue several expensive /api/chat requests after
-                    # the readiness probe already proved they cannot succeed.
-                    return False
-                elif self._vision.model not in models:
-                    self._log(
-                        f"[Captcha] Ollama model {self._vision.model} not pulled - "
-                        f"run: ollama pull {self._vision.model}",
-                        level="warn")
-                else:
-                    self._vision_ready = True
+            # ── NoneCap FIRST ────────────────────────────────────────────
+            # A hosted solver returns a real P1_ token, so there is nothing
+            # to click, drag or match. Try it before the local pipeline;
+            # only fall through to vision if it cannot deliver.
+            try:
+                nc_ok = await asyncio.wait_for(
+                    self._solve_with_nonecap(), timeout=NONECAP_STEP_BUDGET)
+            except asyncio.TimeoutError:
+                self._log(f"[NoneCap] Step exceeded "
+                          f"{NONECAP_STEP_BUDGET:.0f}s — falling back to the "
+                          "local solver", level="warn")
+                nc_ok = False
+            except Exception as e:
+                self._log(f"[NoneCap] Step error {type(e).__name__}: {e} — "
+                          "falling back to the local solver", level="warn")
+                nc_ok = False
+            if nc_ok:
+                return True
 
-            for solve_attempt in range(3):
-                if solve_attempt:
-                    await asyncio.sleep(3)
-                    self._log(
-                        f"[Captcha] Retrying vision solve (attempt {solve_attempt + 1}/3)...",
-                        level="warn")
-                if await self._past_captcha():
-                    self._log("[Captcha] Page already past captcha")
+            # Tier 2 — AZcaptcha (another hosted token).
+            try:
+                if await asyncio.wait_for(self._solve_with_azcaptcha(),
+                                          timeout=NONECAP_STEP_BUDGET):
                     return True
-                # hCaptcha can show several rounds in a row - keep solving
-                # until it mints the token or the challenge resets. Each
-                # round is CLASSIFIED first: hCaptcha has five challenge
-                # families (grid binary, reference binary, point, bbox,
-                # drag, multiple choice, text) and answering a point round
-                # with tile indices (or vice versa) is a guaranteed fail —
-                # and a loud automation signal.
-                last_sig = None
-                for round_i in range(8):
-                    if await self._past_captcha():
-                        return True
-                    chall = await self._challenge_iframe()
-                    if chall is None or not await self._challenge_rendered(chall):
-                        # After Next the iframe often drops to a loader.
-                        # Wait for the next challenge to paint — do NOT
-                        # treat the dip as "challenge over".
-                        chall = await self._wait_for_image_challenge(timeout=10.0)
-                    if chall is None:
-                        if await read_hcaptcha_token(self._page):
-                            self._log(
-                                "[Captcha] [OK] hCaptcha token minted by the solved "
-                                "challenge - submitting form")
-                            await self._click_form_submit()
-                            for _ in range(8):
-                                await asyncio.sleep(1.0)
-                                if await self._past_captcha():
-                                    return True
-                        break
-                    frame = await self._hcaptcha_frame_for(chall)
-                    if frame is None:
-                        await asyncio.sleep(1.5)
-                        continue
-                    dom = await self._probe_challenge_dom(frame)
-                    prompt = await self._read_challenge_prompt(frame)
-                    if not prompt:
-                        # DOM prompt empty (still painting?) — the payload's
-                        # requester_question is a solid fallback.
-                        prompt = hct.question_text(self._challenge_payload or {})
-                    if not prompt:
-                        self._log("[Captcha] Prompt not readable yet (new round loading?)",
-                                  level="warn")
-                        await asyncio.sleep(2)
-                        continue
-                    family = hct.classify(self._challenge_payload, dom, prompt)
-                    # Live tower wording is a Move-badge drag even when
-                    # /getcaptcha labelled the round image_label_area_select.
-                    if hct.is_tower_prompt(prompt) and family != hct.DRAG_DROP:
-                        self._log(
-                            f"[Captcha] Tower wording — forcing drag-drop "
-                            f"(was {family})")
-                        family = hct.DRAG_DROP
-                    sig = (prompt, family, int((dom or {}).get("tiles") or 0))
-                    # Same prompt + same layout: we already answered this
-                    # grid. Re-clicking tiles TOGGLES them off. Just hit
-                    # Next again and wait for the next challenge.
-                    if last_sig is not None and sig == last_sig:
-                        self._log(
-                            "[Captcha] Same challenge still showing — clicking Next again")
-                        await self._click_challenge_verify(frame)
-                        await asyncio.sleep(1.2)
-                        continue
-                    self._log(
-                        f"[Captcha] Challenge round {round_i + 1} "
-                        f"[{family}/{hct.answer_shape(family)}]: {prompt[:120]}")
-                    if family == hct.DRAG_DROP:
-                        if hct.is_tower_prompt(prompt):
-                            ok = await self._solve_tower_round(frame, prompt)
-                        elif hct.is_pattern_prompt(prompt):
-                            ok = await self._solve_pattern_round(frame, prompt)
-                        else:
-                            ok = await self._solve_drag_round(frame, prompt)
-                    elif family == hct.AREA_POINT:
-                        ok = await self._solve_point_round(frame, prompt,
-                                                           bbox=False)
-                    elif family == hct.AREA_BBOX:
-                        ok = await self._solve_point_round(frame, prompt,
-                                                           bbox=True)
-                    elif family == hct.MULTIPLE_CHOICE:
-                        ok = await self._solve_choice_round(frame, prompt)
-                    elif family == hct.TEXT_ENTRY:
-                        ok = await self._solve_text_round(frame, prompt)
-                    elif family == hct.COUNT:
-                        ok = await self._solve_count_round(frame, prompt)
-                    else:
-                        ok = await self._solve_binary_round(frame, prompt, dom)
-                    if not ok:
-                        self._log("[Captcha] Round not solved - retrying",
-                                  level="warn")
-                        await asyncio.sleep(2)
-                        continue
-                    await asyncio.sleep(0.7)
-                    await self._click_challenge_verify(frame)
-                    last_sig = sig
-                    # Wait for hCaptcha to accept (token minted) OR paint
-                    # the next challenge (new prompt / new layout).
-                    token_seen = False
-                    advanced = False
-                    for _ in range(14):
-                        await asyncio.sleep(0.7)
-                        if await self._past_captcha():
-                            self._log("[Captcha] [OK] Vision solve ACCEPTED - past captcha")
-                            return True
-                        if await read_hcaptcha_token(self._page):
-                            token_seen = True
-                            self._log(
-                                "[Captcha] [OK] hCaptcha token minted by the solved "
-                                "challenge - submitting form")
-                            await self._click_form_submit()
-                            break
-                        c2 = await self._challenge_iframe()
-                        if c2 is None or not await self._challenge_rendered(c2):
-                            continue
-                        f2 = await self._hcaptcha_frame_for(c2)
-                        if f2 is None:
-                            continue
-                        p2 = await self._read_challenge_prompt(f2)
-                        if not p2:
-                            p2 = hct.question_text(self._challenge_payload or {})
-                        d2 = await self._probe_challenge_dom(f2)
-                        fam2 = hct.classify(self._challenge_payload, d2, p2)
-                        sig2 = (p2, fam2, int((d2 or {}).get("tiles") or 0))
-                        if p2 and sig2 != last_sig:
-                            self._log(
-                                f"[Captcha] Next challenge ready: {p2[:80]}")
-                            advanced = True
-                            break
-                    if token_seen:
-                        for _ in range(8):
-                            await asyncio.sleep(1.0)
-                            if await self._past_captcha():
-                                self._log(
-                                    "[Captcha] [OK] Registration submitted after "
-                                    "vision solve")
-                                return True
-                        self._log(
-                            "[Captcha] Form submitted after solve but not past captcha "
-                            "yet - retrying",
-                            level="warn")
-                    elif advanced:
-                        continue
-                self._log("[Captcha] Vision solve not accepted across rounds - retrying",
+            except Exception as e:
+                self._log(f"[AZcaptcha] step error {type(e).__name__}: {e}",
                           level="warn")
-            self._log("[Captcha] [FAIL] Vision solver could not clear the challenge",
-                      level="error")
-            await asyncio.sleep(2)
+
+            # Tiers 3-4 — vision. These do NOT mint a token: they say where
+            # to click, we click it, and the widget mints its own. For
+            # enterprise rqdata that is the only binding that can match.
+            try:
+                if await asyncio.wait_for(self._solve_with_vision_chain(),
+                                          timeout=NONECAP_STEP_BUDGET):
+                    return True
+            except Exception as e:
+                self._log(f"[Vision] step error {type(e).__name__}: {e}",
+                          level="warn")
+
+            # ── NoneCap is the ONLY solver ──────────────────────────
+            # The local vision stack is gone: it never cleared a single
+            # Discord challenge, and every round it "tried" cost 20-45s
+            # of model timeouts plus
+            # stray clicks that are themselves an automation signal.
+            # Failing fast and rotating to a fresh session beats burning
+            # two minutes on a solver that cannot win.
+            self._log("[Captcha] [FAIL] NoneCap could not clear the "
+                      "challenge — rotating session", level="error")
+            await asyncio.sleep(1)
             return False
 
         except Exception as e:
@@ -4440,6 +4645,133 @@ class DiscordAutomation:
         return best;
     }"""
 
+    _RQDATA_JS = r"""() => {
+        // hCaptcha keeps the enterprise config on the widget instance. The
+        // network hook only sees rqdata if /getcaptcha fires while we are
+        // listening, so read it from the live page as well.
+        const seen = [];
+        const push = (v) => {
+            if (typeof v === 'string' && v.length > 8) seen.push(v);
+        };
+        try {
+            for (const el of document.querySelectorAll(
+                    '[data-rqdata], [data-hcaptcha-rqdata]')) {
+                push(el.getAttribute('data-rqdata'));
+                push(el.getAttribute('data-hcaptcha-rqdata'));
+            }
+        } catch (e) {}
+        // hcaptcha.getConfig / internal client registry
+        try {
+            const h = window.hcaptcha;
+            if (h) {
+                for (const k of ['getConfig', 'getWidgetConfig']) {
+                    if (typeof h[k] === 'function') {
+                        const c = h[k]();
+                        if (c) { push(c.rqdata); push(c.rqData); }
+                    }
+                }
+            }
+        } catch (e) {}
+        // Scan inline scripts for an rqdata assignment.
+        try {
+            for (const sc of document.querySelectorAll('script')) {
+                const t = sc.textContent || '';
+                if (t.length > 200000) continue;
+                const m = t.match(
+                    /rqdata["'\s:=]+([A-Za-z0-9+/=._-]{16,})/i);
+                if (m) push(m[1]);
+            }
+        } catch (e) {}
+        return seen.length ? seen[0] : '';
+    }"""
+
+    async def _live_rqdata(self, budget: float = 8.0) -> str:
+        """Best-effort read of the enterprise rqdata from the live page.
+
+        EVERY evaluate here is individually timed out and the whole search
+        is capped by ``budget``. A cross-origin hCaptcha frame can accept
+        an evaluate and simply never answer, which previously hung the
+        entire captcha step with no log line at all.
+        """
+        cached = getattr(self, "_rqdata", "") or ""
+        if cached:
+            return cached
+        # 1) the /getcaptcha payload, if the response hook stored one
+        try:
+            payload = self._read_challenge_payload() or {}
+            for key in ("rqdata", "rqData", "req"):
+                val = payload.get(key)
+                if isinstance(val, str) and len(val) > 8:
+                    self._rqdata = val
+                    self._log(f"[Captcha] rqdata from challenge payload "
+                              f"({len(val)} chars)")
+                    return val
+        except Exception:
+            pass
+        # 2) the live widget config / DOM / inline scripts
+        deadline = time.time() + budget
+        targets = [self._page]
+        try:
+            targets += list(getattr(self._page, "frames", []) or [])[:8]
+        except Exception:
+            pass
+        for target in targets:
+            if time.time() >= deadline:
+                self._log("[Captcha] rqdata search hit its time budget",
+                          level="debug")
+                break
+            try:
+                val = await asyncio.wait_for(
+                    target.evaluate(self._RQDATA_JS), timeout=2.0)
+            except Exception:
+                continue
+            if isinstance(val, str) and len(val) > 8:
+                self._rqdata = val
+                self._log(f"[Captcha] rqdata read from the live page "
+                          f"({len(val)} chars)")
+                return val
+        return ""
+
+    def _solver_proxy_url(self) -> str:
+        """The egress the solver must mint the token through.
+
+        Discord's enterprise rqdata is bound to the exit IP that asked for
+        the challenge. If NoneCap solves on its own IP while we register
+        from ours, the binding breaks -> invalid-response, every time.
+
+        Returns "" when there is nothing shareable (TOR is a local SOCKS
+        port the solver cannot reach), which the caller reports plainly.
+        """
+        override = (os.environ.get("NONECAP_PROXY") or "").strip()
+        if override:
+            return override
+        p = self.proxy
+        if not isinstance(p, dict):
+            return ""
+        user = str(p.get("username") or "").strip()
+        pwd = str(p.get("password") or "").strip()
+        # Pool entries are {proto, host, port, username, password}; the
+        # Playwright form is {server, username, password}. Accept BOTH —
+        # reading only `server` returned "" for real pool sessions and
+        # silently dropped the solver back to its own IP.
+        server_url = str(p.get("server") or "").strip()
+        if not server_url:
+            host = str(p.get("host") or "").strip()
+            port = str(p.get("port") or "").strip()
+            if host:
+                proto = str(p.get("proto") or "http").strip() or "http"
+                server_url = f"{proto}://{host}:{port}" if port \
+                    else f"{proto}://{host}"
+        if not server_url:
+            return ""
+        if user and "@" not in server_url:
+            scheme, _, hostport = server_url.partition("://")
+            if hostport:
+                return f"{scheme}://{user}:{pwd}@{hostport}"
+        return server_url
+
+
+
     async def _challenge_surface(self, frame):
         """(screenshot bytes, page-space box) of the biggest canvas/image in
         the challenge frame — the click surface for point/bbox/drag rounds."""
@@ -4458,8 +4790,38 @@ class DiscordAutomation:
             import io as _io
             im = Image.open(_io.BytesIO(raw)).convert("RGB")
             x0 = int(info["x"]); y0 = int(info["y"])
-            crop = im.crop((x0, y0, x0 + int(info["width"]),
-                            y0 + int(info["height"])))
+            x1 = x0 + int(info["width"])
+            y1 = y0 + int(info["height"])
+            # The rect comes from getBoundingClientRect INSIDE the frame,
+            # but frame.screenshot() is not always that same coordinate
+            # space (device pixel ratio, or the element sitting in a nested
+            # document). A crop that lands off-image returns solid black —
+            # which is exactly the "0 contours on every round" symptom.
+            iw, ih = im.size
+            # Clamp to a VALID rect. An element scrolled out of view gives
+            # negative or beyond-image coords, and PIL then raises
+            # "Coordinate 'right' is less than 'left'" — which killed every
+            # drag round with "Surface screenshot failed".
+            cx0 = max(0, min(x0, iw - 1))
+            cy0 = max(0, min(y0, ih - 1))
+            cx1 = max(cx0 + 1, min(x1, iw))
+            cy1 = max(cy0 + 1, min(y1, ih))
+            if (cx1 - cx0) < 60 or (cy1 - cy0) < 60:
+                self._log(f"[Captcha] Element rect ({x0},{y0},{x1},{y1}) is "
+                          f"outside the {iw}x{ih} frame — using the whole "
+                          f"frame", level="warn")
+                cx0, cy0, cx1, cy1 = 0, 0, iw, ih
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
+            crop = im.crop((cx0, cy0, cx1, cy1))
+            if not self._surface_is_usable(crop):
+                self._log(f"[Captcha] Cropped surface looks blank "
+                          f"({crop.size[0]}x{crop.size[1]} of {iw}x{ih} at "
+                          f"{x0},{y0}) — using the whole frame instead",
+                          level="warn")
+                crop = im
+                box = {"x": ox, "y": oy, "width": float(iw),
+                       "height": float(ih)}
             buf = _io.BytesIO()
             crop.save(buf, "JPEG", quality=92)
             return buf.getvalue(), box
@@ -4471,192 +4833,1163 @@ class DiscordAutomation:
         """Normalised 0..1 point -> page coordinates inside `box` (clamped)."""
         return hct.denorm(point, box)
 
-    # lazy offline solvers — return None when torch/weights are absent
-    def _tile_classifier(self):
-        if self._cnn_tile is None:
-            try:
-                from tile_classifier import TileClassifier
-                c = TileClassifier()
-                self._cnn_tile = c if c.available else False
-            except Exception:
-                self._cnn_tile = False
-        return self._cnn_tile or None
+    async def _click_challenge_tiles(self, frame, indices) -> bool:
+        """Humanized clicks on the given 1-based tile indices (reading order).
 
-    def _point_locator(self):
-        if self._cnn_point is None:
+        hCaptcha grades pointer telemetry, so a bare element.click() in a
+        tight loop is an automation tell. Each tile gets a Bezier glide to a
+        gaussian landing point inside its box (frame origin applied) with a
+        real down/dwell/up, and a human 0.18-0.55 s pause between tiles.
+        element.click() remains only as a last-resort fallback."""
+        for sel in ('div.task-image, [class*="task-image" i]',
+                    '.task-grid img, [class*="task-grid" i] img, '
+                    '.challenge-content img'):
             try:
-                from tile_classifier import PointLocator
-                c = PointLocator()
-                self._cnn_point = c if c.available else False
+                n = await frame.locator(sel).count()
             except Exception:
-                self._cnn_point = False
-        return self._cnn_point or None
+                continue
+            if n == 0:
+                continue
+            # tile rects are frame-local (getBoundingClientRect); add the
+            # iframe's own page offset once
+            try:
+                rects = await frame.evaluate("""(sel) => {
+                    const out = [];
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        out.push({ x: r.left, y: r.top,
+                                   width: r.width, height: r.height });
+                    }
+                    return out;
+                }""", sel)
+            except Exception:
+                rects = None
+            ox, oy = await self._frame_origin(frame)
+            clicked = 0
+            for idx in indices:
+                if not (isinstance(idx, int) and 1 <= idx <= n):
+                    continue
+                done = False
+                if rects and len(rects) >= idx:
+                    r = rects[idx - 1]
+                    if r and r.get("width"):
+                        try:
+                            await hm.click_box(self._page, {
+                                "x": r["x"] + ox, "y": r["y"] + oy,
+                                "width": r["width"], "height": r["height"]})
+                            done = True
+                        except Exception:
+                            done = False
+                if not done:
+                    try:
+                        await frame.locator(sel).nth(idx - 1).click(timeout=5000)
+                        done = True
+                    except Exception:
+                        continue
+                clicked += 1
+                await asyncio.sleep(random.uniform(0.18, 0.55))
+            if clicked:
+                return True
+        return False
 
-    def _drag_locator(self):
-        if self._cnn_drag is None:
+    async def _type_challenge_answer(self, frame, text: str) -> bool:
+        """Fill the answer input for 'type the characters' challenges."""
+        try:
+            inp = frame.locator('input[type="text"], input:not([type]), textarea').first
+            await inp.click(timeout=4000)
+            await inp.fill(text, timeout=4000)
+            self._log("[Captcha] Typed challenge answer")
+            return True
+        except Exception:
+            return False
+
+    async def _piece_signature(self, frame):
+        """Cheap fingerprint of the challenge surface, used to tell whether
+        a drag actually moved anything (vs the piece springing back)."""
+        try:
+            shot, _ = await self._challenge_surface(frame)
+        except Exception:
+            return None
+        if not shot:
+            return None
+        try:
+            import hashlib
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(shot)).convert("L").resize((64, 64))
+            return hashlib.md5(im.tobytes()).hexdigest()
+        except Exception:
+            return None
+
+    async def _drag_verified(self, frame, src, dst) -> bool:
+        """Drag, CHECK it stuck, and escalate the gesture if it snapped back.
+
+        hCaptcha drag widgets are built three different ways (raw pointer
+        tracking, HTML5 drag-and-drop, pointer-capture) and the wrong
+        channel leaves the piece exactly where it started. Rather than
+        guess, try each and verify against a before/after fingerprint of
+        the surface — the piece landing somewhere new changes the pixels.
+        """
+        strategies = (
+            ("pointer", hm.drag),
+            ("slow-pointer", hm.drag_slow),
+            ("html5-dnd", hm.drag_html5),
+            ("pointer-events", hm.drag_pointer_events),
+        )
+        for name, fn in strategies:
+            before = await self._piece_signature(frame)
             try:
-                from tile_classifier import DragLocator
-                c = DragLocator()
-                self._cnn_drag = c if c.available else False
+                res = await fn(self._page, src, dst)
+            except Exception as e:
+                self._log(f"[Captcha] Drag via {name} errored: "
+                          f"{type(e).__name__}", level="warn")
+                continue
+            if isinstance(res, str) and res not in ("ok", None):
+                self._log(f"[Captcha] Drag via {name}: {res}", level="debug")
+            await asyncio.sleep(0.6)
+            after = await self._piece_signature(frame)
+            if before is None or after is None:
+                # Cannot verify — assume the gesture landed.
+                self._log(f"[Captcha] Drag via {name} (unverified)")
+                return True
+            if before != after:
+                self._log(f"[Captcha] Drag via {name} STUCK "
+                          f"(surface changed)")
+                if self._events is not None:
+                    self._events.report_nowait(
+                        "pass", stage="drag_gesture", gesture=name)
+                return True
+            self._log(f"[Captcha] Drag via {name} snapped back — "
+                      f"trying the next gesture", level="warn")
+        self._log("[Captcha] All drag gestures snapped back", level="warn")
+        if self._events is not None:
+            self._events.report_nowait("fail", stage="drag_gesture",
+                                       gesture="all-failed")
+        return False
+
+    async def _solve_with_vision_chain(self) -> bool:
+        """Tiers 3-4: a VLM says where to click; the WIDGET mints the token.
+
+        This is the important difference from the token tiers. NoneCap and
+        AZcaptcha hand us a token minted elsewhere, which Discord's
+        enterprise sitekey then has to accept. Here we never import a
+        token: the model returns coordinates, our own humanized mouse
+        clicks them, and hCaptcha mints its own token inside the session
+        it has already been scoring. There is no rqdata binding to
+        mismatch, because the widget knows its own challenge.
+        """
+        try:
+            import solver_chain
+        except Exception:
+            return False
+        avail = solver_chain.available()
+        tiers = []
+        if avail.get("openrouter"):
+            tiers.append(("openrouter", 3))
+        if avail.get("google"):
+            tiers.append(("google", 4))
+        if not tiers:
+            return False
+
+        chall = await self._challenge_iframe()
+        if chall is None:
+            return False
+        frame = await self._hcaptcha_frame_for(chall)
+        if frame is None:
+            return False
+        prompt = await self._read_challenge_prompt(frame)
+        if not prompt:
+            self._log("[Vision] No prompt readable yet", level="warn")
+            return False
+
+        dom = await self._probe_challenge_dom(frame)
+        family = hct.classify(self._challenge_payload, dom, prompt)
+        shape = hct.answer_shape(family)
+        self._log(f"[Vision] Challenge [{family}/{shape}]: {prompt[:90]}")
+
+        # Grid rounds send every tile; everything else sends the canvas.
+        images: list = []
+        box = None
+        if shape == "tiles":
+            images = await self._grab_challenge_tiles(frame)
+        if not images:
+            shot, box = await self._challenge_surface(frame)
+            if not shot:
+                self._log("[Vision] No usable surface", level="warn")
+                return False
+            images = [shot]
+
+        for provider, tier in tiers:
+            solver = solver_chain.VisionSolver(provider, log=self._log)
+            if not solver.enabled:
+                continue
+            self._log(f"[Vision] Tier {tier}: {provider} ({solver.model})")
+            answer = await solver.solve(prompt, images, shape=shape)
+            if not answer:
+                continue
+            if await self._apply_vision_answer(frame, answer, box):
+                # Let the widget mint and the page settle.
+                for _ in range(10):
+                    await asyncio.sleep(1.0)
+                    if await self._past_captcha():
+                        self._log("[Vision] [OK] Challenge cleared — the "
+                                  "WIDGET minted the token")
+                        return True
+                    tok = await read_hcaptcha_token(self._page)
+                    if tok:
+                        self._log(f"[Vision] Widget minted a token "
+                                  f"({len(tok)} chars) — submitting")
+                        await self._click_form_submit()
+                        for _ in range(8):
+                            await asyncio.sleep(1.0)
+                            if await self._past_captcha():
+                                return True
+                        break
+                self._log(f"[Vision] Tier {tier} answered but the round did "
+                          f"not clear", level="warn")
+        return False
+
+    async def _grab_challenge_tiles(self, frame) -> list:
+        """Screenshot each tile of a grid round, in reading order."""
+        out: list = []
+        for sel in ('div.task-image, [class*="task-image" i]',
+                    '.task-grid img, [class*="task-grid" i] img'):
+            try:
+                loc = frame.locator(sel)
+                n = await loc.count()
             except Exception:
-                self._cnn_drag = False
-        return self._cnn_drag or None
+                continue
+            if n < 4:
+                continue
+            for i in range(min(n, 9)):
+                try:
+                    raw = await loc.nth(i).screenshot()
+                    if raw:
+                        out.append(raw)
+                except Exception:
+                    pass
+            if out:
+                break
+        return out
+
+    async def _apply_vision_answer(self, frame, answer: dict,
+                                   box) -> bool:
+        """Execute a vision answer with humanized input."""
+        kind = answer.get("type")
+        try:
+            if kind == "tiles":
+                idx = answer.get("indices") or []
+                if not idx:
+                    self._log("[Vision] No tiles selected", level="warn")
+                    return False
+                ok = await self._click_challenge_tiles(frame, idx)
+                if ok:
+                    await self._click_challenge_verify(frame)
+                return ok
+            if kind == "points" and box:
+                for pt in (answer.get("points") or [])[:4]:
+                    x, y = self._denorm(pt, box)
+                    await hm.click(self._page, x, y)
+                    await asyncio.sleep(random.uniform(0.25, 0.6))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "drag" and box:
+                fx, fy = self._denorm(answer["from"], box)
+                tx, ty = self._denorm(answer["to"], box)
+                self._log(f"[Vision] Dragging ({fx:.0f},{fy:.0f}) -> "
+                          f"({tx:.0f},{ty:.0f})")
+                await self._drag_verified(frame, (fx, fy), (tx, ty))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "bbox" and box:
+                bb = answer["bbox"]
+                x1, y1 = self._denorm((bb["x1"], bb["y1"]), box)
+                x2, y2 = self._denorm((bb["x2"], bb["y2"]), box)
+                await hm.drag(self._page, (x1, y1), (x2, y2))
+                await self._click_challenge_verify(frame)
+                return True
+            if kind == "text":
+                if await self._type_challenge_answer(frame,
+                                                     answer.get("text", "")):
+                    await self._click_challenge_verify(frame)
+                    return True
+                return False
+            if kind == "count":
+                if await self._type_challenge_answer(
+                        frame, str(answer.get("count", ""))):
+                    await self._click_challenge_verify(frame)
+                    return True
+                return False
+        except Exception as e:
+            self._log(f"[Vision] Could not apply answer: "
+                      f"{type(e).__name__}: {e}", level="warn")
+        return False
+
+    async def _solve_with_nonecap(self) -> bool:
+        """Clear the challenge with the hosted NoneCap solver.
+
+        Returns True only when a token was minted AND the page moved past
+        the captcha. Any failure falls through to the local vision
+        pipeline, so this is strictly additive.
+        """
+        try:
+            import nonecap_solver
+        except Exception as e:
+            self._log(f"[NoneCap] module unavailable: {type(e).__name__}",
+                      level="warn")
+            return False
+        if not nonecap_solver.configured():
+            # Say WHY, once per attempt — silence here is what made the
+            # last run look like NoneCap was never wired in at all.
+            if not getattr(self, "_nonecap_warned", False):
+                self._nonecap_warned = True
+                reason = ("NONECAP_API not set" if not nonecap_solver.api_key()
+                          else "disabled via NONECAP_ENABLED")
+                self._log(f"[NoneCap] Skipped: {reason}", level="warn")
+            return False
+        self._log("[NoneCap] Starting hosted solve")
+        if self._nonecap is None:
+            self._nonecap = nonecap_solver.NoneCapSolver(log=self._log)
+
+        # Sitekey: cached from the widget probe, else read it live.
+        sitekey = getattr(self, "_hcaptcha_sitekey", "") or ""
+        if not sitekey:
+            try:
+                sitekey = await asyncio.wait_for(
+                    extract_hcaptcha_sitekey(self._page), timeout=10.0) or ""
+                if sitekey:
+                    self._hcaptcha_sitekey = sitekey
+            except Exception as e:
+                self._log(f"[NoneCap] sitekey read failed: "
+                          f"{type(e).__name__}", level="warn")
+                sitekey = ""
+        if not sitekey:
+            self._log("[NoneCap] No sitekey yet — using the local solver",
+                      level="warn")
+            return False
+
+        try:
+            page_url = await asyncio.wait_for(
+                self._page.evaluate("() => location.href"), timeout=5.0)
+        except Exception:
+            page_url = "https://discord.com/register"
+
+        if not self._solver_proxy_url():
+            self._log(
+                "[NoneCap] No shareable egress — the solver will mint on "
+                "ITS IP while we register from TOR. Discord's rqdata is "
+                "IP-bound, so this is expected to return invalid-response. "
+                "Set NONECAP_PROXY (or use a residential proxy) to fix it.",
+                level="warn")
+        # Discord's /auth/register 400 is the authoritative source for
+        # rqdata — it is the blob Discord itself will validate against.
+        rqdata = await self._live_rqdata()
+        if not rqdata:
+            self._log("[NoneCap] No enterprise rqdata found — solving as "
+                      "plain hCaptcha (Discord binds tokens to rqdata, so "
+                      "this usually gets rejected)", level="warn")
+        tries = max(1, nonecap_solver.NONECAP_TRIES)
+        for attempt in range(1, tries + 1):
+            if self._stopped.is_set():
+                return False
+            if await self._past_captcha():
+                return True
+            if attempt > 1:
+                # Discord issues a NEW challenge with invalid-response, so a
+                # retry MUST rebind to it — same rqdata twice can only fail.
+                #
+                # Do NOT wipe self._rqdata here: the 400 handler has ALREADY
+                # stored the fresh blob, and clearing it made _live_rqdata()
+                # fall back to the stale /getcaptcha payload — which is why
+                # attempt 2 logged the same rqdata hash as attempt 1.
+                fresh = await self._live_rqdata()
+                if fresh and fresh != rqdata:
+                    self._log(f"[NoneCap] retry bound to the FRESH challenge "
+                              f"({len(fresh)} chars)")
+                    rqdata = fresh
+                elif fresh:
+                    # Give the widget a moment to fetch the new challenge,
+                    # then look again. Re-solving a refused blob is a
+                    # guaranteed failure and a wasted credit.
+                    for _ in range(6):
+                        await asyncio.sleep(1.0)
+                        again = await self._live_rqdata()
+                        if again and again != rqdata:
+                            fresh = again
+                            break
+                    if fresh != rqdata:
+                        self._log(f"[NoneCap] retry bound to the FRESH "
+                                  f"challenge after waiting "
+                                  f"({len(fresh)} chars)")
+                        rqdata = fresh
+                    else:
+                        self._log("[NoneCap] retry: challenge did NOT rotate "
+                                  "— re-solving the same rqdata cannot pass",
+                                  level="warn")
+            self._log(f"[NoneCap] Attempt {attempt}/{tries}"
+                      + (" (enterprise" if rqdata else " (plain")
+                      + (", invisible)"
+                         if getattr(self, "_captcha_invisible", False)
+                         else ")"))
+            # Print the EXACT solve parameters. If a token that looks
+            # perfect keeps getting refused, the answer is in here — a
+            # stale rqdata, the wrong url, or a sitekey that does not
+            # match the widget.
+            import hashlib as _h
+            _rqh = _h.md5(rqdata.encode()).hexdigest()[:8] if rqdata else "-"
+            self._log(f"[NoneCap]   sitekey={sitekey} url={page_url} "
+                      f"rqdata={len(rqdata)}ch/{_rqh} "
+                      f"rqtoken={'yes' if getattr(self, '_rqtoken', '') else 'no'} "
+                      f"session={'yes' if getattr(self, '_captcha_session_id', '') else 'no'}")
+            # hCaptcha binds the token to the solving IP and UA. Give
+            # NoneCap the same ones this browser is using, or Discord
+            # answers invalid-response even for a perfect solve.
+            # NB: user_agent is deprecated in the API and ignored — the
+            # solver presents its own coherent identity. Sending ours made
+            # the request contradict itself.
+            invisible = bool(getattr(self, "_captcha_invisible", False))
+            # rqdata is welded to the EXIT IP that requested the challenge.
+            # A token minted on the solver's own IP breaks that binding and
+            # comes back invalid-response, so forward our egress.
+            egress = self._solver_proxy_url()
+            # Snapshot the challenge this token will be bound to. The
+            # /auth/register response hook fires while we are awaiting the
+            # solve and replaces self._rqtoken / _captcha_session_id with
+            # the NEXT challenge's values — sending those alongside THIS
+            # token is an automatic invalid-response.
+            solved_rqdata = rqdata
+            solved_rqtoken = getattr(self, "_rqtoken", "") or ""
+            solved_session = getattr(self, "_captcha_session_id", "") or ""
+            self._solved_rqdata = solved_rqdata
+            token = await self._nonecap.solve(sitekey, str(page_url),
+                                              rqdata=rqdata,
+                                              proxy=egress)
+            if token:
+                self._captcha_respkey = getattr(
+                    self._nonecap, "last_resp_key", "") or ""
+            if not token:
+                # Failed solves are not charged, so retrying is free.
+                if self._nonecap.last_error in ("authentication",
+                                                "insufficient credits",
+                                                "not configured"):
+                    self._log("[NoneCap] Unrecoverable — falling back to "
+                              "the local solver", level="warn")
+                    return False
+                continue
+            if await self._apply_hcaptcha_token(
+                    token, solved_rqtoken=solved_rqtoken,
+                    solved_session=solved_session):
+                self._log("[Captcha] [OK] NoneCap token accepted — "
+                          "challenge cleared")
+                if self._events is not None:
+                    self._events.report_nowait(
+                        "pass", stage="nonecap", attempt=attempt)
+                await self._nonecap.report(self._nonecap.last_solve_id, True)
+                return True
+            self._log(f"[NoneCap] Token was not accepted "
+                      f"(attempt {attempt}/{tries})", level="warn")
+            await self._nonecap.report(self._nonecap.last_solve_id, False,
+                                       "page did not advance")
+        if self._events is not None:
+            self._events.report_nowait("fail", stage="nonecap",
+                                       attempt=tries)
+        self._log("[NoneCap] Out of attempts — falling back to the local "
+                  "solver", level="warn")
+        # State the conclusion plainly instead of leaving it to be pieced
+        # together from twenty lines.
+        self._log(
+            "[NoneCap] ================ VERDICT ================",
+            level="warn")
+        self._log(
+            f"[NoneCap] {tries} tokens delivered to Discord, all rejected "
+            f"with invalid-response.", level="warn")
+        self._log(
+            "[NoneCap] Verified correct this run: sitekey matches Discord's, "
+            "rqdata fresh per attempt (hashes differ), rqtoken + session_id "
+            "echoed, resp_key sent, headers X-Captcha-Key/-Rqtoken/"
+            "-Session-Id/-Respkey present, register POST reached the API "
+            "(real HTTP 400, not 0), solve minted through OUR proxy exit.",
+            level="warn")
+        self._log(
+            "[NoneCap] Every request parameter is now verified byte-correct, "
+            "including the rqdata/rqtoken/session pinning fixed in 1b0f996 "
+            "(solved-with and sent-with hashes match on every attempt).",
+            level="warn")
+        self._log(
+            "[NoneCap] Remaining cause: the token is refused by hCaptcha "
+            "itself. NoneCap's API accepts only {type, sitekey, url, "
+            "rqdata, proxy} — it has NO rqtoken parameter — so the solve "
+            "is bound to rqdata alone. If Discord's enterprise sitekey "
+            "also binds the token to captcha_rqtoken, no caller can "
+            "satisfy that through this API.", level="warn")
+        self._log(
+            f"[NoneCap] ASK NONECAP: 'Does solve id "
+            f"{getattr(self._nonecap, 'last_solve_id', '?')} "
+            "(sitekey a9b5fb07-92ff-493f-86fe-352a2803b3df, "
+            "hcaptcha_enterprise, invisible, fresh rqdata, own proxy) "
+            "produce a token Discord accepts? Discord returns "
+            "invalid-response on every one. Do you support Discord "
+            "registration, and does your API take captcha_rqtoken?'",
+            level="warn")
+        self._log(
+            "[NoneCap] =========================================",
+            level="warn")
+        return False
+
+    async def _solve_with_azcaptcha(self) -> bool:
+        """Tier 2: AZcaptcha token, submitted exactly like NoneCap's."""
+        try:
+            import solver_chain
+        except Exception:
+            return False
+        if not solver_chain.AZCAPTCHA_KEY():
+            return False
+        sitekey = getattr(self, "_hcaptcha_sitekey", "") or ""
+        if not sitekey:
+            try:
+                sitekey = await asyncio.wait_for(
+                    extract_hcaptcha_sitekey(self._page), timeout=10.0) or ""
+            except Exception:
+                sitekey = ""
+        if not sitekey:
+            return False
+        rqdata = await self._live_rqdata()
+        solved_rqtoken = getattr(self, "_rqtoken", "") or ""
+        solved_session = getattr(self, "_captcha_session_id", "") or ""
+        try:
+            page_url = await asyncio.wait_for(
+                self._page.evaluate("() => location.href"), timeout=5.0)
+        except Exception:
+            page_url = "https://discord.com/register"
+
+        az = solver_chain.AZCaptcha(log=self._log)
+        self._log("[AZcaptcha] Tier 2 — hosted token")
+        token = await az.solve(sitekey, str(page_url), rqdata=rqdata,
+                               invisible=bool(getattr(
+                                   self, "_captcha_invisible", True)),
+                               proxy=self._solver_proxy_url())
+        if not token:
+            return False
+        self._captcha_respkey = ""
+        if await self._apply_hcaptcha_token(
+                token, solved_rqtoken=solved_rqtoken,
+                solved_session=solved_session):
+            self._log("[AZcaptcha] [OK] Token accepted")
+            return True
+        self._log("[AZcaptcha] Token rejected", level="warn")
+        return False
+
+    # Setting textarea.value is not enough on a React form: React tracks
+    # the value on its own internal node property, so a plain assignment is
+    # invisible to it and the app never learns the captcha was solved. Use
+    # the native setter, then dispatch, then call hCaptcha's OWN registered
+    # callback — that is what the host page actually listens to.
+    _INJECT_TOKEN_JS = r"""(tok) => {
+        const out = {fields: 0, callbacks: 0, react: false};
+
+        const setNative = (el, value) => {
+            try {
+                const proto = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const d = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (d && d.set) { d.set.call(el, value); out.react = true; }
+                else { el.value = value; }
+            } catch (e) { el.value = value; }
+        };
+
+        const docs = [document];
+        try {
+            for (const f of Array.from(window.frames)) {
+                try { if (f.document) docs.push(f.document); } catch (e) {}
+            }
+        } catch (e) {}
+
+        for (const doc of docs) {
+            for (const sel of ['textarea[name="h-captcha-response"]',
+                               'input[name="h-captcha-response"]',
+                               'textarea[name="g-recaptcha-response"]',
+                               '[name="h-captcha-response"]']) {
+                let els = [];
+                try { els = doc.querySelectorAll(sel); } catch (e) {}
+                for (const el of els) {
+                    setNative(el, tok);
+                    try { el.innerHTML = tok; } catch (e) {}
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    out.fields++;
+                }
+            }
+        }
+
+        // hCaptcha keeps every widget's config (including the page's
+        // success callback) in its client registry. Invoking that callback
+        // is what tells the host app the captcha passed.
+        const tryCall = (fn) => {
+            if (typeof fn !== 'function') return false;
+            try { fn(tok); out.callbacks++; return true; } catch (e) {}
+            return false;
+        };
+        try {
+            const h = window.hcaptcha;
+            if (h) {
+                // Make getResponse() return our token for any later read.
+                try { h.getResponse = () => tok; } catch (e) {}
+                for (const k of ['getConfig', 'getWidgetConfig']) {
+                    if (typeof h[k] === 'function') {
+                        try {
+                            const c = h[k]();
+                            if (c) {
+                                tryCall(c.callback);
+                                tryCall(c['callback']);
+                            }
+                        } catch (e) {}
+                    }
+                }
+                // Internal registries used by the widget bundle.
+                for (const key of Object.keys(h)) {
+                    try {
+                        const v = h[key];
+                        if (v && typeof v === 'object') {
+                            for (const kk of Object.keys(v)) {
+                                const w = v[kk];
+                                if (w && typeof w === 'object' && w.callback)
+                                    tryCall(w.callback);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+
+        // Callbacks named in the markup: data-callback="fnName".
+        try {
+            for (const el of document.querySelectorAll('[data-callback]')) {
+                const name = el.getAttribute('data-callback');
+                if (name && typeof window[name] === 'function')
+                    tryCall(window[name]);
+            }
+        } catch (e) {}
+        for (const key of ['hcaptchaCallback', 'onHcaptchaSuccess',
+                           'captchaCallback', 'onCaptchaResponse',
+                           'hcaptchaOnLoad']) {
+            tryCall(window[key]);
+        }
+        return out;
+    }"""
+
+    # Patch fetch/XHR so Discord's OWN register call carries our token.
+    # The React app does not read textarea[name=h-captcha-response]; it
+    # sends {captcha_key, captcha_rqtoken} in the /auth/register body. Any
+    # token we inject into the DOM is simply never looked at.
+    _CAPTCHA_HOOK_JS = r"""() => {
+        if (window.__ncHookInstalled) return 'already';
+        window.__ncHookInstalled = true;
+        window.__ncToken = window.__ncToken || '';
+        window.__ncRqToken = window.__ncRqToken || '';
+        window.__ncInjections = 0;
+
+        const isAuth = (u) => {
+            try {
+                const s = String(u || '');
+                return s.indexOf('/api/') !== -1 &&
+                    (s.indexOf('/auth/register') !== -1 ||
+                     s.indexOf('/auth/login') !== -1);
+            } catch (e) { return false; }
+        };
+
+        window.__ncSeen = [];        // every auth request we observed
+        window.__ncLastBodyKeys = '';
+
+        const addCaptcha = (bodyText) => {
+            let obj;
+            try { obj = JSON.parse(bodyText || '{}'); }
+            catch (e) {
+                window.__ncSeen.push('unparseable-body');
+                return bodyText;
+            }
+            if (!obj || typeof obj !== 'object') {
+                window.__ncSeen.push('non-object-body');
+                return bodyText;
+            }
+            if (window.__ncDirectInflight) {
+                window.__ncSeen.push('own-direct-request');
+                return bodyText;
+            }
+            if (!window.__ncToken) {
+                window.__ncSeen.push('no-token-yet');
+                return bodyText;
+            }
+            obj.captcha_key = window.__ncToken;
+            if (window.__ncRqToken) obj.captcha_rqtoken = window.__ncRqToken;
+            window.__ncInjections++;
+            window.__ncLastBodyKeys = Object.keys(obj).join(',');
+            window.__ncSeen.push('injected');
+            return JSON.stringify(obj);
+        };
+
+        // fetch
+        const of = window.fetch;
+        window.fetch = function (input, init) {
+            try {
+                const url = (typeof input === 'string')
+                    ? input : (input && input.url);
+                if (isAuth(url) && init && init.body &&
+                        typeof init.body === 'string') {
+                    init = Object.assign({}, init,
+                                         {body: addCaptcha(init.body)});
+                }
+            } catch (e) {}
+            return of.apply(this, arguments);
+        };
+
+        // XMLHttpRequest
+        const oo = XMLHttpRequest.prototype.open;
+        const os = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) {
+            this.__ncUrl = u;
+            return oo.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function (body) {
+            try {
+                if (isAuth(this.__ncUrl) && typeof body === 'string') {
+                    arguments[0] = addCaptcha(body);
+                }
+            } catch (e) {}
+            return os.apply(this, arguments);
+        };
+        return 'installed';
+    }"""
+
+    def _mutate_register_body(self, url: str, body):
+        """Insert captcha_key/captcha_rqtoken into a register POST body."""
+        token = getattr(self, "_pending_captcha_token", "") or ""
+        if not token or not body:
+            return None
+        # Never rewrite our OWN direct submit: it already carries the
+        # captcha headers, and re-encoding the body corrupted it.
+        if getattr(self, "_nc_direct_inflight", False):
+            return None
+        low = url.lower()
+        if "/api/" not in low:
+            return None
+        if not any(p in low for p in ("/auth/register", "/auth/login")):
+            return None
+        try:
+            obj = json.loads(body)
+        except Exception:
+            self._cdp_inject_note = "body-not-json"
+            return None
+        if not isinstance(obj, dict):
+            return None
+        obj["captcha_key"] = token
+        rqt = getattr(self, "_rqtoken", "") or ""
+        if rqt:
+            obj["captcha_rqtoken"] = rqt
+        self._cdp_injections = getattr(self, "_cdp_injections", 0) + 1
+        self._cdp_inject_note = "injected:" + ",".join(obj.keys())
+        self._log(f"[Captcha] CDP injected captcha_key into "
+                  f"{url.split('/api')[-1][:40]}")
+        return json.dumps(obj)
+
+    async def _install_cdp_captcha_interceptor(self) -> bool:
+        """Rewrite the register body at the network layer.
+
+        The JS hook is defeated when Discord issues the request outside our
+        patched context — the live log proved it: hook installed, yet
+        injections=0 and seen=[] (the hook observed no register request at
+        all). Fetch.requestPaused sees every request regardless.
+        """
+        if getattr(self, "_cdp_interceptor_on", False):
+            return True
+        fn = getattr(self._page, "intercept_request_bodies", None)
+        if not callable(fn):
+            return False
+        try:
+            ok = await asyncio.wait_for(
+                fn(["/auth/register", "/auth/login"],
+                   self._mutate_register_body), timeout=10.0)
+        except Exception as e:
+            self._log(f"[Captcha] CDP interceptor failed: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+        if ok:
+            self._cdp_interceptor_on = True
+            self._log("[Captcha] CDP request interceptor active "
+                      "(network-layer token injection)")
+        return bool(ok)
+
+    async def _disarm_cdp_captcha_interceptor(self) -> None:
+        """Turn Fetch interception back off.
+
+        A paused-request domain left enabled after we stop listening is a
+        page-wide stall waiting to happen.
+        """
+        if not getattr(self, "_cdp_interceptor_on", False):
+            return
+        self._cdp_interceptor_on = False
+        try:
+            fn = getattr(self._page, "disable_request_interception", None)
+            if callable(fn):
+                await asyncio.wait_for(fn(), timeout=8.0)
+                self._log("[Captcha] CDP request interceptor disarmed")
+        except Exception:
+            pass
+
+    async def _install_captcha_hook_early(self) -> None:
+        """Install the request hook as soon as the page exists.
+
+        Also registered as an init script so it survives navigation — the
+        register POST can fire before any of our later code runs.
+        """
+        try:
+            add_init = getattr(self._page, "add_init_script", None)
+            if callable(add_init):
+                await asyncio.wait_for(
+                    add_init(f"({self._CAPTCHA_HOOK_JS})();"), timeout=8.0)
+        except Exception:
+            pass
+        try:
+            await self._install_captcha_hook()
+        except Exception:
+            pass
+        # NB: the CDP Fetch interceptor is deliberately NOT armed here.
+        # Fetch.enable PAUSES every matching request until we continue it,
+        # so leaving it on for the whole session risks stalling the page
+        # (observed: 'Form never rendered after 75s'). It is armed only
+        # once a token exists, and disarmed straight after the submit.
+
+    async def _install_captcha_hook(self) -> bool:
+        """Install the fetch/XHR patch (idempotent)."""
+        try:
+            res = await asyncio.wait_for(
+                self._page.evaluate(self._CAPTCHA_HOOK_JS), timeout=8.0)
+            if res == "installed":
+                self._log("[Captcha] Register-request hook installed")
+            return bool(res)
+        except Exception as e:
+            # A dead/naviating page is normal here — the hook is
+            # re-installed when the token arrives, so this is not an error
+            # worth a warning on every attempt.
+            self._log(f"[Captcha] Register hook deferred "
+                      f"({type(e).__name__})", level="debug")
+            return False
+
+    _DIRECT_REGISTER_JS = r"""(p) => {
+        // Replay the register POST with the solved captcha.
+        //
+        // Discord expects the token in HEADERS, not the JSON body:
+        //   X-Captcha-Key         the solved hCaptcha token
+        //   X-Captcha-Rqtoken     echoed back from the 400 challenge
+        //   X-Captcha-Session-Id  echoed back from the 400 challenge
+        // Putting captcha_key in the body is the old (pre-enterprise)
+        // shape and is what 'captcha-required' kept complaining about.
+        //
+        // window.__ncDirectInflight tells our own interceptors to leave
+        // this request alone — it already carries the captcha headers.
+        const body = {
+            fingerprint: p.fingerprint || undefined,
+            email: p.email,
+            username: p.username,
+            global_name: p.global_name || p.username,
+            password: p.password,
+            invite: null,
+            consent: true,
+            date_of_birth: p.dob,
+            gift_code_sku_id: null,
+            promotional_email_opt_in: false
+        };
+        const headers = {
+            'Content-Type': 'application/json',
+            'X-Discord-Locale': 'en-US',
+            'X-Debug-Options': 'bugReporterEnabled',
+            'X-Captcha-Key': p.token
+        };
+        if (p.rqtoken) headers['X-Captcha-Rqtoken'] = p.rqtoken;
+        if (p.session) headers['X-Captcha-Session-Id'] = p.session;
+        // hCaptcha's getRespKey() pair. Enterprise verifiers check the
+        // token AND the key together; sending only the token is a
+        // half-answer.
+        if (p.respkey) headers['X-Captcha-Respkey'] = p.respkey;
+        // Set BEFORE the call: our own hook runs synchronously inside
+        // fetch() and would otherwise re-add captcha_key to this body.
+        window.__ncDirectInflight = true;
+        return fetch('/api/v9/auth/register', {
+            method: 'POST',
+            headers: headers,
+            credentials: 'include',
+            body: JSON.stringify(body)
+        }).then(async (r) => {
+            window.__ncDirectInflight = false;
+            let text = '';
+            try { text = await r.text(); } catch (e) {}
+            return {status: r.status, body: text.slice(0, 1200)};
+        }).catch((e) => {
+            window.__ncDirectInflight = false;
+            return {status: -1, body: String(e && e.message || e)};
+        });
+    }"""
+
+    async def _direct_register_with_token(self, token: str,
+                                          rqtoken: str = None,
+                                          session: str = None) -> bool:
+        """POST /auth/register ourselves with the captcha token attached.
+
+        Returns True when Discord accepts it (2xx with a session token).
+        """
+        email = getattr(self, "_email", "") or ""
+        username = getattr(self, "_username", "") or ""
+        password = getattr(self, "_password", "") or ""
+        dob = getattr(self, "_dob_iso", "") or ""
+        if not (email and username and password and dob):
+            self._log(f"[NoneCap] Cannot submit directly — missing "
+                      f"credentials (email={bool(email)} user={bool(username)}"
+                      f" pass={bool(password)} dob={bool(dob)})",
+                      level="warn")
+            return False
+        payload = {
+            "email": email,
+            "username": username,
+            "global_name": getattr(self, "_display_name_used", "") or username,
+            "password": password,
+            "dob": dob,
+            "token": token,
+            # PINNED at solve time. Reading self._* here sent the NEXT
+            # challenge's rqtoken/session with THIS challenge's token —
+            # a guaranteed invalid-response.
+            "rqtoken": (rqtoken if rqtoken is not None
+                        else getattr(self, "_rqtoken", "") or ""),
+            "session": (session if session is not None
+                        else getattr(self, "_captcha_session_id", "") or ""),
+            "respkey": getattr(self, "_captcha_respkey", "") or "",
+            "fingerprint": getattr(self, "_discord_fingerprint", "") or "",
+        }
+        self._nc_direct_inflight = True
+        try:
+            res = await asyncio.wait_for(
+                self._page.evaluate(self._DIRECT_REGISTER_JS, payload),
+                timeout=45.0)
+        except Exception as e:
+            self._log(f"[NoneCap] Direct register failed: "
+                      f"{type(e).__name__}: {e}", level="warn")
+            self._nc_direct_inflight = False
+            return False
+        if not isinstance(res, dict):
+            self._log(f"[NoneCap] Direct register returned {res!r}",
+                      level="warn")
+            self._nc_direct_inflight = False
+            return False
+        self._nc_direct_inflight = False
+        status = int(res.get("status") or 0)
+        self._last_direct_status = status
+        body = str(res.get("body") or "")
+        self._log(f"[NoneCap] Direct register -> HTTP {status}")
+        # FULL body, in chunks — the 220-char cut was hiding the tail of
+        # Discord's answer (extra captcha_* fields live at the end).
+        for i in range(0, min(len(body), 1600), 400):
+            self._log(f"[NoneCap]   body[{i}:] {body[i:i + 400]}")
+        # Exactly what we sent, so a wrong/missing value is visible here
+        # rather than inferred from three separate lines.
+        tok = getattr(self, "_pending_captcha_token", "") or ""
+        rk = getattr(self, "_captcha_respkey", "") or ""
+        rqt = payload.get("rqtoken") or ""
+        sid = payload.get("session") or ""
+        rq = getattr(self, "_solved_rqdata", "") or ""
+        import hashlib as _hh
+        def _h8(v):
+            return _hh.md5(v.encode()).hexdigest()[:8] if v else "-"
+        self._log(
+            f"[NoneCap]   SENT key={len(tok)}ch/{_h8(tok)} "
+            f"prefix={tok[:3] or '-'} "
+            f"respkey={len(rk)}ch/{_h8(rk)} prefix={rk[:3] or '-'} "
+            f"rqtoken={len(rqt)}ch/{_h8(rqt)} "
+            f"session={sid[:8] or '-'} rqdata={len(rq)}ch/{_h8(rq)}")
+        if status in (200, 201):
+            self._register_accepted = True
+            self._log("[Captcha] [OK] Discord accepted the registration")
+            return True
+        # Surface the reason, and pick up the FRESH challenge Discord
+        # hands back — on invalid-response it issues new rqdata/rqtoken,
+        # so the next attempt must use those, not the stale pair.
+        try:
+            data = json.loads(body)
+            keys = data.get("captcha_key")
+            if isinstance(keys, list) and keys:
+                hint = _CAPTCHA_KEY_HINTS.get(str(keys[0]).strip(), "")
+                self._log(f"[NoneCap] Discord rejected the token: "
+                          f"{keys[0]}" + (f" — {hint}" if hint else ""),
+                          level="warn")
+            refreshed = []
+            new_rq = data.get("captcha_rqdata")
+            if isinstance(new_rq, str) and len(new_rq) > 8 \
+                    and new_rq != getattr(self, "_rqdata", ""):
+                self._rqdata = new_rq
+                refreshed.append("rqdata")
+            new_rqt = data.get("captcha_rqtoken")
+            if isinstance(new_rqt, str) and new_rqt \
+                    and new_rqt != getattr(self, "_rqtoken", ""):
+                self._rqtoken = new_rqt
+                refreshed.append("rqtoken")
+            new_sess = data.get("captcha_session_id")
+            if isinstance(new_sess, str) and new_sess:
+                self._captcha_session_id = new_sess
+                refreshed.append("session")
+            if refreshed:
+                self._log(f"[NoneCap] Fresh challenge issued "
+                          f"({', '.join(refreshed)}) — the next attempt "
+                          f"will use it")
+        except Exception:
+            pass
+        return False
+
+    async def _apply_hcaptcha_token(self, token: str,
+                                    solved_rqtoken: str = None,
+                                    solved_session: str = None) -> bool:
+        """Inject a solved token and confirm the page actually advanced."""
+        try:
+            applied = await asyncio.wait_for(
+                self._page.evaluate(self._INJECT_TOKEN_JS, token),
+                timeout=10.0)
+        except Exception as e:
+            self._log(f"[NoneCap] Token injection failed: "
+                      f"{type(e).__name__}", level="warn")
+            return False
+        if isinstance(applied, dict):
+            self._log(f"[NoneCap] Injected: fields={applied.get('fields')} "
+                      f"callbacks={applied.get('callbacks')} "
+                      f"react={applied.get('react')}")
+            hit = int(applied.get("fields") or 0) + \
+                int(applied.get("callbacks") or 0)
+        else:
+            hit = int(applied or 0)
+        if not hit:
+            self._log("[NoneCap] Nothing accepted the token (no response "
+                      "field and no widget callback)", level="warn")
+            return False
+
+        # THE important step: hand the token to both injection paths so
+        # Discord's own /auth/register call carries captcha_key.
+        self._pending_captcha_token = token
+        self._cdp_injections = 0
+        self._cdp_inject_note = ""
+        # Force a re-install: Fetch.enable is per-target, and the page has
+        # navigated since page-creation time.
+        self._cdp_interceptor_on = False
+        cdp_ok = await self._install_cdp_captcha_interceptor()
+        await self._install_captcha_hook()
+        if not cdp_ok:
+            self._log("[NoneCap] CDP interceptor unavailable — the token "
+                      "can only ride the JS hook", level="warn")
+        try:
+            pub = await asyncio.wait_for(self._page.evaluate(
+                """(a) => {
+                    window.__ncToken = a[0] || '';
+                    window.__ncRqToken = a[1] || '';
+                    window.__ncRespKey = a[2] || '';
+                    // Make getRespKey() answer with the solver's key too.
+                    try {
+                        if (window.hcaptcha && window.__ncRespKey) {
+                            window.hcaptcha.getRespKey =
+                                () => window.__ncRespKey;
+                        }
+                    } catch (e) {}
+                    return {tok: !!window.__ncToken,
+                            rq: !!window.__ncRqToken,
+                            rk: !!window.__ncRespKey};
+                }""", [token, getattr(self, "_rqtoken", "") or "",
+                       getattr(self, "_captcha_respkey", "") or ""]),
+                timeout=8.0)
+            self._log(f"[NoneCap] Token published to the request hook "
+                      f"({pub})")
+        except Exception as e:
+            self._log(f"[NoneCap] Could not publish the token: "
+                      f"{type(e).__name__}", level="warn")
+
+        # Submit and give the page a moment to accept it.
+        try:
+            await asyncio.wait_for(self._click_form_submit(), timeout=15.0)
+        except Exception:
+            pass
+        for _ in range(6):
+            await asyncio.sleep(1.0)
+            if await self._past_captcha():
+                return True
+
+        # The click did not produce a register request (Discord keeps the
+        # challenge open instead of re-POSTing), so send it ourselves with
+        # the token attached.
+        ok_direct = await self._direct_register_with_token(
+            token, rqtoken=solved_rqtoken, session=solved_session)
+        await self._disarm_cdp_captcha_interceptor()
+        if ok_direct:
+            return True
+
+        # Did our token actually leave the browser? This separates "the
+        # token was rejected" from "the token was never sent", which look
+        # identical from the outside.
+        try:
+            diag = await asyncio.wait_for(self._page.evaluate(
+                """() => ({
+                    installed: !!window.__ncHookInstalled,
+                    injections: window.__ncInjections || 0,
+                    seen: (window.__ncSeen || []).slice(-6),
+                    bodyKeys: window.__ncLastBodyKeys || ''
+                })"""), timeout=8.0)
+            diag["cdp_injections"] = getattr(self, "_cdp_injections", 0)
+            diag["cdp_note"] = getattr(self, "_cdp_inject_note", "")
+            diag["direct_status"] = getattr(self, "_last_direct_status", 0)
+            self._log(f"[NoneCap] Hook diagnostics: {diag}")
+            # The DIRECT submit is the path that carries the token now, so
+            # a quiet JS hook is expected and not an error. Only complain
+            # when NOTHING delivered it.
+            delivered = (diag.get("injections") or diag["cdp_injections"]
+                         or diag["direct_status"] >= 400)
+            if not delivered:
+                self._log(
+                    "[NoneCap] The token never reached a register request — "
+                    "Discord's submit did not go through the patched "
+                    "fetch/XHR (service worker, or the request fired before "
+                    "the hook was installed)", level="warn")
+        except Exception:
+            pass
+        return False
+
+
+    @staticmethod
+    def _surface_is_usable(im) -> bool:
+        """True when the crop actually contains a picture.
+
+        A degenerate crop (off-image, zero-size, or a flat fill) has almost
+        no pixel variance. Detecting that is what stops the solver from
+        analysing a black rectangle and reporting "0 contours" forever.
+        """
+        try:
+            w, h = im.size
+            if w < 60 or h < 60:
+                return False
+            import numpy as _np
+            a = _np.asarray(im.convert("L"), dtype=_np.float32)
+            if a.size == 0:
+                return False
+            return float(a.std()) >= 6.0
+        except Exception:
+            return True
+
 
     # ── per-family round solvers ───────────────────────────────────────────
 
-    async def _solve_binary_round(self, frame, prompt, dom) -> bool:
-        """image_label_binary (+ its reference-image affordance variant).
 
-        Offline path first: the tile CNN labels every tile; when the mean
-        confidence clears _CNN_MIN_CONF and the prompt resolves through the
-        knowledge base, we click without any model-server round trip."""
-        tiles = await self._screenshot_challenge_tiles(frame)
-        if not tiles:
-            return False
-        examples = await self._capture_example_images(frame)
-        cnn = self._tile_classifier()
-        if cnn is not None:
-            try:
-                got = cnn.classify_many(tiles, with_conf=True)
-                if len(got) == len(tiles) and got:
-                    labels = [g[0] for g in got]
-                    mean_conf = sum(g[1] for g in got) / len(got)
-                    ex_label = None
-                    if examples:
-                        eg = cnn.classify_many(examples[:1])
-                        if eg:
-                            ex_label = eg[0][0]
-                    if mean_conf >= _CNN_MIN_CONF:
-                        idx = hct.resolve_semantic(prompt, labels,
-                                                   example_label=ex_label)
-                        if idx is not None:
-                            self._log(
-                                f"[Captcha] Offline CNN grid: {labels} "
-                                f"(conf {mean_conf:.2f}, ref={ex_label}) -> {idx}")
-                            if not idx:
-                                # Understood empty round (no tile matches) —
-                                # Verify/Next with nothing selected is correct.
-                                return True
-                            return await self._click_challenge_tiles(frame, idx)
-                        self._log(
-                            "[Captcha] Offline labels made but prompt not "
-                            "understood — asking vision model", level="debug")
-                    else:
-                        self._log(
-                            f"[Captcha] Offline grid confidence {mean_conf:.2f} "
-                            f"< {_CNN_MIN_CONF:.2f} — asking vision model",
-                            level="debug")
-            except Exception as e:
-                self._log(f"[Captcha] Offline grid path error: {e}",
-                          level="debug")
-        self._log(
-            f"[Captcha] Asking Ollama ({self._vision.model}) which tiles match...")
-        answer = await self._vision.solve(prompt, tiles, shape="tiles",
-                                          examples=examples)
-        if not answer:
-            return False
-        if answer.get("type") == "text":
-            self._log(f"[Captcha] Text answer on grid round: {answer.get('text')!r}")
-            return await self._type_challenge_answer(frame,
-                                                     answer.get("text", ""))
-        indices = [i for i in answer.get("indices", [])
-                   if isinstance(i, int) and 1 <= i <= len(tiles)]
-        self._log(f"[Captcha] Clicking tiles: {indices}")
-        return await self._click_challenge_tiles(frame, indices)
 
-    async def _solve_point_round(self, frame, prompt, bbox: bool = False) -> bool:
-        """area_select: click a point — or, for bbox rounds, drag out the
-        box's diagonal. Offline PointLocator first, vision model fallback."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        pl = self._point_locator()
-        if pl is not None and not bbox:
-            try:
-                point = None
-                target = hct.extract_target(prompt)
-                if hct.superlative_table(prompt) or not target:
-                    rel = pl.locate_relational(
-                        shot, prompt, verifier=self._tile_classifier())
-                    if rel:
-                        point = (rel[0], rel[1])
-                        self._log(
-                            f"[Captcha] Offline relational point -> "
-                            f"{rel[2]} @ ({rel[0]:.2f},{rel[1]:.2f})")
-                if point is None and target:
-                    hit = pl.locate(shot, target)
-                    if hit:
-                        point = (hit[0], hit[1])
-                        self._log(
-                            f"[Captcha] Offline point '{target}' @ "
-                            f"({hit[0]:.2f},{hit[1]:.2f}) conf={hit[2]:.2f}")
-                if point is not None:
-                    x, y = self._denorm(point, box)
-                    await hm.click(self._page, x, y)
-                    return True
-            except Exception as e:
-                self._log(f"[Captcha] Offline point path error: {e}",
-                          level="debug")
-        answer = await self._vision.solve(
-            prompt, [shot], shape=("bbox" if bbox else "points"))
-        if not answer:
-            return False
-        if bbox:
-            if answer.get("type") != "bbox":
-                return False
-            bb = answer["bbox"]
-            x1, y1 = self._denorm((bb["x1"], bb["y1"]), box)
-            x2, y2 = self._denorm((bb["x2"], bb["y2"]), box)
-            self._log(f"[Captcha] Drawing box ({x1:.0f},{y1:.0f})->"
-                      f"({x2:.0f},{y2:.0f})")
-            await hm.drag(self._page, (x1, y1), (x2, y2))
-            return True
-        if answer.get("type") == "points" and answer.get("points"):
-            clicked = 0
-            for pt in answer.get("points") or []:
-                try:
-                    x, y = self._denorm(pt, box)
-                except Exception:
-                    continue
-                self._log(f"[Captcha] Point click at ({x:.0f},{y:.0f})")
-                await hm.click(self._page, x, y)
-                clicked += 1
-                await asyncio.sleep(random.uniform(0.15, 0.38))
-            return clicked > 0
-        return False
+    async def _frame_shot(self, frame):
+        """Whole-frame screenshot bytes, used when the element crop fails."""
+        try:
+            raw = await frame.screenshot()
+            return raw or None
+        except Exception:
+            return None
 
-    async def _solve_drag_round(self, frame, prompt) -> bool:
-        """image_drag_drop: a REAL press/move/release drag (hCaptcha ignores
-        synthetic clicks here — DragSolver only matches Arkose iframes, so
-        these rounds used to be unreachable)."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        dl = self._drag_locator()
-        if dl is not None:
-            try:
-                got = dl.locate(shot)
-                if got:
-                    fx, fy = self._denorm(got["from"], box)
-                    tx, ty = self._denorm(got["to"], box)
-                    self._log(
-                        f"[Captcha] Offline drag ({got['from'][0]:.2f},"
-                        f"{got['from'][1]:.2f}) -> ({got['to'][0]:.2f},"
-                        f"{got['to'][1]:.2f})")
-                    await hm.drag(self._page, (fx, fy), (tx, ty))
-                    return True
-            except Exception as e:
-                self._log(f"[Captcha] Offline drag path error: {e}",
-                          level="debug")
-        answer = await self._vision.solve(prompt, [shot], shape="drag")
-        if not answer or answer.get("type") != "drag":
-            return False
-        fx, fy = self._denorm(answer["from"], box)
-        tx, ty = self._denorm(answer["to"], box)
-        self._log(f"[Captcha] Dragging piece ({fx:.0f},{fy:.0f}) -> "
-                  f"({tx:.0f},{ty:.0f})")
-        await hm.drag(self._page, (fx, fy), (tx, ty))
-        return True
+
+
 
     _TOWER_PIECE_JS = r"""() => {
         const vis = (el) => !!(el) &&
@@ -4735,158 +6068,7 @@ class DiscordAutomation:
         cy = (float(info["y"]) + float(info["h"]) / 2.0) / bh + 0.05
         return (max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)))
 
-    async def _solve_tower_round(self, frame, prompt) -> bool:
-        """Wooden-block tower: drag the Move piece onto the incomplete stack.
 
-        Live prompt: "Move the correct missing block segment onto the
-        incomplete tower". hCaptcha serves this under area_select, but
-        the answer is a real press/move/release drag — a point click
-        never picks up the piece. NEVER uses DragLocator (punched-slot
-        geometry is the wrong puzzle). Offline wood-mask heuristic
-        first; a SHORT vision ``shape="tower"`` call is last resort
-        (a long 504 expires the challenge).
-        """
-        shot, box = await self._tower_frame_shot(frame)
-        if not shot or not box:
-            shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            self._log("[Captcha] Tower: no screenshot", level="warn")
-            return False
-        hint = await self._tower_piece_hint(frame, box)
-        debug = {}
-        got = None
-        try:
-            got = hct.locate_tower_drag(shot, piece_hint=hint, debug=debug)
-        except Exception as e:
-            debug["reason"] = "error:%s" % type(e).__name__
-            self._log(f"[Captcha] Offline tower error: {e}", level="debug")
-            got = None
-        self._log(f"[Captcha] Tower heuristic: {debug}")
-        if got and got.get("from") and got.get("to"):
-            fx, fy = self._denorm(got["from"], box)
-            tx, ty = self._denorm(got["to"], box)
-            self._log(
-                f"[Captcha] Offline tower drag "
-                f"({got['from'][0]:.2f},{got['from'][1]:.2f}) -> "
-                f"({got['to'][0]:.2f},{got['to'][1]:.2f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        # Do not sit on a 180s 504 — that expires the challenge.
-        answer = await self._vision.solve(
-            prompt, [shot], shape="tower", timeout=18.0)
-        if answer and answer.get("type") == "drag":
-            fx, fy = self._denorm(answer["from"], box)
-            tx, ty = self._denorm(answer["to"], box)
-            self._log(f"[Captcha] Vision tower drag ({fx:.0f},{fy:.0f}) -> "
-                      f"({tx:.0f},{ty:.0f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        # Last resort: DOM piece + heuristic drop (even if `from` was missing).
-        best = debug.get("best") if isinstance(debug, dict) else None
-        if hint and isinstance(best, dict) and best.get("to"):
-            fx, fy = self._denorm(hint, box)
-            tx, ty = self._denorm(best["to"], box)
-            self._log(
-                f"[Captcha] Tower last-resort drag "
-                f"({hint[0]:.2f},{hint[1]:.2f}) -> "
-                f"({best['to'][0]:.2f},{best['to'][1]:.2f})")
-            await hm.drag(self._page, (fx, fy), (tx, ty))
-            return True
-        return False
-
-    async def _solve_pattern_round(self, frame, prompt) -> bool:
-        """Pattern completion ("put one of the animals into the empty spot
-        to complete the pattern"): a 3x3 icon grid with one empty cell and
-        a row of candidates. The CORRECT candidate is chosen by the row/
-        column pattern, so the geometric DragLocator cannot answer it.
-
-        Offline path: crop the grid cells and candidates out of the
-        surface screenshot, label them with the tile classifier, pick the
-        candidate via hct.resolve_pattern (Latin square) — all gated on
-        classifier confidence. Otherwise the vision model answers with a
-        candidate->hole drag. The gesture itself is a real humanized drag
-        (and if a drag is not accepted, the candidate is clicked instead —
-        some builds accept click-to-place)."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot or not box:
-            return False
-        from_to = None
-        # ── offline: crop-classify -> Latin-square pattern logic ─────────
-        tc = self._tile_classifier()
-        probe = await self._probe_pattern_dom(frame, box)
-        if tc is not None and probe is not None:
-            try:
-                import io as _io
-                from PIL import Image as _Image
-                import numpy as _np
-                im = _Image.open(_io.BytesIO(shot)).convert("RGB")
-                W, H = im.size
-                cells, cands = probe
-                # hole = the near-white empty cell (max mean brightness;
-                # min-std fails because flat painted tiles can be flatter
-                # than the outlined white hole)
-                crops, means = [], []
-                for rect in cells:
-                    x0 = int(rect[0] * W)
-                    y0 = int(rect[1] * H)
-                    x1 = int((rect[0] + rect[2]) * W)
-                    y1 = int((rect[1] + rect[3]) * H)
-                    c = im.crop((x0, y0, x1, y1))
-                    crops.append(c)
-                    means.append(float(_np.asarray(c.convert("L")).mean()))
-                hole = int(_np.argmax(means))
-                labelled = tc.classify_many(crops)
-                if len(labelled) == len(cells):
-                    grid = [g[0] if i != hole else None
-                            for i, g in enumerate(labelled)]
-                    cand_crops = []
-                    for rect in cands:
-                        x0 = int(rect[0] * W)
-                        y0 = int(rect[1] * H)
-                        x1 = int((rect[0] + rect[2]) * W)
-                        y1 = int((rect[1] + rect[3]) * H)
-                        cand_crops.append(im.crop((x0, y0, x1, y1)))
-                    clab = tc.classify_many(cand_crops)
-                    confs = [g[1] for g in labelled] + [g[1] for g in clab]
-                    mean_conf = sum(confs) / max(1, len(confs))
-                    if mean_conf >= _CNN_MIN_CONF:
-                        win = hct.resolve_pattern(
-                            grid, hole, [g[0] for g in clab])
-                        if win is not None:
-                            cbox = cands[win]
-                            hbox = cells[hole]
-                            from_to = (
-                                (box["x"] + (cbox[0] + cbox[2] / 2) * box[
-                                    "width"],
-                                 box["y"] + (cbox[1] + cbox[3] / 2) * box[
-                                     "height"]),
-                                (box["x"] + (hbox[0] + hbox[2] / 2) * box[
-                                    "width"],
-                                 box["y"] + (hbox[1] + hbox[3] / 2) * box[
-                                     "height"]))
-                            self._log(
-                                f"[Captcha] Offline pattern: grid={grid} "
-                                f"hole={hole} candidates={clab} -> "
-                                f"{clab[win]} (conf {mean_conf:.2f})")
-            except Exception as e:
-                self._log(f"[Captcha] Offline pattern error: {e}",
-                          level="debug")
-        # ── vision fallback ───────────────────────────────────────────────
-        if from_to is None:
-            answer = await self._vision.solve(prompt, [shot],
-                                              shape="pattern")
-            if not answer or answer.get("type") != "drag":
-                return False
-            fx, fy = self._denorm(answer["from"], box)
-            tx, ty = self._denorm(answer["to"], box)
-            from_to = ((fx, fy), (tx, ty))
-            self._log(f"[Captcha] Vision pattern drag ({fx:.0f},{fy:.0f}) "
-                      f"-> ({tx:.0f},{ty:.0f})")
-        (fx, fy), (tx, ty) = from_to
-        await hm.drag(self._page, (fx, fy), (tx, ty))
-        # some builds accept click-to-place instead of a drag — retry the
-        # candidate with a humanized click when the round does not advance
-        return True
 
     async def _probe_pattern_dom(self, frame, surface_box):
         """Visible small square-ish elements in the challenge frame, split
@@ -4962,77 +6144,7 @@ class DiscordAutomation:
         except Exception:
             return None
 
-    async def _solve_choice_round(self, frame, prompt) -> bool:
-        """multiple_choice: read the option buttons, ask the model, click
-        the chosen option with a humanized box click."""
-        options = await frame.evaluate("""() => {
-            const out = [];
-            for (const el of document.querySelectorAll(
-                    '.answer-option, [class*="answer-option" i], ' +
-                    '[class*="choice" i] button, .options [role="button"]')) {
-                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                if (t.length < 2 || t.length > 200) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width < 40 || r.height < 14) continue;
-                out.push({ text: t.slice(0, 200), box: {
-                    x: r.left, y: r.top, width: r.width, height: r.height } });
-            }
-            return out;
-        }""")
-        if not options or len(options) < 2:
-            return False
-        shot, _ = await self._challenge_surface(frame)
-        listing = "\n".join("%d. %s" % (i + 1, o["text"])
-                            for i, o in enumerate(options))
-        answer = await self._vision.solve(
-            prompt + "\nOPTIONS:\n" + listing, [shot] if shot else [b""],
-            shape="choice")
-        if not answer or answer.get("type") != "choice":
-            return False
-        idx = answer.get("index")
-        if not isinstance(idx, int) or not (1 <= idx <= len(options)):
-            return False
-        ox, oy = await self._frame_origin(frame)
-        b = options[idx - 1]["box"]
-        page_box = {"x": b["x"] + ox, "y": b["y"] + oy,
-                    "width": b["width"], "height": b["height"]}
-        self._log(f"[Captcha] Multiple-choice -> option {idx}: "
-                  f"{options[idx - 1]['text'][:60]!r}")
-        await hm.click_box(self._page, page_box)
-        return True
 
-    async def _solve_count_round(self, frame, prompt) -> bool:
-        """counting ("How many X are in this image?"): numeric answer
-        options. Tries the offline peak counter first (self-gated — it
-        returns None unless the count is clean), then the vision model,
-        then clicks the option button matching the count."""
-        shot, box = await self._challenge_surface(frame)
-        if not shot:
-            return False
-        n = None
-        target = hct.extract_target(prompt)
-        if target:
-            pl = self._point_locator()
-            if pl is not None:
-                try:
-                    n = pl.count(shot, target)
-                    if n is not None:
-                        self._log(
-                            f"[Captcha] Offline count: {n} x {target}")
-                except Exception as e:
-                    self._log(f"[Captcha] Offline count error: {e}",
-                              level="debug")
-        if n is None:
-            answer = await self._vision.solve(prompt, [shot], shape="count")
-            if not answer or answer.get("type") != "count":
-                return False
-            n = answer.get("count")
-        if not isinstance(n, int) or n < 1:
-            self._log("[Captcha] Counting produced no usable number",
-                      level="warn")
-            return False
-        self._log(f"[Captcha] Counting answer: {n}")
-        return await self._click_number_option(frame, n)
 
     async def _click_number_option(self, frame, n: int) -> bool:
         """Click the numeric answer option whose label equals ``n``.
@@ -5084,76 +6196,7 @@ class DiscordAutomation:
         await hm.click_box(self._page, page_box)
         return True
 
-    async def _solve_text_round(self, frame, prompt) -> bool:
-        """text_entry: vision model reads the characters, we type them."""
-        shot, _ = await self._challenge_surface(frame)
-        if not shot:
-            return False
-        answer = await self._vision.solve(prompt, [shot], shape="text")
-        if answer and answer.get("type") == "text":
-            self._log(f"[Captcha] Text challenge: {answer.get('text')!r}")
-            return await self._type_challenge_answer(frame,
-                                                     answer.get("text", ""))
-        return False
 
-    async def _click_challenge_tiles(self, frame, indices) -> bool:
-        """Humanized clicks on the given 1-based tile indices (reading order).
-
-        hCaptcha grades pointer telemetry, so a bare element.click() in a
-        tight loop is an automation tell. Each tile gets a Bezier glide to a
-        gaussian landing point inside its box (frame origin applied) with a
-        real down/dwell/up, and a human 0.18-0.55 s pause between tiles.
-        element.click() remains only as a last-resort fallback."""
-        for sel in ('div.task-image, [class*="task-image" i]',
-                    '.task-grid img, [class*="task-grid" i] img, '
-                    '.challenge-content img'):
-            try:
-                n = await frame.locator(sel).count()
-            except Exception:
-                continue
-            if n == 0:
-                continue
-            # tile rects are frame-local (getBoundingClientRect); add the
-            # iframe's own page offset once
-            try:
-                rects = await frame.evaluate("""(sel) => {
-                    const out = [];
-                    for (const el of document.querySelectorAll(sel)) {
-                        const r = el.getBoundingClientRect();
-                        out.push({ x: r.left, y: r.top,
-                                   width: r.width, height: r.height });
-                    }
-                    return out;
-                }""", sel)
-            except Exception:
-                rects = None
-            ox, oy = await self._frame_origin(frame)
-            clicked = 0
-            for idx in indices:
-                if not (isinstance(idx, int) and 1 <= idx <= n):
-                    continue
-                done = False
-                if rects and len(rects) >= idx:
-                    r = rects[idx - 1]
-                    if r and r.get("width"):
-                        try:
-                            await hm.click_box(self._page, {
-                                "x": r["x"] + ox, "y": r["y"] + oy,
-                                "width": r["width"], "height": r["height"]})
-                            done = True
-                        except Exception:
-                            done = False
-                if not done:
-                    try:
-                        await frame.locator(sel).nth(idx - 1).click(timeout=5000)
-                        done = True
-                    except Exception:
-                        continue
-                clicked += 1
-                await asyncio.sleep(random.uniform(0.18, 0.55))
-            if clicked:
-                return True
-        return False
 
     _NEXT_VERIFY_JS = r"""() => {
         const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -5253,39 +6296,7 @@ class DiscordAutomation:
                 continue
         return False
 
-    async def _type_challenge_answer(self, frame, text: str) -> bool:
-        """Fill the answer input for 'type the characters' challenges."""
-        try:
-            inp = frame.locator('input[type="text"], input:not([type]), textarea').first
-            await inp.click(timeout=4000)
-            await inp.fill(text, timeout=4000)
-            self._log("[Captcha] Typed challenge answer")
-            return True
-        except Exception:
-            return False
 
-    async def _solve_funcaptcha(self) -> bool:
-        """FunCAPTCHA (Arkose) solver using vision AI (DragSolver).
-
-        Uses the vision model (configured via VISION_API_BASE / OLLAMA_BASE)
-        to handle slider puzzles, tile-click challenges, and drag-to-match
-        challenges served by Arkose Labs FunCAPTCHA.
-        """
-        try:
-            solver = DragSolver(
-                page=self._page,
-                vision=self._vision,
-                log=self._log,
-            )
-            if await solver.detect(timeout=8.0):
-                self._log("[FunCAPTCHA] DragSolver engaged", level="info")
-                return await solver.solve(timeout=45.0)
-            self._log("[FunCAPTCHA] No FunCAPTCHA frame detected by DragSolver",
-                      level="warn")
-            return False
-        except Exception as e:
-            self._log(f"[FunCAPTCHA] DragSolver error: {e}", level="error")
-            return False
 
     async def _form_ready(self) -> dict:
         """Evaluate _FORM_READY_JS with the locale-aware DOB label table."""
@@ -6212,6 +7223,14 @@ class DiscordAutomation:
                 self._log_exception("[Form] Verify read-back failed", e)
 
             # ── DOB ──
+            # Remember it: the direct-API captcha path needs date_of_birth.
+            try:
+                self._dob_iso = (f"{int(year_val):04d}-"
+                                 f"{months.index(month_name) + 1:02d}-"
+                                 f"{int(day_val):02d}")
+            except Exception:
+                self._dob_iso = ""
+            self._display_name_used = display_name or self._username
             self._log(f"DOB: {month_name} {day_val}, {year_val}")
             await self._select_dob("Month", month_name)
             await self._human_pause()

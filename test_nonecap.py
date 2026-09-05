@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""Tests for the NoneCap client, including a real local HTTP server."""
+import asyncio
+import json
+import os
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import nonecap_solver
+from nonecap_solver import NoneCapSolver, api_key, configured
+
+
+# ── a stand-in NoneCap API ──────────────────────────────────────────────
+STATE = {"mode": "inline", "polls": 0, "last_payload": None,
+         "last_auth": "", "cancelled": []}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body):
+        raw = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self):
+        STATE["last_auth"] = self.headers.get("Authorization", "")
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        if self.path.endswith("/cancel"):
+            STATE["cancelled"].append(self.path)
+            return self._send(200, {"status": "cancelled"})
+        if "/feedback" in self.path:
+            return self._send(204, {})
+        STATE["last_payload"] = body
+        mode = STATE["mode"]
+        if mode == "inline":
+            return self._send(200, {"id": "s1", "status": "solved",
+                                    "token": "P1_" + "x" * 40,
+                                    "credits_charged": 1})
+        if mode == "poll":
+            return self._send(202, {"id": "s2", "status": "pending",
+                                    "token": None})
+        if mode == "failed":
+            return self._send(200, {"id": "s3", "status": "failed",
+                                    "token": None,
+                                    "error": {"message": "unsolvable"}})
+        if mode == "auth":
+            return self._send(401, {"error": "bad key"})
+        if mode == "credits":
+            return self._send(402, {"error": "no credits"})
+        if mode == "ratelimit":
+            return self._send(429, {"error": "slow down"})
+        return self._send(500, {"error": "boom"})
+
+    def do_GET(self):
+        if self.path.startswith("/v1/me"):
+            return self._send(200, {"credits_balance": 1234})
+        STATE["polls"] += 1
+        if STATE["polls"] >= 2:
+            return self._send(200, {"id": "s2", "status": "solved",
+                                    "token": "P1_" + "y" * 40,
+                                    "credits_charged": 2})
+        return self._send(200, {"id": "s2", "status": "solving",
+                                "token": None})
+
+
+class TestNoneCapAgainstServer(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.srv.server_port
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        STATE.update({"mode": "inline", "polls": 0, "last_payload": None,
+                      "cancelled": []})
+
+    def _client(self):
+        return NoneCapSolver(key="nc_live_test", base=self.base,
+                             log=lambda *a, **k: None)
+
+    async def test_inline_token(self):
+        tok = await self._client().solve("sk-uuid", "https://x.test/")
+        self.assertTrue(tok.startswith("P1_"))
+
+    async def test_payload_shape(self):
+        await self._client().solve("sk-uuid", "https://x.test/login")
+        p = STATE["last_payload"]
+        self.assertEqual(p["type"], "hcaptcha")
+        self.assertEqual(p["sitekey"], "sk-uuid")
+        self.assertEqual(p["url"], "https://x.test/login")
+
+    async def test_bearer_header(self):
+        await self._client().solve("sk", "https://x.test/")
+        self.assertEqual(STATE["last_auth"], "Bearer nc_live_test")
+
+    async def test_enterprise_uses_rqdata(self):
+        await self._client().solve("sk", "https://x.test/", rqdata="RQ123")
+        p = STATE["last_payload"]
+        self.assertEqual(p["type"], "hcaptcha_enterprise")
+        self.assertEqual(p["rqdata"], "RQ123")
+
+    async def test_202_then_poll(self):
+        STATE["mode"] = "poll"
+        tok = await self._client().solve("sk", "https://x.test/")
+        self.assertTrue(tok.startswith("P1_"))
+        self.assertGreaterEqual(STATE["polls"], 2)
+
+    async def test_failed_solve_returns_none(self):
+        STATE["mode"] = "failed"
+        c = self._client()
+        self.assertIsNone(await c.solve("sk", "https://x.test/"))
+        self.assertIn("unsolvable", c.last_error)
+        self.assertEqual(c.failures, 1)
+
+    async def test_auth_error_is_flagged(self):
+        STATE["mode"] = "auth"
+        c = self._client()
+        self.assertIsNone(await c.solve("sk", "https://x.test/"))
+        self.assertEqual(c.last_error, "authentication")
+
+    async def test_insufficient_credits_flagged(self):
+        STATE["mode"] = "credits"
+        c = self._client()
+        self.assertIsNone(await c.solve("sk", "https://x.test/"))
+        self.assertEqual(c.last_error, "insufficient credits")
+
+    async def test_rate_limit_flagged(self):
+        STATE["mode"] = "ratelimit"
+        c = self._client()
+        self.assertIsNone(await c.solve("sk", "https://x.test/"))
+        self.assertEqual(c.last_error, "rate limited")
+
+    async def test_missing_sitekey_never_calls_out(self):
+        c = self._client()
+        self.assertIsNone(await c.solve("", "https://x.test/"))
+        self.assertIsNone(STATE["last_payload"])
+
+    async def test_balance(self):
+        self.assertEqual(await self._client().balance(), 1234)
+
+    async def test_credits_counted(self):
+        c = self._client()
+        await c.solve("sk", "https://x.test/")
+        self.assertEqual(c.credits_charged, 1)
+        self.assertEqual(c.solves, 1)
+
+
+class TestKeyHandling(unittest.TestCase):
+    def setUp(self):
+        for v in ("NONECAP_API", "NONECAP_API_KEY", "NONECAP_KEY"):
+            os.environ.pop(v, None)
+
+    tearDown = setUp
+
+    def test_reads_nonecap_api(self):
+        os.environ["NONECAP_API"] = "nc_live_abc"
+        self.assertEqual(api_key(), "nc_live_abc")
+
+    def test_accepts_aliases(self):
+        os.environ["NONECAP_KEY"] = "nc_live_alias"
+        self.assertEqual(api_key(), "nc_live_alias")
+
+    def test_strips_pasted_name_equals_value(self):
+        os.environ["NONECAP_API"] = "NONECAP_API = nc_live_pasted"
+        self.assertEqual(api_key(), "nc_live_pasted")
+
+    def test_strips_quotes(self):
+        os.environ["NONECAP_API"] = "'nc_live_quoted'"
+        self.assertEqual(api_key(), "nc_live_quoted")
+
+    def test_not_configured_without_a_key(self):
+        self.assertFalse(configured())
+
+    def test_disabled_client_never_solves(self):
+        c = NoneCapSolver(key="", log=lambda *a, **k: None)
+        self.assertFalse(c.enabled)
+        self.assertIsNone(asyncio.run(c.solve("sk", "https://x.test/")))
+
+    def test_three_tries_by_default(self):
+        self.assertEqual(nonecap_solver.NONECAP_TRIES, 3)
+
+
+class TestNullCredits(unittest.IsolatedAsyncioTestCase):
+    """credits_charged can be null; that must not crash or print 'None'."""
+
+    async def test_null_credits_logged_cleanly(self):
+        from nonecap_solver import NoneCapSolver
+        lines = []
+        c = NoneCapSolver(key="k", log=lambda m, **kw: lines.append(m))
+
+        async def fake_await(session, solve, deadline):
+            return await NoneCapSolver._await_token(c, session, solve,
+                                                    deadline)
+
+        solve = {"id": "s", "status": "solved", "token": "P1_" + "z" * 30,
+                 "credits_charged": None}
+        tok = await NoneCapSolver._await_token(c, None, solve, 1e18)
+        self.assertTrue(tok.startswith("P1_"))
+        self.assertTrue(any("credits n/a" in l for l in lines), lines)
+        self.assertFalse(any("None credit" in l for l in lines), lines)
+
+    async def test_integer_credits_still_counted(self):
+        from nonecap_solver import NoneCapSolver
+        c = NoneCapSolver(key="k", log=lambda *a, **k: None)
+        solve = {"id": "s", "status": "solved", "token": "P1_" + "z" * 30,
+                 "credits_charged": 3}
+        await NoneCapSolver._await_token(c, None, solve, 1e18)
+        self.assertEqual(c.credits_charged, 3)
+
+
+class TestServerWiring(unittest.TestCase):
+    """Guard the integration points that made the live run fail."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_rqdata_is_read_live_not_just_from_the_hook(self):
+        self.assertIn("_live_rqdata", self.src)
+        self.assertIn("rqdata = await self._live_rqdata()", self.src)
+
+    def test_warns_when_solving_without_rqdata(self):
+        self.assertIn("No enterprise rqdata found", self.src)
+
+    def test_token_injection_uses_the_native_react_setter(self):
+        i = self.src.find("_INJECT_TOKEN_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("getOwnPropertyDescriptor", block)
+        self.assertIn("HTMLTextAreaElement", block)
+
+    def test_token_injection_fires_the_widget_callback(self):
+        i = self.src.find("_INJECT_TOKEN_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("callback", block)
+        self.assertIn("getConfig", block)
+
+    def test_nonecap_is_the_only_solver(self):
+        # The vision stack (Roboflow / RT-DETR / Gemma) is gone: it never
+        # cleared a Discord challenge and cost 20-45s per round.
+        self.assertNotIn("_vision_ready", self.src)
+        self.assertNotIn("RoboflowVisionClient", self.src)
+        self.assertIn("_solve_with_nonecap()", self.src)
+
+
+class TestNoStalls(unittest.TestCase):
+    """The captcha step must never hang, whatever the page does."""
+
+    def test_live_rqdata_respects_its_budget(self):
+        """A cross-origin frame can accept evaluate() and never answer."""
+        import asyncio as aio
+        import time as _t
+        import server
+
+        class Hanging:
+            async def evaluate(self, js):
+                await aio.sleep(3600)
+
+        class Bot:
+            _RQDATA_JS = server.DiscordAutomation._RQDATA_JS
+            _rqdata = ""
+            def __init__(self):
+                self._page = Hanging()
+                self._page.frames = [Hanging() for _ in range(5)]
+            def _log(self, *a, **k):
+                pass
+            def _read_challenge_payload(self, data=None):
+                return {}
+
+        t0 = _t.time()
+        out = aio.run(
+            server.DiscordAutomation._live_rqdata(Bot(), budget=3.0))
+        self.assertEqual(out, "")
+        self.assertLess(_t.time() - t0, 9.0, "rqdata search hung")
+
+    def test_every_page_call_in_the_path_is_timed_out(self):
+        src = open("server.py").read()
+        i = src.index("async def _solve_with_nonecap")
+        j = src.index("async def _apply_hcaptcha_token")
+        # both methods make up the NoneCap path
+        block = src[min(i, j):max(i, j) + 6000]
+        # Check the CALL SITES (evaluate/await), not the JS definition.
+        for needle in ("extract_hcaptcha_sitekey(self._page)",
+                       'evaluate("() => location.href")',
+                       "evaluate(self._INJECT_TOKEN_JS, token)"):
+            i = block.find(needle)
+            self.assertNotEqual(i, -1, f"call site missing: {needle}")
+            self.assertIn("wait_for", block[max(0, i - 220):i + 80],
+                          f"{needle} is not time-boxed")
+
+    def test_step_has_a_hard_budget(self):
+        import server
+        self.assertGreater(server.NONECAP_STEP_BUDGET, 0)
+        src = open("server.py").read()
+        self.assertIn("NONECAP_STEP_BUDGET", src)
+        i = src.index("_solve_with_nonecap(), timeout=")
+        self.assertIn("NONECAP_STEP_BUDGET", src[i:i + 80])
+
+    def test_skip_reason_is_logged(self):
+        """Silence is what made it look like NoneCap was never wired in."""
+        src = open("server.py").read()
+        self.assertIn("[NoneCap] Skipped:", src)
+        self.assertIn("[NoneCap] Starting hosted solve", src)
+
+
+class TestIpAndUaBinding(unittest.IsolatedAsyncioTestCase):
+    """hCaptcha binds a token to the solving IP/UA.
+
+    Live evidence: with the token finally reaching Discord, the verdict was
+    'invalid-response' — the token was real but solved on NoneCap's IP
+    while we submit from a TOR exit.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        STATE.update({"mode": "inline", "polls": 0, "last_payload": None})
+
+    def _c(self):
+        return NoneCapSolver(key="k", base=self.base,
+                             log=lambda *a, **kw: None)
+
+    async def test_proxy_is_forwarded(self):
+        await self._c().solve("sk", "https://x.test/",
+                              proxy="socks5://1.2.3.4:1080")
+        self.assertEqual(STATE["last_payload"]["proxy"],
+                         "socks5://1.2.3.4:1080")
+
+    async def test_user_agent_is_NOT_forwarded(self):
+        # Deprecated 2026-08-13 and ignored by the API. The SDK warns that
+        # a caller-supplied UA replaced only some identity signals and
+        # "made the request contradict itself".
+        await self._c().solve("sk", "https://x.test/", user_agent="UA/1.0")
+        self.assertNotIn("user_agent", STATE["last_payload"])
+
+    async def test_absent_by_default(self):
+        await self._c().solve("sk", "https://x.test/")
+        self.assertNotIn("proxy", STATE["last_payload"])
+        self.assertNotIn("user_agent", STATE["last_payload"])
+        self.assertNotIn("invisible", STATE["last_payload"])
+
+    async def test_env_proxy_is_used(self):
+        import nonecap_solver as ns
+        old = ns.NONECAP_PROXY
+        ns.NONECAP_PROXY = "http://env:9"
+        try:
+            await self._c().solve("sk", "https://x.test/")
+            self.assertEqual(STATE["last_payload"]["proxy"], "http://env:9")
+        finally:
+            ns.NONECAP_PROXY = old
+
+    def test_server_does_not_send_a_user_agent(self):
+        # The solver builds its own coherent identity; overriding only the
+        # UA made the request self-contradictory (SDK note, 2026-08-13).
+        src = open("server.py").read()
+        self.assertNotIn("user_agent=str(ua)", src)
+
+
+class TestNoSelfInjection(unittest.TestCase):
+    """Our own direct submit must not be rewritten by our interceptors."""
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_direct_request_sets_an_inflight_flag(self):
+        # The old body marker leaked to Discord as an unknown field, so
+        # the guard is now an in-flight flag on both sides.
+        self.assertIn("__ncDirectInflight", self.src)
+        self.assertIn("_nc_direct_inflight", self.src)
+
+    def test_marker_no_longer_leaks_into_the_body(self):
+        self.assertNotIn("__nc_direct:", self.src)
+
+    def test_cdp_mutator_skips_our_own_request(self):
+        i = self.src.index("def _mutate_register_body")
+        block = self.src[i:i + 1200]
+        self.assertIn("_nc_direct_inflight", block)
+
+    def test_js_hook_skips_marked_bodies(self):
+        i = self.src.index("_CAPTCHA_HOOK_JS")
+        block = self.src[i:i + 4000]
+        self.assertIn("own-direct-request", block)
+
+
+class TestEgressForwarding(unittest.TestCase):
+    """rqdata is IP-bound: the solver must mint from OUR exit IP.
+
+    Confirmed by practitioners running this exact flow — 'the rqdata blob
+    is welded to discord.com AND to the exact exit IP that asked for the
+    challenge'. Solver mints on its own IP -> invalid-response.
+    """
+
+    def _url(self, proxy):
+        import server
+
+        class B:
+            pass
+
+        b = B()
+        b.proxy = proxy
+        return server.DiscordAutomation._solver_proxy_url(b)
+
+    def test_tor_has_no_shareable_egress(self):
+        self.assertEqual(self._url(None), "")
+
+    def test_auth_proxy_is_rendered_with_credentials(self):
+        self.assertEqual(
+            self._url({"server": "http://gate:8080", "username": "u",
+                       "password": "p"}),
+            "http://u:p@gate:8080")
+
+    def test_inline_credentials_are_left_alone(self):
+        self.assertEqual(self._url({"server": "http://u:p@gate:8080"}),
+                         "http://u:p@gate:8080")
+
+    def test_socks5_is_supported(self):
+        self.assertEqual(
+            self._url({"server": "socks5://gate:1080", "username": "u",
+                       "password": "p"}),
+            "socks5://u:p@gate:1080")
+
+    def test_env_override_wins(self):
+        import os
+        os.environ["NONECAP_PROXY"] = "http://override:1"
+        try:
+            self.assertEqual(self._url(None), "http://override:1")
+        finally:
+            del os.environ["NONECAP_PROXY"]
+
+    def test_egress_is_passed_to_the_solver(self):
+        src = open("server.py").read()
+        self.assertIn("proxy=egress", src)
+
+    def test_missing_egress_is_called_out(self):
+        src = open("server.py").read()
+        self.assertIn("No shareable egress", src)
+
+
+class TestWidgetRqdataCrossCheck(unittest.TestCase):
+    """Solve the challenge the WIDGET is bound to, not a stale one.
+
+    From practitioners running this flow: on invalid-response Discord
+    hands back a NEW challenge, and re-solving the old rqdata can never
+    pass. The widget already running in the page is the authority.
+    """
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_rqdata_comes_from_discords_own_400(self):
+        # The widget cross-check went with the vision stack; Discord's
+        # /auth/register 400 is the authoritative source and always was.
+        self.assertIn("captcha_rqdata", self.src)
+        self.assertIn("Captured enterprise rqdata", self.src)
+
+    def test_fresh_challenge_is_adopted_on_rejection(self):
+        self.assertIn("Fresh challenge issued", self.src)
+
+
+
+    def test_retry_rebinds_to_the_fresh_challenge(self):
+        i = self.src.index("Discord issues a NEW challenge")
+        block = self.src[i:i + 1600]
+        self.assertIn("Do NOT wipe self._rqdata", block)
+
+    def test_retry_waits_for_rotation_instead_of_resolving_a_refused_blob(self):
+        i = self.src.index("Discord issues a NEW challenge")
+        block = self.src[i:i + 2600]
+        self.assertIn("challenge did NOT rotate", block)
+
+    def test_solve_parameters_are_logged(self):
+        self.assertIn("sitekey={sitekey} url={page_url}", self.src)
+
+
+class TestMatchesOfficialSdk(unittest.TestCase):
+    """Body must match nonecap-py's _build_solve_body exactly.
+
+    Reading the official SDK found three bugs in my hand-rolled client:
+    an `invisible` field that does not exist, a deprecated `user_agent`
+    that the SDK warns "made the request contradict itself", and a
+    resp_key I never captured at all.
+    """
+
+    def setUp(self):
+        import inspect
+
+        import nonecap_solver
+        self.src = inspect.getsource(nonecap_solver.NoneCapSolver.solve)
+
+    def test_no_invented_invisible_field(self):
+        self.assertNotIn('payload["invisible"]', self.src)
+
+    def test_no_deprecated_user_agent(self):
+        self.assertNotIn('payload["user_agent"]', self.src)
+
+    def test_keeps_the_documented_fields(self):
+        for field in ('"type"', '"sitekey"', '"url"', '"rqdata"',
+                      '"proxy"'):
+            self.assertIn(field, self.src)
+
+    def test_enterprise_requires_rqdata(self):
+        import nonecap_solver
+        c = nonecap_solver.NoneCapSolver(key="k", log=lambda *a, **k: None)
+        import asyncio
+        # no sitekey -> refuses before any network call
+        self.assertIsNone(asyncio.run(c.solve("", "https://x/")))
+
+
+class TestRespKey(unittest.TestCase):
+    """Discord verifies the token AND hCaptcha's respkey together."""
+
+    def test_solver_captures_resp_key(self):
+        import inspect
+
+        import nonecap_solver
+        src = inspect.getsource(nonecap_solver.NoneCapSolver)
+        self.assertIn("last_resp_key", src)
+        self.assertIn('solve.get("resp_key")', src)
+
+    def test_register_sends_the_respkey_header(self):
+        src = open("server.py").read()
+        self.assertIn("X-Captcha-Respkey", src)
+
+    def test_respkey_is_plumbed_from_solver_to_request(self):
+        src = open("server.py").read()
+        self.assertIn("_captcha_respkey", src)
+        self.assertIn('"respkey": getattr(self, "_captcha_respkey"', src)
+
+    def test_get_resp_key_is_patched_in_the_page(self):
+        src = open("server.py").read()
+        self.assertIn("__ncRespKey", src)
+        self.assertIn("getRespKey", src)
+
+
+class TestNoDanglingCalls(unittest.TestCase):
+    """Every self.X() must exist. A deleted helper still being called is
+    how '_widget_rqdata' shipped and killed the run on attempt 2."""
+
+    def test_no_dangling_self_calls_in_server(self):
+        import ast
+        src = open("server.py").read()
+        tree = ast.parse(src)
+        defined, assigned, called = set(), set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defined.add(node.name)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx,
+                                                              ast.Store):
+                if isinstance(node.value, ast.Name) \
+                        and node.value.id == "self":
+                    assigned.add(node.attr)
+            if isinstance(node, ast.Call) and isinstance(node.func,
+                                                         ast.Attribute):
+                v = node.func.value
+                if isinstance(v, ast.Name) and v.id == "self":
+                    called.add(node.func.attr)
+        missing = sorted(c for c in called
+                         if c not in defined and c not in assigned)
+        self.assertEqual(missing, [], f"calls with no definition: {missing}")
+
+    def test_no_vision_module_imports_remain(self):
+        src = open("server.py").read()
+        for mod in ("vision_solver", "drag_solver", "shape_drag",
+                    "shape_match_cv", "text_puzzle", "hcaptcha_detect"):
+            self.assertNotIn(f"import {mod}", src)
+
+
+class TestNoneCapPathRuns(unittest.IsolatedAsyncioTestCase):
+    """Execute _solve_with_nonecap for real against stubs."""
+
+    async def test_full_path_executes(self):
+        import os
+
+        import server
+
+        class FakePage:
+            url = "https://discord.com/register"
+            frames = []
+
+            async def evaluate(self, js, arg=None):
+                j = str(js)
+                if "location.href" in j:
+                    return "https://discord.com/register"
+                if "__ncToken" in j:
+                    return {"tok": True, "rq": True, "rk": True}
+                if "auth/register" in j and "fetch" in j:
+                    return {"status": 400, "body": '{"captcha_key":'
+                            '["invalid-response"]}'}
+                if "__ncHookInstalled" in j:
+                    return "installed"
+                return {}
+
+            async def screenshot(self):
+                return b""
+
+        class FakeSolver:
+            enabled = True
+            last_error = ""
+            last_solve_id = "solve_test"
+            last_resp_key = "E1_k"
+            calls = []
+
+            async def solve(self, sitekey, url, rqdata="", proxy="", **kw):
+                FakeSolver.calls.append(rqdata)
+                return "P1_" + "t" * 50
+
+            async def report(self, *a, **k):
+                return True
+
+        FakeSolver.calls = []
+        bot = server.DiscordAutomation.__new__(server.DiscordAutomation)
+        attrs = dict(
+            _page=FakePage(), _stopped=asyncio.Event(), _nonecap=FakeSolver(),
+            _events=None,
+            proxy={"host": "g", "port": 80, "username": "u", "password": "p"},
+            _rqdata="R" * 216, _rqtoken="t", _captcha_session_id="s",
+            _captcha_respkey="", _captcha_invisible=True,
+            _hcaptcha_sitekey="a9b5fb07-92ff-493f-86fe-352a2803b3df",
+            _discord_fingerprint="fp", _dob_iso="1996-07-28",
+            _display_name_used="u", _email="a@b.c", _username="u",
+            _password="p", _nc_direct_inflight=False, _cdp_injections=0,
+            _cdp_inject_note="", _cdp_interceptor_on=False,
+            _last_direct_status=0, _register_accepted=False,
+            _pending_captcha_token="", _challenge_payload=None,
+            _proxy_relay=None)
+        for k, v in attrs.items():
+            setattr(bot, k, v)
+        bot._log = lambda m, level="info": None
+
+        old = os.environ.get("NONECAP_API")
+        os.environ["NONECAP_API"] = "nc_live_test"
+        try:
+            ok = await bot._solve_with_nonecap()
+        finally:
+            if old is None:
+                os.environ.pop("NONECAP_API", None)
+            else:
+                os.environ["NONECAP_API"] = old
+        self.assertFalse(ok)
+        self.assertEqual(len(FakeSolver.calls), 3, "all 3 attempts must run")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

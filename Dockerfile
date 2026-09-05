@@ -31,8 +31,6 @@ RUN wget -q -O /tmp/chrome.deb \
 # websockets + Deprecated as its own dependencies).
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
-# the Brain (brain.py / Test tab) needs torch - CPU build is plenty
-RUN pip install --no-cache-dir --retries 10 --timeout 300 torch --index-url https://download.pytorch.org/whl/cpu
 
 # Run the browser and Tor under a non-root account. Chrome is designed to
 # run as an unprivileged process; browser files remain readable by that user.

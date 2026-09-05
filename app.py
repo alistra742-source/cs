@@ -36,15 +36,26 @@ PROXY_FORCE = (
 )
 
 # Fall back to TOR (socks5://127.0.0.1:9050) when the proxy pool is
-# exhausted or every session is dead (e.g. vaultproxies at 0.00 GB quota).
-# Disable with TOR_FALLBACK=0.
-TOR_FALLBACK = (os.environ.get("TOR_FALLBACK") or "").strip().lower() not in ("0", "false", "no", "off")
+# exhausted or every session is dead.
+#
+# DEFAULT OFF whenever residential sessions are configured. Discord's
+# enterprise hCaptcha binds rqdata to the exit IP, and the solver is given
+# OUR proxy — a silent TOR fallback breaks that binding and guarantees
+# invalid-response, while also handing Discord a heavily-flagged exit. If
+# proxies are configured we wait for a live one instead of quietly
+# downgrading. Set TOR_FALLBACK=1 to opt back in.
+_TOR_FALLBACK_ENV = (os.environ.get("TOR_FALLBACK") or "").strip().lower()
+if _TOR_FALLBACK_ENV in ("1", "true", "yes", "on"):
+    TOR_FALLBACK = True
+elif _TOR_FALLBACK_ENV in ("0", "false", "no", "off"):
+    TOR_FALLBACK = False
+else:
+    TOR_FALLBACK = not PROXY_FORCE
 
 from server import DiscordAutomation, _tor_check, ENGINE
 import live_control
 import live_ui
 import trainer
-import brain_test
 
 # ── Global state (Flask thread + asyncio thread) ──
 
@@ -66,6 +77,9 @@ WORKER_COUNT = 1
 LOW_MEMORY_MODE = (os.environ.get("LOW_MEMORY_MODE") or "1").strip().lower() not in ("0", "false", "no", "off")
 LOW_MEMORY_SWEEP_DELAY_S = max(15.0, float(os.environ.get("LOW_MEMORY_SWEEP_DELAY_S", "60")))
 LOW_MEMORY_SWEEP_CONCURRENCY = max(1, min(8, int(os.environ.get("LOW_MEMORY_SWEEP_CONCURRENCY", "4"))))
+# How many Discord-reachable sessions to prove BEFORE workers start. Small
+# on purpose: a worker only needs one good session at a time.
+PROXY_WARMUP_TARGET = max(1, int(os.environ.get("PROXY_WARMUP_TARGET", "12")))
 WORKER_IDS = [f"B{i+1}" for i in range(WORKER_COUNT)]
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -344,7 +358,10 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 tor_fallback = True
                 _log(f"[{wid}] [Proxy] No usable proxy sessions — falling back to TOR (socks5://127.0.0.1:9050)", level="warn")
             else:
-                _log(f"[{wid}] [Proxy] No proxy sessions (forced mode) — refreshing and waiting...", level="warn")
+                _log(f"[{wid}] [Proxy] No usable session right now — waiting "
+                     f"(TOR is disabled: Discord binds the captcha to the "
+                     f"exit IP, so a TOR downgrade would fail anyway)",
+                     level="warn")
                 state["proxy"] = "waiting-for-proxy"
                 await asyncio.sleep(5)
                 continue
@@ -371,7 +388,12 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                 proxy = None
                 consecutive_tunnel_fails += 1
                 backoff = min(backoff * 2, 8)
-                if consecutive_tunnel_fails >= 4:
+                # A handful of dead sessions out of hundreds is normal —
+                # rotate, do not condemn the pool. Only give up once we have
+                # burned a meaningful slice of it.
+                _dead_limit = 4 if not PROXY_FORCE else max(
+                    12, min(40, (proxy_pool.count if proxy_pool else 0) // 8))
+                if consecutive_tunnel_fails >= _dead_limit:
                     if TOR_FALLBACK and _tor_check() and not tor_fallback:
                         tor_fallback = True
                         proxy = None
@@ -380,8 +402,18 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
                         _proxy_stats_line(wid)
                         await asyncio.sleep(1)
                         continue
-                    _log(f"[{wid}] {consecutive_tunnel_fails} consecutive tunnel failures — aborting (all sessions appear dead)")
-                    break
+                    _log(f"[{wid}] {consecutive_tunnel_fails} consecutive "
+                         f"dead sessions — pausing 30s and refreshing the "
+                         f"pool (TOR disabled)", level="warn")
+                    consecutive_tunnel_fails = 0
+                    backoff = 0.3
+                    try:
+                        if proxy_pool is not None:
+                            await proxy_pool.refresh()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                    continue
                 _proxy_stats_line(wid)
                 await asyncio.sleep(backoff)
                 continue
@@ -392,6 +424,7 @@ async def _run_worker(wid: str, cfg: dict, proxy=None) -> None:
             bot = DiscordAutomation(
                 headless=cfg.get("headless", True),
                 domain=domain,
+                proxy=proxy,
             )
             state["bot"] = bot
             try:
@@ -582,23 +615,44 @@ def _browser_busy() -> bool:
                for state in _workers.values())
 
 
-async def _deferred_proxy_sweep(n_sessions: int) -> None:
-    """Validate a large proxy pool only while the renderer is idle.
+async def validate_working_set(target: int = 0) -> dict:
+    """Prove a WORKING SET of sessions before the workers need them.
 
-    Workers retain their one-at-a-time live probe, so deferring this optional
-    dashboard-wide sweep does not weaken the connection gate for an attempt.
+    The old deferred sweep waited for an idle renderer, which never happens
+    while a worker is running — so a freshly bought pool sat at
+    "0 Discord-reachable" forever and take() handed out unproven sessions.
+    This validates a bounded slice up front (cheap: a few concurrent HTTPS
+    GETs), so START always draws from sessions known to reach Discord.
+    """
+    if proxy_pool is None:
+        return {"tested": 0, "reachable": 0}
+    target = target or PROXY_WARMUP_TARGET
+    _log(f"[Proxy] Validating sessions against discord.com "
+         f"(target {target} working)...")
+    stats = await proxy_pool.validate_until(
+        target=target,
+        concurrency=(LOW_MEMORY_SWEEP_CONCURRENCY if LOW_MEMORY_MODE else 25),
+        log=_log)
+    ok = stats.get("reachable", 0)
+    if ok:
+        _log(f"[Proxy] [OK] {ok} session(s) verified Discord-reachable "
+             f"(tested {stats.get('tested', 0)})")
+    else:
+        _log(f"[Proxy] [WARN] 0 of {stats.get('tested', 0)} sessions could "
+             f"reach discord.com — check the provider/plan", level="warn")
+    return stats
+
+
+async def _deferred_proxy_sweep(n_sessions: int) -> None:
+    """Keep validating the REST of the pool in the background.
+
+    The working set is proven up front by validate_working_set(); this only
+    tops up the dashboard's picture of the remaining sessions.
     """
     if proxy_pool is None or not n_sessions:
         return
     if LOW_MEMORY_MODE:
-        _log(
-            f"[Proxy] Low-memory mode: deferred {n_sessions}-session sweep; "
-            "workers still probe their selected session individually"
-        )
         await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
-        while _running and _browser_busy():
-            _log("[Proxy] Low-memory mode: browser active, delaying bulk validation")
-            await asyncio.sleep(LOW_MEMORY_SWEEP_DELAY_S)
         if not _running:
             return
         concurrency = LOW_MEMORY_SWEEP_CONCURRENCY
@@ -721,7 +775,16 @@ async def _start_all_async(cfg: dict) -> None:
     asyncio.create_task(_proxy_file_watcher())
 
     if n_sessions and _proxies_available and proxy_pool is not None:
-        # ── Start workers IMMEDIATELY — they self-probe proxies ──
+        # ── Prove a working set BEFORE the workers draw from the pool ──
+        # Without this, take() hands out unproven sessions and a dead one
+        # costs a full browser launch (and, with TOR disabled, an aborted
+        # attempt). A few seconds here saves minutes later.
+        try:
+            await validate_working_set()
+        except Exception as e:
+            _log(f"[Proxy] Warm-up validation error: {e}", level="warn")
+
+        # ── Start workers — they still self-probe their chosen session ──
         # The sweep below runs concurrently; workers don't wait for it.
         # Each worker does a fast single-shot probe before launching a
         # browser, so dead sessions are caught in ~3s not 10s.
@@ -1048,44 +1111,6 @@ async def _start_real_demo_browser(wid: str, cfg: dict) -> dict:
         state["launching"] = False
 
 
-async def _start_brain_test_runner(speed: float = 2.0) -> dict:
-    """Attach the BRAIN TEST engine to B1's browser on the app asyncio loop.
-
-    Live hCaptcha demo rounds are analyzed by models/brain.pt (BrainSolver)
-    and reported in the Test tab. No clicking, no training, no collection.
-    """
-    if trainer.trainer_engine.is_busy() and not trainer.trainer_engine.is_preparing():
-        return {"ok": False,
-                "message": "The Live Demo trainer is running - stop it first"}
-    if brain_test.brain_engine.is_busy() and not brain_test.brain_engine.is_preparing():
-        return {"ok": False, "message": "Brain test already running or stopping"}
-    cfg = load_config()
-    browser = await _start_real_demo_browser("B1", cfg)
-    if browser.get("error"):
-        return {"ok": False, "message": browser["error"], "browser": browser}
-    state = _workers.get("B1") or _init_worker("B1")
-    bot = state.get("bot")
-    # The shared-browser helper parks the page on the hCaptcha DEMO; navigate
-    # straight to the brain-test target so the camera opens on Royal Mail.
-    if bot is not None:
-        try:
-            nav = await live_control.live_navigate(bot,
-                                                   brain_test.TARGET_URL)
-            if nav.get("screenshot"):
-                state["last_shot_b64"] = nav["screenshot"]
-            _log("[B1] [BrainTest] Navigated to %s" % brain_test.TARGET_URL)
-        except Exception as exc:
-            _log("[B1] [BrainTest] Initial navigation failed (%s); the "
-                 "cycle will retry." % exc)
-    result = brain_test.brain_engine.start_external(
-        getattr(bot, "_page", None), speed=speed, one_shot=False,
-    )
-    if result.get("ok"):
-        state["status"] = "demo"
-        state["step"] = "brain test · official hCaptcha demo"
-    return {**result, "browser": browser}
-
-
 async def _start_real_demo_runner(speed: float, one_shot: bool = False) -> dict:
     """Attach the trainer to B1's browser on the app asyncio loop."""
     if (trainer.trainer_engine.is_busy()
@@ -1153,6 +1178,29 @@ def _mask_proxy_key(key: str) -> str:
     if m:
         sid = "s-" + m.group(1)[:10]
     return f"{sid} @ {host}" if sid else host
+
+@app.route('/proxies/validate', methods=['POST'])
+def handle_proxy_validate():
+    """Validate sessions on demand (dashboard button).
+
+    ?target=N  how many working sessions to prove (default: all loaded).
+    """
+    if not (_proxies_available and proxy_pool is not None):
+        return jsonify({"error": "proxies module not loaded"})
+    try:
+        target = int(request.args.get("target") or 0)
+    except Exception:
+        target = 0
+    if not target:
+        target = proxy_pool.count or 1
+    try:
+        stats = _run_in_loop(validate_working_set(target))
+    except Exception as e:
+        return jsonify({"error": str(e)})
+    out = dict(stats or {})
+    out.update(proxy_pool.stats())
+    return jsonify(out)
+
 
 @app.route('/proxies')
 def handle_proxies():
@@ -1551,41 +1599,6 @@ def handle_trainer_questions():
     st = trainer.trainer_engine.get_state()
     return jsonify(st.get('questions', []))
 
-@app.route('/test/status')
-def handle_test_status():
-    return jsonify(brain_test.brain_engine.get_state())
-
-
-@app.route('/test/start', methods=['POST'])
-def handle_test_start():
-    queued = brain_test.brain_engine.begin_launch()
-    if not queued.get("ok"):
-        return jsonify(queued), 409
-    if not _loop:
-        brain_test.brain_engine.launch_failed("Event loop is unavailable.")
-        return jsonify({"ok": False, "message": "event loop unavailable"}), 503
-
-    async def launch_runner():
-        result = await _start_brain_test_runner()
-        if not result.get("ok"):
-            brain_test.brain_engine.launch_failed(
-                result.get("message", "Could not start the brain test."))
-        return result
-
-    try:
-        asyncio.run_coroutine_threadsafe(launch_runner(), _loop)
-    except Exception as exc:
-        brain_test.brain_engine.launch_failed(
-            f"Could not queue browser setup: {exc}")
-        return jsonify({"ok": False, "message": "could not queue browser setup"}), 503
-    return jsonify(queued), 202
-
-
-@app.route('/test/stop', methods=['POST'])
-def handle_test_stop():
-    return jsonify(brain_test.brain_engine.stop())
-
-
 @app.route('/trainer/speed', methods=['POST'])
 def handle_trainer_speed():
     data = request.get_json(silent=True) or {}
@@ -1609,46 +1622,6 @@ def _run_event_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-async def _vision_keepalive(interval: float = 240.0) -> None:
-    """Keep a HOSTED vision endpoint warm so the platform doesn't stop it.
-
-    The bot only calls vision when a captcha appears. Between captchas the
-    service idles — and on Railway's Hobby plan a deployment with no traffic
-    is STOPPED after ~15 minutes. The next captcha then hits a dead edge
-    (TLS reset in <0.1s, not a cold start) and every round fails until
-    someone manually restarts the deploy. A tiny GET / every 4 minutes
-    counts as traffic and keeps the deployment running. Local Ollama
-    (localhost) is skipped — it never idles out.
-    """
-    import vision_solver as _vs
-    base = (_vs.OLLAMA_BASE or "").rstrip("/")
-    if not base:
-        return
-    host = base.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]",
-                "host.docker.internal"):
-        return
-    headers = {}
-    if _vs.VISION_API_KEY:
-        headers["Authorization"] = f"Bearer {_vs.VISION_API_KEY}"
-    was_up: Optional[bool] = None
-    while True:
-        try:
-            timeout = aiohttp.ClientTimeout(total=25)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(base + "/", headers=headers) as r:
-                    up = (r.status == 200)
-        except Exception:
-            up = False
-        if was_up is not None and up != was_up:
-            if up:
-                _log(f"[Vision] Endpoint back UP at {base}", level="warn")
-            else:
-                _log(f"[Vision] Endpoint DOWN at {base} — captcha rounds "
-                     "will fail until it answers (check the hosted deploy)",
-                     level="warn")
-        was_up = up
-        await asyncio.sleep(interval)
 
 def main() -> None:
     global _loop
@@ -1663,12 +1636,7 @@ def main() -> None:
     t = threading.Thread(target=_run_event_loop, args=(_loop,), daemon=True)
     t.start()
 
-    # Keep the hosted vision endpoint from being stopped for inactivity
-    # (no-op when VISION_API_BASE is unset or points at localhost).
-    try:
-        asyncio.run_coroutine_threadsafe(_vision_keepalive(), _loop)
-    except Exception as e:
-        print(f"[app] vision keepalive not started: {e}", flush=True)
+    # Keep the Roboflow workflow warm (no-op without API_KEY).
 
     # Auto-migrate DB (DATABASE_URL from env)
 
@@ -1793,7 +1761,6 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 <button class="act" data-tab="main" onclick="showTab('main')">Dashboard</button>
 <button data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
 <button data-tab="trainer" onclick="showTab('trainer')">Live Demo</button>
-<button data-tab="test" onclick="showTab('test')">Test</button>
 <button data-tab="data" onclick="showTab('data')">Data</button>
 </nav>
 
@@ -1811,9 +1778,14 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 <div class="row">
 <div class="col stat"><div class="n" id="proxyTotal">0</div><div class="l">Total</div></div>
-<div class="col stat"><div class="n" id="proxyValid">0</div><div class="l">Valid</div></div>
+<div class="col stat"><div class="n" id="proxyValid" style="color:#3ba55d">0</div><div class="l">Working</div></div>
+<div class="col stat"><div class="n" id="proxyUnproven" style="color:#b58900">0</div><div class="l">Unproven</div></div>
 <div class="col stat"><div class="n" id="proxyUsed">0</div><div class="l">Used</div></div>
-<div class="col stat"><div class="n" id="proxyInvalid">0</div><div class="l">Invalid</div></div>
+<div class="col stat"><div class="n" id="proxyInvalid" style="color:#ed4245">0</div><div class="l">Dead</div></div>
+</div>
+<div class="flex mt">
+<button onclick="validateProxies()" id="btnValidateProxies">CHECK PROXIES</button>
+<span id="proxyCheckMsg" style="font-size:11px;color:#8a8a93;align-self:center"></span>
 </div>
 </div>
 
@@ -1909,38 +1881,6 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 
 <!-- Captured image challenges and their prompts are kept separate from controls. -->
-<div id="tabtest" class="hide">
-<div class="row mb">
-  <button class="primary" onclick="testStart()">Start Brain Test</button>
-  <button class="danger" onclick="testStop()">Stop</button>
-  <span id="testState" style="font-size:12px;opacity:.75">idle</span>
-</div>
-<div class="row mb" style="gap:14px;flex-wrap:wrap;font-size:12px">
-  <span>Brain: <b id="testBrain">?</b></span>
-  <span>Answered: <b id="testAnswered">0</b></span>
-  <span>Executed (clicked): <b id="testExecuted">0</b></span>
-  <span>Deferred: <b id="testDeferred">0</b></span>
-  <span>Cycles: <b id="testCycles">0</b></span>
-</div>
-<div class="row mb" style="gap:12px;flex-wrap:wrap">
-  <div style="flex:1;min-width:320px">
-    <div style="font-size:11px;letter-spacing:1px;opacity:.6;margin-bottom:6px">LIVE CAMERA</div>
-    <img id="testCam" src="/latest" style="width:100%;border:1px solid #26262b;border-radius:10px;background:#0d0d0f" alt="live camera">
-  </div>
-  <div style="flex:1;min-width:320px">
-    <div style="font-size:11px;letter-spacing:1px;opacity:.6;margin-bottom:6px">BRAIN'S ANSWER (overlay)</div>
-    <img id="testOverlay" style="width:100%;border:1px solid #26262b;border-radius:10px;background:#0d0d0f" alt="brain answer overlay">
-    <div id="testLatest" style="font-size:12px;margin-top:8px;white-space:pre-wrap"></div>
-  </div>
-</div>
-<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:10px 0 6px">ROUND LOG</div>
-<div id="testRounds" style="font-size:12px;max-height:320px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px"></div>
-<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:12px 0 6px">ACTIVITY LOG</div>
-<div id="testLogs" style="font-size:11px;max-height:200px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px;font-family:'JetBrains Mono',monospace;color:#9ca3af"></div>
-<div style="font-size:11px;letter-spacing:1px;opacity:.6;margin:12px 0 6px">OPERATOR ACTIVITY (live camera input)</div>
-<div id="testPointer" style="font-size:11px;max-height:140px;overflow:auto;border:1px solid #26262b;border-radius:10px;padding:8px;font-family:'JetBrains Mono',monospace;color:#9ca3af"></div>
-</div>
-
 <div id="tabdata" class="hide">
   <div class="card" style="margin-bottom:12px">
     <div class="flex" style="justify-content:space-between;margin-bottom:10px">
@@ -1999,7 +1939,7 @@ function toast(m){
   setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t)},3000);
 }
 function showTab(name){
-  var ids=['main','tokens','trainer','data','test'];
+  var ids=['main','tokens','trainer','data'];
   ids.forEach(function(t){
     var el=$('tab'+t);
     if(el)el.classList.toggle('hide',t!==name);
@@ -2010,65 +1950,9 @@ function showTab(name){
   if(name==='trainer' || name==='data'){
     refreshTrainer();
   }
-  if(name==='test'){
-    testPoll();
-  }
 }
 window.showTab=showTab;
 
-/* ── Test tab: live brain solving ─────────────────────────────────────── */
-function testStart(){
-  fetch('/test/start',{method:'POST'}).then(r=>r.json()).then(function(j){
-    if(!j.ok){alert(j.message||'could not start');}
-  });
-}
-function testStop(){
-  fetch('/test/stop',{method:'POST'}).then(r=>r.json());
-}
-function testEsc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function testPoll(){
-  fetch('/test/status').then(r=>r.json()).then(function(s){
-    var el=function(id){return document.getElementById(id);};
-    el('testState').textContent=(s.running?(s.stage||'running'):(s.preparing?'starting':'idle'))+(s.status_text?' · '+s.status_text:'');
-    el('testBrain').textContent=(s.brain_state==='loaded'?'LOADED':
-      s.brain_state==='loading'?'LOADING…':
-      s.brain_state==='failed'?('FAILED: '+(s.brain_error||'brain.pt missing')):
-      'NOT LOADED');
-    el('testAnswered').textContent=s.answered_count||0;
-    el('testExecuted').textContent=s.executed_count||0;
-    el('testDeferred').textContent=s.deferred_count||0;
-    el('testCycles').textContent=s.cycles_count||0;
-    var cam=el('testCam'); if(cam && s.running){cam.src='/latest?'+Date.now();}
-    var rounds=s.rounds||[];
-    if(rounds.length){
-      var last=rounds[rounds.length-1];
-      var ov=el('testOverlay');
-      if(last.overlay_url && ov.getAttribute('src')!==last.overlay_url){ov.src=last.overlay_url;}
-      el('testLatest').textContent='#'+last.id+' ['+last.family+']\n'+last.question+'\n→ '+last.answer+'  (conf '+last.confidence+')';
-    }
-    var rows=rounds.slice().reverse().map(function(r){
-      var col=r.deferred?'#fbbf24':'#34d399';
-      return '<div style="padding:4px 0;border-bottom:1px solid #1a1a1e">'+
-        '<span style="color:'+col+'">'+(r.deferred?'DEFER':'ANSWER')+'</span> '+
-        '<b>#'+r.id+'</b> ['+testEsc(r.family)+'] '+testEsc(r.question)+
-        '<div style="opacity:.85">→ '+testEsc(r.answer)+' <span style="opacity:.6">(conf '+r.confidence+')</span></div></div>';
-    }).join('');
-    el('testRounds').innerHTML=rows||'<div style="opacity:.5">No rounds yet — press Start.</div>';
-    var logs=s.logs||[];
-    el('testLogs').innerHTML=logs.slice().reverse().map(function(l){
-      return '<div>'+testEsc(l)+'</div>';
-    }).join('')||'<div style="opacity:.5">No activity yet.</div>';
-    var ptr=s.pointer_log||[];
-    el('testPointer').innerHTML=ptr.slice().reverse().map(function(p){
-      return '<div>'+testEsc((p.t||'')+' '+p.kind+' ('+p.x+','+p.y+')'+(p.selector?' '+p.selector:''))+'</div>';
-    }).join('')||'<div style="opacity:.5">No operator input (click/drag on the live camera to see it here).</div>';
-  }).catch(function(){});
-}
-setInterval(function(){
-  if(document.getElementById('tabtest') && !document.getElementById('tabtest').classList.contains('hide')){testPoll();}
-},2000);
-window.testStart=testStart;window.testStop=testStop;
 
 function startBot(){
   api('/start').then(function(r){return r.json()}).then(function(d){
@@ -2101,12 +1985,7 @@ function refreshStatus(){
       $('statGenerated').textContent=(s&&s.generated)||0;
       $('statValid').textContent=(s&&s.valid)||0;
       $('statExpired').textContent=(s&&s.expired)||0;
-      if(s&&s.proxies){
-        $('proxyTotal').textContent=s.proxies.total||0;
-        $('proxyValid').textContent=s.proxies.valid||0;
-        $('proxyUsed').textContent=s.proxies.used||0;
-        $('proxyInvalid').textContent=s.proxies.invalid||0;
-      }
+      if(s&&s.proxies){ applyProxyStats(s.proxies); }
     }catch(e){}
   }).catch(function(){});
 }
@@ -2173,8 +2052,45 @@ window.refreshTokens=refreshTokens;
 function refreshProxies(){
   api('/proxies/refresh').then(function(r){return r.json()}).then(function(d){
     toast(d.message||d.error||'Refreshed');
+    applyProxyStats(d);
   }).catch(function(e){toast('Error: '+e.message)});
 }
+
+function applyProxyStats(d){
+  if(!d)return;
+  var set=function(id,v){var el=$(id); if(el&&v!==undefined&&v!==null)el.textContent=v;};
+  set('proxyTotal', d.available!==undefined?d.available:d.fetched);
+  set('proxyValid', d.verified!==undefined?d.verified:d.valid);
+  set('proxyUnproven', d.unproven);
+  set('proxyUsed', d.used);
+  set('proxyInvalid', d.dead!==undefined?d.dead:d.failed);
+  var badge=$('proxyStats');
+  if(badge){
+    var ok=(d.verified!==undefined?d.verified:d.valid)||0;
+    var tot=(d.available!==undefined?d.available:d.fetched)||0;
+    badge.textContent=ok+' / '+tot+' working';
+    badge.className='badge '+(ok>0?'badge-ok':'badge-warn');
+  }
+}
+window.applyProxyStats=applyProxyStats;
+
+function validateProxies(){
+  var btn=$('btnValidateProxies'), msg=$('proxyCheckMsg');
+  if(btn){btn.disabled=true;btn.textContent='CHECKING...';}
+  if(msg)msg.textContent='Testing sessions against discord.com...';
+  api('/proxies/validate',{method:'POST'}).then(function(r){return r.json()})
+   .then(function(d){
+     if(d.error){toast('Error: '+d.error); if(msg)msg.textContent=d.error;}
+     else{
+       applyProxyStats(d);
+       var m=(d.reachable||0)+' working of '+(d.tested||0)+' tested';
+       if(msg)msg.textContent=m;
+       toast(m);
+     }
+   }).catch(function(e){toast('Error: '+e.message)})
+   .then(function(){if(btn){btn.disabled=false;btn.textContent='CHECK PROXIES';}});
+}
+window.validateProxies=validateProxies;
 window.refreshProxies=refreshProxies;
 
 function viewAllLogs(){

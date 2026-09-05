@@ -12,6 +12,7 @@ The pool hands out proxy dicts so the browser worker can pass
 username/password to Playwright separately.
 """
 import asyncio
+import base64
 import json
 import os
 import random
@@ -118,12 +119,29 @@ def parse_proxy_list(text: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def tor_only() -> bool:
+    """True when residential proxies are disabled and TOR is the only exit.
+
+    Set FORCE_TOR=1 (or PROXY_MODE=tor) to ignore every configured
+    vaultproxy session — useful when the provider's sessions are all dead
+    and each one costs a browser launch before it fails.
+    """
+    if (os.environ.get("PROXY_MODE") or "").strip().lower() == "tor":
+        return True
+    return (os.environ.get("FORCE_TOR") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _vault_proxy_urls() -> List[str]:
     """Residential proxy session URLs (user:pass@host:port).
     Priority: VAULTPROXY_URLS env -> composed from VAULTPROXY_HOST/PORT/
     USER_PREFIX/PASS/TTL + VAULTPROXY_SESSIONS (comma/newline list — just
     change the string after -s- when sessions rotate) -> proxies.txt /
     vaultproxies.txt files (both read, deduped)."""
+    global loaded_files
+    if tor_only():
+        loaded_files = []
+        return []
     urls: List[str] = []
     env_urls = (os.environ.get("VAULTPROXY_URLS") or "").strip()
     if env_urls:
@@ -138,7 +156,6 @@ def _vault_proxy_urls() -> List[str]:
         for s in re.split(r"[\s,;]+", sessions):
             if s:
                 urls.append(f"{user_prefix}{s}-ttl-{ttl}:{passwd}@{host}:{port}")
-    global loaded_files
     loaded_files = []
     root = Path(__file__).resolve().parent
     for fname in VAULTPROXY_FILES:
@@ -303,10 +320,16 @@ class ProxyPool:
         return {
             "available": self.count,
             "fetched": self.fetched_count,
-            "valid": self.valid_count,
+            "valid": self.working_count,
             "used": self.used_count,
             "working": self.worked_count,
             "failed": self.failed_count,
+            # Live validation picture for the dashboard.
+            "verified": self.working_count,
+            "unproven": self.unproven_count,
+            "dead": sum(1 for p in self._proxies
+                        if p.get("_probe_failed")
+                        or p.get("key") in self._failed),
             "last_refresh": self.last_refresh,
         }
 
@@ -349,9 +372,17 @@ class ProxyPool:
         if not candidates:
             self._failed = set()
             candidates = list(self._proxies)
+        # Never hand out a session that failed its probe while unproven
+        # ones remain — that is what put a dead proxy in front of a worker.
+        untried = [p for p in candidates if not p.get("_probe_failed")]
+        candidates = untried or candidates
         fresh = [p for p in candidates if p.get("key") not in self._used_before]
         pool_ = fresh or candidates
         valid = [p for p in pool_ if p.get("_valid")]
+        if not valid:
+            # fall back to proven sessions from the whole pool before
+            # resorting to an unproven one
+            valid = [p for p in candidates if p.get("_valid")]
         proxy = random.choice(valid) if valid else random.choice(pool_)
         key = proxy.get("key")
         self._used_at[key] = now
@@ -422,6 +453,115 @@ class ProxyPool:
                 await conn.close()
         except Exception:
             return False
+
+    @staticmethod
+    async def _connect_probe(proxy: Dict[str, str],
+                             timeout: float = 6.0) -> bool:
+        """Probe the way CHROME does: raw CONNECT to discord.com:443.
+
+        aiohttp's proxy support was giving false positives — it sends
+        Proxy-Authorization automatically, so a session that Chrome cannot
+        authenticate to still looked healthy. This speaks the proxy
+        protocol directly, so 407s and dead tunnels are caught here rather
+        than after a browser launch.
+        """
+        host = proxy.get("host")
+        port = proxy.get("port")
+        if not host or not port:
+            return False
+        head = b"CONNECT discord.com:443 HTTP/1.1\r\n" \
+               b"Host: discord.com:443\r\n"
+        if proxy.get("username"):
+            raw = f"{proxy['username']}:{proxy.get('password','')}".encode()
+            head += b"Proxy-Authorization: Basic " + \
+                base64.b64encode(raw) + b"\r\n"
+        head += b"\r\n"
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port)), timeout=timeout)
+            writer.write(head)
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            return b" 200 " in line
+        except Exception:
+            return False
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+    async def validate_until(self, target: int = 12,
+                             concurrency: int = 60,
+                             timeout: float = 4.0,
+                             max_tests: int = 0,
+                             log: Optional[Callable] = None) -> dict:
+        """Probe sessions until ``target`` of them reach Discord.
+
+        Stops as soon as the target is met, so a 663-session pool costs a
+        few seconds rather than a full sweep. Sessions that answer are
+        marked ``_valid`` (take() prefers those); ones that fail here are
+        recorded as ``_probe_failed`` but NOT blacklisted — a burst can
+        false-fail a good session, and the worker's own probe is the gate.
+        """
+        stats = {"tested": 0, "reachable": 0, "failed": 0}
+        already = [p for p in self._proxies if p.get("_valid")]
+        if len(already) >= target:
+            stats["reachable"] = len(already)
+            return stats
+        pending = [p for p in self._proxies
+                   if not p.get("_valid")
+                   and p.get("key") not in self._failed]
+        random.shuffle(pending)
+        if max_tests:
+            pending = pending[:max_tests]
+        if not pending:
+            return stats
+
+        found = [len(already)]
+        stop = asyncio.Event()
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(p):
+            if stop.is_set():
+                return
+            async with sem:
+                if stop.is_set():
+                    return
+                ok = await self._connect_probe(p, timeout=timeout)
+                stats["tested"] += 1
+                if ok:
+                    p["_valid"] = True
+                    p.pop("_probe_failed", None)
+                    self._failed.discard(p.get("key"))
+                    stats["reachable"] += 1
+                    found[0] += 1
+                    if found[0] >= target:
+                        stop.set()
+                else:
+                    p["_probe_failed"] = True
+                    stats["failed"] += 1
+                if log and stats["tested"] % 10 == 0:
+                    log(f"[Proxy] Validated {stats['tested']} — "
+                        f"{found[0]} working")
+
+        await asyncio.gather(*(_one(p) for p in pending),
+                             return_exceptions=True)
+        self.valid_count = sum(1 for p in self._proxies if p.get("_valid"))
+        return stats
+
+    @property
+    def working_count(self) -> int:
+        """Sessions proven to reach Discord."""
+        return sum(1 for p in self._proxies if p.get("_valid"))
+
+    @property
+    def unproven_count(self) -> int:
+        return sum(1 for p in self._proxies
+                   if not p.get("_valid") and not p.get("_probe_failed")
+                   and p.get("key") not in self._failed)
 
     async def sweep(self, window: float = 10.0,
                     concurrency: int = SWEEP_CONCURRENCY,

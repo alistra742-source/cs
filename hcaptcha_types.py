@@ -200,6 +200,15 @@ def _bbox_config(payload: dict) -> bool:
         "\"box\"" in blob
 
 
+# Unambiguous drag wording. Kept deliberately tight so a grid round that
+# merely mentions "move" is not misrouted.
+_DRAG_PROMPT_RE = re.compile(
+    r"\bdrag\b|where it fits|place where it belongs|"
+    r"\bmove the (icon|piece|shape|element|tile|block|item|object)\b|"
+    r"matching (slot|outline|shape)|missing piece|complete the puzzle",
+    re.I)
+
+
 def classify_from_payload(payload: dict) -> str:
     if not isinstance(payload, dict):
         return UNKNOWN
@@ -220,6 +229,12 @@ def classify_from_payload(payload: dict) -> str:
         # that is ONLY a tower/pattern drag must NOT commit to a point
         # click — that never grabs the Move piece.
         mixed = bool(_BINARY_GRID_Q_RE.search(q))
+        # Explicit drag wording beats the payload label. hCaptcha ships
+        # "Please drag the icon to the place where it fits" under
+        # request_type image_label_area_select; trusting the label makes
+        # the solver CLICK a drag round, which can never pass.
+        if not mixed and _DRAG_PROMPT_RE.search(q or ""):
+            return DRAG_DROP
         if not mixed and (is_tower_prompt(q) or is_pattern_prompt(q)):
             return DRAG_DROP
         if mixed:
@@ -276,6 +291,14 @@ def classify_from_dom(facts: dict, prompt: str = "") -> str:
     """Map DOM fact counts to a family. Rules ordered by confidence."""
     if not isinstance(facts, dict) or not facts:
         return UNKNOWN
+
+    # WORDING WINS. hCaptcha renders drag rounds as one big canvas with no
+    # draggable node and no "Move" text leaf (the badge is an icon), so the
+    # DOM heuristics below fall through to AREA_POINT and the solver then
+    # answers a drag round with a click — which can never pass. When the
+    # prompt literally says drag/where it fits, believe it.
+    if _DRAG_PROMPT_RE.search(prompt or ""):
+        return DRAG_DROP
 
     def n(key):
         try:

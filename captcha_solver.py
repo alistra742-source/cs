@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """hCaptcha DOM helpers (vision model solves the image grid directly).
 
-The bot solves the challenge itself with a local Ollama vision model
-(see vision_solver.py and server.py's ``_solve_hcaptcha_if_present``).
+The bot solves the challenge itself with a Roboflow vision workflow
+(see nonecap_solver.py and server.py's ``_solve_hcaptcha_if_present``).
 This module keeps only the pure DOM helpers the flow still needs:
 
   · extract_hcaptcha_sitekey / extract_hcaptcha_rqdata / extract_rqdata_from_body

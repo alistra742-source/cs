@@ -81,9 +81,14 @@ label{font-size:11px;color:#8a8a92;display:block;margin-bottom:4px;letter-spacin
 </div>
 <div class="row">
 <div class="col stat"><div class="n" id="proxyTotal">0</div><div class="l">Total</div></div>
-<div class="col stat"><div class="n" id="proxyValid">0</div><div class="l">Valid</div></div>
+<div class="col stat"><div class="n" id="proxyValid" style="color:#3ba55d">0</div><div class="l">Working</div></div>
+<div class="col stat"><div class="n" id="proxyUnproven" style="color:#b58900">0</div><div class="l">Unproven</div></div>
 <div class="col stat"><div class="n" id="proxyUsed">0</div><div class="l">Used</div></div>
-<div class="col stat"><div class="n" id="proxyInvalid">0</div><div class="l">Invalid</div></div>
+<div class="col stat"><div class="n" id="proxyInvalid" style="color:#ed4245">0</div><div class="l">Dead</div></div>
+</div>
+<div class="flex mt">
+<button onclick="validateProxies()" id="btnValidateProxies">CHECK PROXIES</button>
+<span id="proxyCheckMsg" style="font-size:11px;color:#8a8a93;align-self:center"></span>
 </div>
 </div>
 
@@ -210,12 +215,7 @@ function refreshStatus(){
       $('statGenerated').textContent=(s&&s.generated)||0;
       $('statValid').textContent=(s&&s.valid)||0;
       $('statExpired').textContent=(s&&s.expired)||0;
-      if(s&&s.proxies){
-        $('proxyTotal').textContent=s.proxies.total||0;
-        $('proxyValid').textContent=s.proxies.valid||0;
-        $('proxyUsed').textContent=s.proxies.used||0;
-        $('proxyInvalid').textContent=s.proxies.invalid||0;
-      }
+      if(s&&s.proxies){ applyProxyStats(s.proxies); }
       if(s&&s.headless!==undefined){
         $('hlOn').classList.toggle('primary',!!s.headless);
         $('hlOff').classList.toggle('primary',!s.headless);
@@ -271,8 +271,45 @@ window.refreshTokens=refreshTokens;
 function refreshProxies(){
   api('/proxies/refresh').then(function(r){return r.json()}).then(function(d){
     toast(d.message||d.error||'Refreshed');
+    applyProxyStats(d);
   }).catch(function(e){toast('Error: '+e.message)});
 }
+
+function applyProxyStats(d){
+  if(!d)return;
+  var set=function(id,v){var el=$(id); if(el&&v!==undefined&&v!==null)el.textContent=v;};
+  set('proxyTotal', d.available!==undefined?d.available:d.fetched);
+  set('proxyValid', d.verified!==undefined?d.verified:d.valid);
+  set('proxyUnproven', d.unproven);
+  set('proxyUsed', d.used);
+  set('proxyInvalid', d.dead!==undefined?d.dead:d.failed);
+  var badge=$('proxyStats');
+  if(badge){
+    var ok=(d.verified!==undefined?d.verified:d.valid)||0;
+    var tot=(d.available!==undefined?d.available:d.fetched)||0;
+    badge.textContent=ok+' / '+tot+' working';
+    badge.className='badge '+(ok>0?'badge-ok':'badge-warn');
+  }
+}
+window.applyProxyStats=applyProxyStats;
+
+function validateProxies(){
+  var btn=$('btnValidateProxies'), msg=$('proxyCheckMsg');
+  if(btn){btn.disabled=true;btn.textContent='CHECKING...';}
+  if(msg)msg.textContent='Testing sessions against discord.com...';
+  api('/proxies/validate',{method:'POST'}).then(function(r){return r.json()})
+   .then(function(d){
+     if(d.error){toast('Error: '+d.error); if(msg)msg.textContent=d.error;}
+     else{
+       applyProxyStats(d);
+       var m=(d.reachable||0)+' working of '+(d.tested||0)+' tested';
+       if(msg)msg.textContent=m;
+       toast(m);
+     }
+   }).catch(function(e){toast('Error: '+e.message)})
+   .then(function(){if(btn){btn.disabled=false;btn.textContent='CHECK PROXIES';}});
+}
+window.validateProxies=validateProxies;
 window.refreshProxies=refreshProxies;
 
 function viewAllLogs(){
