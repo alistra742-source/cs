@@ -83,7 +83,7 @@ That is the only required variable. Optional:
 
 | variable | meaning | default |
 |---|---|---|
-| `NONECAP_TRIES` | solve attempts per challenge | `3` |
+| `NONECAP_TRIES` | solve attempts per challenge (total, incl. first try: `2` = one attempt + one retry) | `2` |
 | `NONECAP_WAIT` | seconds the API holds the connection (max 90) | `90` |
 | `NONECAP_TIMEOUT` | overall ceiling per attempt, incl. polling | `180` |
 | `NONECAP_ENABLED` | set 0 to disable and use vision only | `1` |

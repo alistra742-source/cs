@@ -189,8 +189,8 @@ class TestKeyHandling(unittest.TestCase):
         self.assertFalse(c.enabled)
         self.assertIsNone(asyncio.run(c.solve("sk", "https://x.test/")))
 
-    def test_three_tries_by_default(self):
-        self.assertEqual(nonecap_solver.NONECAP_TRIES, 3)
+    def test_two_tries_by_default(self):
+        self.assertEqual(nonecap_solver.NONECAP_TRIES, 2)
 
 
 class TestNullCredits(unittest.IsolatedAsyncioTestCase):

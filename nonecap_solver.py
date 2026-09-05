@@ -42,8 +42,9 @@ NONECAP_BASE = (os.environ.get("NONECAP_BASE")
 _KEY_VARS = ("NONECAP_API", "NONECAP_API_KEY", "NONECAP_KEY")
 # Seconds the API holds the connection open waiting for a token (max 90).
 NONECAP_WAIT = int(float(os.environ.get("NONECAP_WAIT", "90")))
-# How many solves to attempt per challenge.
-NONECAP_TRIES = int(float(os.environ.get("NONECAP_TRIES", "3")))
+# How many solves to attempt per challenge (total, incl. the first try):
+# 2 = one initial attempt + one retry, then fall through to AZcaptcha.
+NONECAP_TRIES = int(float(os.environ.get("NONECAP_TRIES", "2")))
 # Overall ceiling for one solve attempt, including polling.
 NONECAP_TIMEOUT = float(os.environ.get("NONECAP_TIMEOUT", "180"))
 NONECAP_ENABLED = (os.environ.get("NONECAP_ENABLED", "1").strip().lower()
