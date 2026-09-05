@@ -448,5 +448,39 @@ class TestEgressForwarding(unittest.TestCase):
         self.assertIn("No shareable egress", src)
 
 
+class TestWidgetRqdataCrossCheck(unittest.TestCase):
+    """Solve the challenge the WIDGET is bound to, not a stale one.
+
+    From practitioners running this flow: on invalid-response Discord
+    hands back a NEW challenge, and re-solving the old rqdata can never
+    pass. The widget already running in the page is the authority.
+    """
+
+    def setUp(self):
+        self.src = open("server.py").read()
+
+    def test_widget_rqdata_reader_exists(self):
+        self.assertIn("_WIDGET_RQDATA_JS", self.src)
+        self.assertIn("async def _widget_rqdata", self.src)
+
+    def test_mismatch_is_detected_and_logged(self):
+        self.assertIn("RQDATA MISMATCH", self.src)
+        self.assertIn("SITEKEY MISMATCH", self.src)
+
+    def test_widget_value_wins_on_mismatch(self):
+        i = self.src.index("RQDATA MISMATCH")
+        block = self.src[i:i + 400]
+        self.assertIn("rqdata = live_rq", block)
+
+    def test_retry_forces_a_fresh_read(self):
+        i = self.src.index("Discord issues a NEW challenge")
+        block = self.src[i:i + 900]
+        self.assertIn('self._rqdata = ""', block)
+        self.assertIn("_widget_rqdata()", block)
+
+    def test_solve_parameters_are_logged(self):
+        self.assertIn("sitekey={sitekey} url={page_url}", self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

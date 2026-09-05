@@ -4979,6 +4979,72 @@ class DiscordAutomation:
                 return f"{scheme}://{user}:{pwd}@{hostport}"
         return server_url
 
+    _WIDGET_RQDATA_JS = r"""() => {
+        // What rqdata is the LIVE widget actually bound to?
+        //
+        // We hand the solver the rqdata from Discord's 400. But the widget
+        // already running in this page fetched its OWN challenge — if the
+        // two differ, the solver mints a token for challenge A while
+        // Discord validates against challenge B, and hCaptcha answers
+        // invalid-response no matter how correct everything else is.
+        const out = {rqdata: '', sitekey: '', found: []};
+        const push = (k, v) => {
+            if (typeof v === 'string' && v.length > 8) out.found.push([k, v]);
+        };
+        try {
+            const h = window.hcaptcha;
+            if (h) {
+                for (const fn of ['getConfig', 'getWidgetConfig']) {
+                    if (typeof h[fn] === 'function') {
+                        try {
+                            const c = h[fn]();
+                            if (c) {
+                                push(fn + '.rqdata', c.rqdata);
+                                if (typeof c.sitekey === 'string')
+                                    out.sitekey = c.sitekey;
+                            }
+                        } catch (e) {}
+                    }
+                }
+                for (const k of Object.keys(h)) {
+                    try {
+                        const v = h[k];
+                        if (v && typeof v === 'object') {
+                            for (const kk of Object.keys(v)) {
+                                const w = v[kk];
+                                if (w && typeof w === 'object') {
+                                    push('reg.' + kk, w.rqdata);
+                                    if (!out.sitekey &&
+                                        typeof w.sitekey === 'string')
+                                        out.sitekey = w.sitekey;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+        try {
+            for (const el of document.querySelectorAll(
+                    '[data-rqdata], [data-sitekey]')) {
+                push('dom', el.getAttribute('data-rqdata'));
+                if (!out.sitekey)
+                    out.sitekey = el.getAttribute('data-sitekey') || '';
+            }
+        } catch (e) {}
+        if (out.found.length) out.rqdata = out.found[0][1];
+        return out;
+    }"""
+
+    async def _widget_rqdata(self) -> dict:
+        """Read the rqdata/sitekey the LIVE widget is bound to."""
+        try:
+            return await asyncio.wait_for(
+                self._page.evaluate(self._WIDGET_RQDATA_JS),
+                timeout=6.0) or {}
+        except Exception:
+            return {}
+
     async def _solve_with_nonecap(self) -> bool:
         """Clear the challenge with the hosted NoneCap solver.
 
@@ -5036,6 +5102,37 @@ class DiscordAutomation:
                 "Set NONECAP_PROXY (or use a residential proxy) to fix it.",
                 level="warn")
         rqdata = await self._live_rqdata()
+        # Cross-check against the widget actually running in the page. A
+        # mismatch means we are solving a DIFFERENT challenge than the one
+        # Discord will validate — the one remaining explanation for a
+        # correct-looking token being refused.
+        try:
+            live = await self._widget_rqdata()
+            live_rq = str(live.get("rqdata") or "")
+            live_sk = str(live.get("sitekey") or "")
+            if live_sk and sitekey and live_sk != sitekey:
+                self._log(f"[NoneCap] SITEKEY MISMATCH: widget={live_sk[:8]}… "
+                          f"vs challenge={sitekey[:8]}… — using the widget's",
+                          level="warn")
+                sitekey = live_sk
+            if live_rq and rqdata and live_rq != rqdata:
+                self._log(f"[NoneCap] RQDATA MISMATCH: the widget is bound to "
+                          f"a different challenge than Discord's 400 "
+                          f"(widget {len(live_rq)} chars vs "
+                          f"{len(rqdata)} chars) — solving the WIDGET's",
+                          level="warn")
+                rqdata = live_rq
+            elif live_rq and not rqdata:
+                rqdata = live_rq
+                self._log(f"[NoneCap] rqdata taken from the live widget "
+                          f"({len(live_rq)} chars)")
+            elif live_rq:
+                self._log("[NoneCap] rqdata matches the live widget")
+            else:
+                self._log("[NoneCap] widget exposes no rqdata to compare",
+                          level="debug")
+        except Exception:
+            pass
         if not rqdata:
             self._log("[NoneCap] No enterprise rqdata found — solving as "
                       "plain hCaptcha (Discord binds tokens to rqdata, so "
@@ -5047,19 +5144,38 @@ class DiscordAutomation:
             if await self._past_captcha():
                 return True
             if attempt > 1:
-                # The challenge may have advanced; re-read rqdata so the
-                # retry is bound to the CURRENT challenge rather than
-                # repeating an identical, already-rejected request.
+                # Discord issues a NEW challenge with invalid-response, so a
+                # retry MUST rebind to it — same rqdata twice can only fail.
+                self._rqdata = ""          # force a re-read, not the cache
                 fresh = await self._live_rqdata()
+                widget = await self._widget_rqdata()
+                w_rq = str(widget.get("rqdata") or "")
+                if w_rq and w_rq != fresh:
+                    self._log("[NoneCap] retry: widget rqdata differs from "
+                              "the API's — trusting the widget")
+                    fresh = w_rq
                 if fresh and fresh != rqdata:
-                    self._log("[NoneCap] rqdata changed — using the fresh "
-                              "blob for this attempt")
+                    self._log(f"[NoneCap] retry bound to the FRESH challenge "
+                              f"({len(fresh)} chars)")
                     rqdata = fresh
+                elif fresh:
+                    self._log("[NoneCap] retry: rqdata unchanged — the "
+                              "challenge did not rotate", level="warn")
             self._log(f"[NoneCap] Attempt {attempt}/{tries}"
                       + (" (enterprise" if rqdata else " (plain")
                       + (", invisible)"
                          if getattr(self, "_captcha_invisible", False)
                          else ")"))
+            # Print the EXACT solve parameters. If a token that looks
+            # perfect keeps getting refused, the answer is in here — a
+            # stale rqdata, the wrong url, or a sitekey that does not
+            # match the widget.
+            import hashlib as _h
+            _rqh = _h.md5(rqdata.encode()).hexdigest()[:8] if rqdata else "-"
+            self._log(f"[NoneCap]   sitekey={sitekey} url={page_url} "
+                      f"rqdata={len(rqdata)}ch/{_rqh} "
+                      f"rqtoken={'yes' if getattr(self, '_rqtoken', '') else 'no'} "
+                      f"session={'yes' if getattr(self, '_captcha_session_id', '') else 'no'}")
             # hCaptcha binds the token to the solving IP and UA. Give
             # NoneCap the same ones this browser is using, or Discord
             # answers invalid-response even for a perfect solve.
